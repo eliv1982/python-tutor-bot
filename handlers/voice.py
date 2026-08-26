@@ -8,7 +8,7 @@ from bot import bot
 from services.router import route_voice_request
 from services.tts import get_available_voices, get_voice_info
 from utils.logging import logger
-from utils.helpers import user_sessions, save_file_async, cleanup_files, strip_markdown
+from utils.helpers import user_sessions, save_file_async, cleanup_files, strip_markdown, download_telegram_file
 from config import VoiceType
 
 
@@ -90,9 +90,8 @@ async def handle_voice_message(message: types.Message):
     
     try:
         # Download voice message
-        file_info = await bot.get_file(message.voice.file_id)
-        voice_bytes = await bot.download_file(file_info.file_path)
-        
+        voice_bytes, _ = await download_telegram_file(bot, message.voice.file_id, operation="voice_download")
+
         # Save to temporary file
         voice_file_path = await save_file_async(voice_bytes, "ogg")
         

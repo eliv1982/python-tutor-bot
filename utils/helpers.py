@@ -8,10 +8,51 @@ import re
 import uuid
 import aiofiles
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 from config import BASE_DIR
 from utils.logging import logger
+
+
+class TelegramDownloadError(RuntimeError):
+    """
+    Raised when downloading a file from Telegram fails.
+
+    Deliberately carries only a fixed, safe message. pyTelegramBotAPI's
+    underlying request errors can render request details that include the
+    token-bearing `/file/bot<TOKEN>/...` URL, so the original exception
+    must never be logged, chained (traceback), or surfaced to the user.
+    """
+
+
+async def download_telegram_file(bot, file_id: str, operation: str) -> Tuple[bytes, str]:
+    """
+    Download a Telegram file's bytes via the bot's own token-scoped calls.
+
+    Args:
+        bot: AsyncTeleBot instance
+        file_id: Telegram file_id to resolve and download
+        operation: Short label for logging (e.g. "photo_download")
+
+    Returns:
+        (file_bytes, file_path) — file_path is Telegram's internal path,
+        useful only as a MIME-type hint; it carries no token.
+
+    Raises:
+        TelegramDownloadError: on any failure. Only the operation name and
+        exception type are logged — never the raw exception or a traceback,
+        since either can contain the token-bearing file URL.
+    """
+    try:
+        file_info = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file_info.file_path)
+        return file_bytes, file_info.file_path
+    except Exception as e:
+        logger.error(
+            "Telegram download failed | operation=%s, error_type=%s",
+            operation, type(e).__name__
+        )
+        raise TelegramDownloadError(f"Telegram download failed during {operation}") from None
 
 
 def strip_markdown(text: str) -> str:
@@ -206,12 +247,12 @@ class UserSession:
         """Set voice for a user."""
         self.sessions[f"{user_id}_voice"] = voice
 
-    def set_pending_image(self, user_id: int, image_url: str):
-        """Сохранить URL изображения в ожидании вопроса от пользователя."""
-        self.sessions[f"{user_id}_pending_image"] = image_url
+    def set_pending_image(self, user_id: int, image_data_url: str):
+        """Сохранить base64 data URL изображения в ожидании вопроса от пользователя."""
+        self.sessions[f"{user_id}_pending_image"] = image_data_url
 
     def get_pending_image(self, user_id: int) -> Optional[str]:
-        """Получить URL изображения, ожидающего вопрос (или None)."""
+        """Получить base64 data URL изображения, ожидающего вопрос (или None)."""
         return self.sessions.get(f"{user_id}_pending_image")
 
     def clear_pending_image(self, user_id: int):

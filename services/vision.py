@@ -18,10 +18,12 @@ async def analyze_image(
 ) -> str:
     """
     Analyze an image using GPT-4 Vision.
-    
+
     Args:
         image_path: Local path to image file
-        image_url: URL to image (Telegram file URL)
+        image_url: Image reference to send to OpenAI. Must be either a
+            base64 data URL or a URL that does not carry a Telegram bot
+            token (Telegram file URLs are never safe to pass here).
         custom_prompt: Custom analysis prompt
     
     Returns:
@@ -63,35 +65,46 @@ async def analyze_image(
         raise
 
 
+MIME_TYPES_BY_EXTENSION = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp'
+}
+
+
+def encode_image_bytes_to_data_url(image_bytes: bytes, filename_hint: str = "") -> str:
+    """
+    Encode raw image bytes to a base64 data URL.
+
+    Args:
+        image_bytes: Raw image content
+        filename_hint: Filename or path used only to guess the MIME type
+
+    Returns:
+        Base64 encoded data URL
+    """
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    extension = Path(filename_hint).suffix.lower()
+    mime_type = MIME_TYPES_BY_EXTENSION.get(extension, 'image/jpeg')
+    return f"data:{mime_type};base64,{base64_image}"
+
+
 def encode_image_to_base64(image_path: Path) -> str:
     """
     Encode image file to base64 data URL.
-    
+
     Args:
         image_path: Path to image file
-    
+
     Returns:
         Base64 encoded data URL
     """
     try:
         with open(image_path, "rb") as image_file:
             image_data = image_file.read()
-        
-        base64_image = base64.b64encode(image_data).decode('utf-8')
-        
-        # Determine MIME type
-        extension = image_path.suffix.lower()
-        mime_types = {
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.gif': 'image/gif',
-            '.webp': 'image/webp'
-        }
-        mime_type = mime_types.get(extension, 'image/jpeg')
-        
-        return f"data:{mime_type};base64,{base64_image}"
-        
+        return encode_image_bytes_to_data_url(image_data, filename_hint=str(image_path))
     except Exception as e:
         logger.error("Vision encode_image failed | path=%s, error=%s", image_path, e)
         raise

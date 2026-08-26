@@ -11,13 +11,16 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 import json
 
-from config import OPENAI_API_KEY, OPENAI_BASE_URL, USE_PROXYAPI, DATA_DIR
+from config import OPENAI_API_KEY, DALLE_MODEL, DATA_DIR
 from utils.logging import logger
 
 
 # Create temp directory for generated images
 GENERATED_IMAGES_DIR = DATA_DIR / "generated_images"
 GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
+
+# This application only ever talks to the official OpenAI API directly.
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 
 def _save_b64_image(b64_string: str) -> Path:
@@ -149,9 +152,9 @@ async def generate_image(
             "Content-Type": "application/json"
         }
         
-        # b64_json избегает загрузки по URL (503 у ProxyAPI/CDN)
+        # b64_json avoids a second network hop to download the image from a URL
         payload = {
-            "model": "dall-e-3",
+            "model": DALLE_MODEL,
             "prompt": prompt,
             "n": 1,
             "size": size,
@@ -159,7 +162,7 @@ async def generate_image(
             "style": style,
             "response_format": "b64_json",
         }
-        api_url = f"{OPENAI_BASE_URL}/images/generations"
+        api_url = f"{OPENAI_API_BASE_URL}/images/generations"
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -268,8 +271,7 @@ async def generate_image_variations(
         data.add_field('n', str(n))
         data.add_field('size', size)
         
-        # Determine API URL based on ProxyAPI usage
-        api_url = f"{OPENAI_BASE_URL}/images/variations"
+        api_url = f"{OPENAI_API_BASE_URL}/images/variations"
         
         # Make API request
         async with aiohttp.ClientSession() as session:

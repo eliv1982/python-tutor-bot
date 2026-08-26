@@ -23,13 +23,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY is not set in .env file")
 
-# ProxyAPI Configuration (для работы в России без VPN)
-USE_PROXYAPI = os.getenv("USE_PROXYAPI", "true").lower() == "true"
-PROXYAPI_BASE_URL_DEFAULT = "https://api.proxyapi.ru/openai/v1"
-OPENAI_BASE_URL = os.getenv(
-    "OPENAI_BASE_URL",
-    PROXYAPI_BASE_URL_DEFAULT if USE_PROXYAPI else "https://api.openai.com/v1"
-)
+# The one and only OpenAI endpoint this application ever talks to. Passed
+# explicitly to every OpenAI-backed client (chat/vision/STT/TTS, image
+# generation, embeddings) rather than left unset, because the underlying
+# SDKs each fall back to reading their own base-URL environment variable
+# when no explicit value is given. This constant must never be made
+# configurable via the environment again — that would reopen a way for
+# requests to be silently redirected to a non-official endpoint.
+OFFICIAL_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 # Bot Modes
 class BotMode:
@@ -63,6 +64,10 @@ DALLE_MODEL = "dall-e-3"
 DALLE_DEFAULT_SIZE = "1024x1024"  # Options: 1024x1024, 1024x1792, 1792x1024
 DALLE_DEFAULT_QUALITY = "standard"  # Options: standard, hd
 DALLE_DEFAULT_STYLE = "vivid"  # Options: vivid, natural
+
+# Maximum size (in bytes) of a Telegram-downloaded image accepted for
+# vision analysis, enforced before base64 encoding / session storage.
+MAX_TELEGRAM_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB
 
 # Database Configuration
 DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/embeddings.db")

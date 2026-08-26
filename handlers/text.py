@@ -160,15 +160,15 @@ async def handle_text_message(message: types.Message):
     text = message.text.strip()
     logger.info("Text message | user_id=%s, text_len=%s, preview=%s", user_id, len(text), text[:80].replace("\n", " "))
 
-    pending_url = user_sessions.get_pending_image(user_id)
-    if pending_url:
+    pending_image_data_url = user_sessions.get_pending_image(user_id)
+    if pending_image_data_url:
         logger.info("Text as image follow-up | user_id=%s, caption_len=%s", user_id, len(text))
         user_sessions.clear_pending_image(user_id)
         await bot.send_chat_action(message.chat.id, 'typing')
         try:
             response = await route_image_request(
                 user_id=user_id,
-                image_url=pending_url,
+                image_url=pending_image_data_url,
                 caption=text
             )
             await bot.send_message(

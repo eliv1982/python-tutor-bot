@@ -10,8 +10,7 @@
 
 1. Скопируйте `.env.example` в `.env` и заполните:
    - `TELEGRAM_BOT_TOKEN` — токен от [@BotFather](https://t.me/BotFather)
-   - `OPENAI_API_KEY` — ключ OpenAI или [ProxyAPI](https://proxyapi.ru) (для работы без VPN)
-   - при использовании ProxyAPI: `USE_PROXYAPI=true`, `OPENAI_BASE_URL=https://api.proxyapi.ru/openai/v1`
+   - `OPENAI_API_KEY` — ключ OpenAI
 2. Установите зависимости: `pip install -r requirements.txt`
 3. Запуск: `python main.py`
 

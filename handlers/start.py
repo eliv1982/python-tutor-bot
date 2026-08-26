@@ -75,7 +75,8 @@ async def cmd_reset(message: types.Message):
     """Handle /reset command - clear conversation history."""
     user_id = message.from_user.id
     user_sessions.clear_history(user_id)
-    logger.info("Command /reset | user_id=%s, history_cleared=True", user_id)
+    user_sessions.clear_pending_image(user_id)
+    logger.info("Command /reset | user_id=%s, history_cleared=True, pending_image_cleared=True", user_id)
     
     await bot.send_message(
         message.chat.id,

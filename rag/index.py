@@ -10,7 +10,7 @@ from chromadb.config import Settings
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
-from config import DATA_DIR, OPENAI_API_KEY, DOCUMENTS_DIR
+from config import DATA_DIR, OPENAI_API_KEY, OFFICIAL_OPENAI_BASE_URL, DOCUMENTS_DIR
 from utils.logging import logger
 from rag.loader import document_loader
 
@@ -32,8 +32,13 @@ class VectorIndex:
         self.persist_directory.mkdir(parents=True, exist_ok=True)
         
         # Initialize embeddings
+        # base_url is pinned explicitly: langchain-openai defaults it from
+        # the OPENAI_API_BASE env var, and would otherwise pass base_url=
+        # None down to the openai SDK, which itself falls back to
+        # OPENAI_BASE_URL. Passing it here overrides both.
         self.embeddings = OpenAIEmbeddings(
-            openai_api_key=OPENAI_API_KEY
+            openai_api_key=OPENAI_API_KEY,
+            base_url=OFFICIAL_OPENAI_BASE_URL
         )
         
         # Initialize or load vector store

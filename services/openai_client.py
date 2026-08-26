@@ -9,8 +9,7 @@ from pathlib import Path
 
 from config import (
     OPENAI_API_KEY,
-    OPENAI_BASE_URL,
-    USE_PROXYAPI,
+    OFFICIAL_OPENAI_BASE_URL,
     GPT_MODEL,
     WHISPER_MODEL,
     TTS_MODEL,
@@ -20,23 +19,23 @@ from config import (
 )
 from utils.logging import logger
 
+# The only image representation this application ever sends to OpenAI's
+# vision endpoint. Rejecting anything else (in particular http(s):// URLs)
+# guarantees a Telegram file URL/bot token can never reach OpenAI.
+SAFE_IMAGE_URL_PREFIX = "data:image/"
+
 
 class OpenAIClient:
     """Async client for OpenAI API operations."""
-    
+
     def __init__(self):
         """Initialize the OpenAI client."""
-        self.client = AsyncOpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_BASE_URL
-        )
-        
-        if USE_PROXYAPI:
-            logger.info(f"OpenAI client initialized with ProxyAPI: {OPENAI_BASE_URL}")
-        else:
-            logger.info("OpenAI client initialized with direct API")
-        
-        self.use_proxyapi = USE_PROXYAPI
+        # Pinned explicitly (not left to SDK defaults) because the openai
+        # SDK itself falls back to an OPENAI_BASE_URL *environment
+        # variable* when base_url isn't passed — a stray leftover in a
+        # developer's .env would otherwise silently re-route requests.
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OFFICIAL_OPENAI_BASE_URL)
+        logger.info("OpenAI client initialized with official OpenAI API")
     
     async def generate_text_response(
         self,
@@ -82,15 +81,24 @@ class OpenAIClient:
     ) -> str:
         """
         Analyze an image using GPT-4 Vision.
-        
+
         Args:
-            image_url: URL or base64 encoded image
+            image_url: Base64 data URL (data:image/...;base64,...). This is
+                the provider boundary: any other value (an http(s):// URL,
+                including a Telegram file URL) is rejected so a Telegram
+                bot token can never be transmitted to OpenAI.
             prompt: Analysis prompt
             model: Vision model to use
-        
+
         Returns:
             Image analysis result
         """
+        if not image_url.startswith(SAFE_IMAGE_URL_PREFIX):
+            logger.error("OpenAI vision rejected unsafe image reference | expected_prefix=%s", SAFE_IMAGE_URL_PREFIX)
+            raise ValueError(
+                "analyze_image only accepts base64 data URLs (data:image/...;base64,...); "
+                "remote URLs are not supported"
+            )
         try:
             logger.debug("OpenAI vision | model=%s, prompt_len=%s", model, len(prompt))
             response = await self.client.chat.completions.create(

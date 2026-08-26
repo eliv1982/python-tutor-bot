@@ -11,6 +11,7 @@ from config import DOCUMENTS_DIR
 from rag.loader import document_loader
 from rag.index import vector_index
 from utils.logging import logger
+from utils.helpers import download_telegram_file
 
 
 # Supported MIME types for RAG
@@ -77,8 +78,7 @@ async def process_document_upload(message: types.Message, document: types.Docume
         await bot.send_message(message.chat.id, "⏳ Загружаю документ...")
         
         # Download file
-        file_info = await bot.get_file(document.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
+        file_bytes, _ = await download_telegram_file(bot, document.file_id, operation="document_download")
         file_path = DOCUMENTS_DIR / document.file_name
         
         # Save file
