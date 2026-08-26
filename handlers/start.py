@@ -7,10 +7,12 @@ from telebot import types
 from bot import bot
 from utils.logging import logger
 from utils.helpers import user_sessions
+from utils.access_control import require_authorized
 from config import BotMode, DEFAULT_MODE
 
 
 @bot.message_handler(commands=['start'])
+@require_authorized
 async def cmd_start(message: types.Message):
     """Handle /start command."""
     user_id = message.from_user.id
@@ -39,6 +41,7 @@ async def cmd_start(message: types.Message):
 
 
 @bot.message_handler(commands=['help'])
+@require_authorized
 async def cmd_help(message: types.Message):
     """Handle /help command."""
     user_id = message.from_user.id
@@ -71,6 +74,7 @@ async def cmd_help(message: types.Message):
 
 
 @bot.message_handler(commands=['reset'])
+@require_authorized
 async def cmd_reset(message: types.Message):
     """Handle /reset command - clear conversation history."""
     user_id = message.from_user.id
@@ -86,6 +90,7 @@ async def cmd_reset(message: types.Message):
 
 
 @bot.message_handler(commands=['stats'])
+@require_authorized
 async def cmd_stats(message: types.Message):
     """Handle /stats command - show knowledge base statistics."""
     user_id = message.from_user.id

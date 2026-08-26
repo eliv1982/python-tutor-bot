@@ -14,12 +14,33 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456789:TEST-TOKEN-DO-NOT-USE"
 os.environ["OPENAI_API_KEY"] = "sk-test-dummy-key"
+
+
+@pytest.fixture(autouse=True)
+def _default_test_access_allowed(monkeypatch):
+    """
+    Stage 1C added a fail-closed Telegram access gate (utils.access_control)
+    in front of every handler: with no TELEGRAM_ALLOWED_USER_IDS configured
+    (the default in this test environment), every user_id is denied.
+
+    Tests written before/independent of that feature call handlers with
+    arbitrary user_ids and don't expect to be denied, so default every test
+    to "authorized" here. tests/test_stage1c_access_control.py — which
+    exercises the gate itself — defines a same-named fixture that shadows
+    this one for that module, leaving the real is_authorized() in place so
+    it can monkeypatch TELEGRAM_ALLOWED_USER_IDS and assert on real
+    allow/deny behavior.
+    """
+    import utils.access_control as access_control
+    monkeypatch.setattr(access_control, "is_authorized", lambda user_id: True)
 
 
 def pytest_configure(config):

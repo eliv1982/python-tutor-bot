@@ -8,6 +8,7 @@ from bot import bot
 from services.router import route_text_request, route_image_request
 from utils.logging import logger
 from utils.helpers import user_sessions, strip_markdown
+from utils.access_control import require_authorized
 from config import BotMode
 
 
@@ -23,6 +24,7 @@ def _get_mode_keyboard():
 
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("mode_"))
+@require_authorized
 async def callback_mode(callback: types.CallbackQuery):
     """Обработка нажатия кнопки режима — автоматическое переключение."""
     user_id = callback.from_user.id
@@ -49,6 +51,7 @@ async def callback_mode(callback: types.CallbackQuery):
 
 
 @bot.message_handler(commands=['mode'])
+@require_authorized
 async def cmd_mode(message: types.Message):
     """Handle /mode command — показать текущий режим и кнопки выбора."""
     user_id = message.from_user.id
@@ -92,6 +95,7 @@ async def cmd_mode(message: types.Message):
 
 
 @bot.message_handler(commands=['image'])
+@require_authorized
 async def cmd_image(message: types.Message):
     """Handle /image command - generate image with specific parameters."""
     user_id = message.from_user.id
@@ -154,6 +158,7 @@ async def cmd_image(message: types.Message):
 
 
 @bot.message_handler(func=lambda message: message.content_type == 'text' and not message.text.startswith('/'))
+@require_authorized
 async def handle_text_message(message: types.Message):
     """Handle regular text messages. Если есть ожидающее изображение — это вопрос к нему."""
     user_id = message.from_user.id

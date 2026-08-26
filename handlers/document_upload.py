@@ -13,6 +13,7 @@ from rag.loader import document_loader, SUPPORTED_EXTENSIONS
 from rag.index import vector_index
 from utils.logging import logger
 from utils.helpers import download_telegram_file, cleanup_file
+from utils.access_control import require_authorized
 
 
 # Supported MIME types for RAG (early routing only — the authoritative
@@ -26,6 +27,7 @@ SUPPORTED_DOC_MIMES = [
 
 
 @bot.message_handler(content_types=['document'])
+@require_authorized
 async def handle_document_message(message: types.Message):
     """Route document messages: RAG upload for PDF/TXT/MD/DOCX, info for images."""
     document = message.document

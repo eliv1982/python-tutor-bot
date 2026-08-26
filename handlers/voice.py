@@ -9,10 +9,12 @@ from services.router import route_voice_request
 from services.tts import get_available_voices, get_voice_info
 from utils.logging import logger
 from utils.helpers import user_sessions, save_file_async, cleanup_files, strip_markdown, download_telegram_file
+from utils.access_control import require_authorized
 from config import VoiceType
 
 
 @bot.message_handler(commands=['voice'])
+@require_authorized
 async def cmd_voice(message: types.Message):
     """Handle /voice command - change TTS voice."""
     user_id = message.from_user.id
@@ -69,6 +71,7 @@ async def cmd_voice(message: types.Message):
 
 
 @bot.message_handler(commands=['voices'])
+@require_authorized
 async def cmd_voices(message: types.Message):
     """Handle /voices command - list all available voices."""
     voice_list = get_available_voices()
@@ -76,6 +79,7 @@ async def cmd_voices(message: types.Message):
 
 
 @bot.message_handler(content_types=['voice'])
+@require_authorized
 async def handle_voice_message(message: types.Message):
     """Handle voice messages."""
     user_id = message.from_user.id
@@ -148,6 +152,7 @@ async def handle_voice_message(message: types.Message):
 
 
 @bot.message_handler(content_types=['audio'])
+@require_authorized
 async def handle_audio_message(message: types.Message):
     """Handle audio files (similar to voice)."""
     await bot.send_message(
