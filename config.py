@@ -69,6 +69,11 @@ DALLE_DEFAULT_STYLE = "vivid"  # Options: vivid, natural
 # vision analysis, enforced before base64 encoding / session storage.
 MAX_TELEGRAM_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB
 
+# Maximum size (in bytes) of a Telegram-downloaded document accepted for
+# RAG ingestion, enforced against the actual downloaded bytes before the
+# file is written to disk, parsed, or indexed.
+MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
 # Database Configuration
 DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/embeddings.db")
 
@@ -76,6 +81,25 @@ DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/embeddings.db")
 DATA_DIR = BASE_DIR / "data"
 DOCUMENTS_DIR = DATA_DIR / "documents"
 EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
+
+# Physical storage root for application-managed Telegram document uploads
+# (opaque UUID-named files, see handlers/document_upload.py). Nested under
+# DOCUMENTS_DIR but deliberately excluded from rag/loader.py's
+# load_directory() startup/reference scan: an upload is already indexed
+# into the persistent Chroma store at upload time with its original
+# filename as source metadata, so blindly rescanning disk on startup would
+# re-index it a second time under its opaque UUID filename. Interim design
+# until the later PostgreSQL/Qdrant document registry stage — if the
+# Chroma store is manually destroyed, uploads are not reconstructed from
+# disk; that recovery path belongs to the later registry architecture.
+#
+# Deliberately NOT created here (unlike DATA_DIR/DOCUMENTS_DIR below):
+# config.py is imported by every test module, and an eager mkdir would
+# create this directory on the real filesystem the moment any test simply
+# imports config, before a test monkeypatches this path to a tmp_path.
+# handlers/document_upload.py creates it lazily, only when an upload
+# actually needs to write to it.
+MANAGED_UPLOADS_DIR = DOCUMENTS_DIR / "uploads"
 
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)

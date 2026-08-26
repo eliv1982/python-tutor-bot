@@ -4,12 +4,19 @@ Loads and processes documents from various formats.
 """
 
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import DOCUMENTS_DIR, RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP
+from config import DOCUMENTS_DIR, MANAGED_UPLOADS_DIR, RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP
 from utils.logging import logger
+
+
+# Formats this loader can actually parse end-to-end. Deliberately excludes
+# legacy `.doc` (Docx2txtLoader only understands the modern .docx zip
+# format and cannot read it) — this is the single source of truth for what
+# both Telegram uploads and the directory scan below may accept.
+SUPPORTED_EXTENSIONS = frozenset({'.pdf', '.txt', '.md', '.docx'})
 
 
 class DocumentLoader:
@@ -23,41 +30,47 @@ class DocumentLoader:
             length_function=len,
         )
     
-    def load_document(self, file_path: Path) -> List[Dict]:
+    def load_document(self, file_path: Path, display_name: Optional[str] = None) -> List[Dict]:
         """
         Load a single document and split into chunks.
-        
+
         Args:
-            file_path: Path to document file
-        
+            file_path: Path to document file on disk (the physical,
+                application-generated storage path)
+            display_name: Human-readable name to record as source metadata
+                instead of `file_path.name`. Used when the physical filename
+                is an opaque storage identity (e.g. a UUID) that must not
+                leak into user-facing source attribution.
+
         Returns:
             List of document chunks with metadata
         """
         try:
             file_path = Path(file_path)
-            
+            source_name = display_name or file_path.name
+
             # Select appropriate loader based on file extension
             if file_path.suffix.lower() == '.pdf':
                 loader = PyPDFLoader(str(file_path))
             elif file_path.suffix.lower() in ['.txt', '.md']:
                 loader = TextLoader(str(file_path), encoding='utf-8')
-            elif file_path.suffix.lower() in ['.docx', '.doc']:
+            elif file_path.suffix.lower() == '.docx':
                 loader = Docx2txtLoader(str(file_path))
             else:
                 raise ValueError(f"Unsupported file format: {file_path.suffix}")
-            
+
             # Load document
             documents = loader.load()
-            
+
             # Split into chunks
             chunks = self.text_splitter.split_documents(documents)
-            
+
             # Add source metadata
             for chunk in chunks:
-                chunk.metadata['source'] = file_path.name
+                chunk.metadata['source'] = source_name
                 chunk.metadata['file_path'] = str(file_path)
-            
-            logger.info("RAG loader load_document | file=%s, chunks=%s", file_path.name, len(chunks))
+
+            logger.info("RAG loader load_document | file=%s, source=%s, chunks=%s", file_path.name, source_name, len(chunks))
             return chunks
         except Exception as e:
             logger.error("RAG loader load_document failed | file=%s, error=%s", file_path, e, exc_info=True)
@@ -76,18 +89,24 @@ class DocumentLoader:
         try:
             directory = Path(directory)
             all_chunks = []
-            
-            # Supported file extensions
-            supported_extensions = ['.pdf', '.txt', '.md', '.docx', '.doc']
-            
+            managed_uploads_dir = MANAGED_UPLOADS_DIR.resolve()
+
             # Find all supported files
             for file_path in directory.rglob('*'):
-                if file_path.suffix.lower() in supported_extensions:
-                    try:
-                        chunks = self.load_document(file_path)
-                        all_chunks.extend(chunks)
-                    except Exception as e:
-                        logger.warning("RAG loader: skipping file | file=%s, error=%s", file_path.name, e)
+                if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                if file_path.resolve().is_relative_to(managed_uploads_dir):
+                    # Application-managed uploads (handlers/document_upload.py)
+                    # are indexed once, at upload time, with their original
+                    # filename as source metadata. Rescanning them here would
+                    # re-index them a second time under their opaque UUID
+                    # filename. See MANAGED_UPLOADS_DIR in config.py.
+                    continue
+                try:
+                    chunks = self.load_document(file_path)
+                    all_chunks.extend(chunks)
+                except Exception as e:
+                    logger.warning("RAG loader: skipping file | file=%s, error=%s", file_path.name, e)
             logger.info("RAG loader load_directory | directory=%s, total_chunks=%s", directory, len(all_chunks))
             return all_chunks
         except Exception as e:

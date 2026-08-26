@@ -23,10 +23,11 @@ async def setup_bot():
     
     try:
         from rag.index import vector_index
+        from rag.loader import SUPPORTED_EXTENSIONS
         from config import DOCUMENTS_DIR
-        
+
         docs = list(DOCUMENTS_DIR.glob('*'))
-        docs = [d for d in docs if d.is_file() and d.suffix.lower() in ['.pdf', '.txt', '.md', '.docx', '.doc']]
+        docs = [d for d in docs if d.is_file() and d.suffix.lower() in SUPPORTED_EXTENSIONS]
         logger.debug("Setup: RAG documents dir scan: path=%s, files=%s", DOCUMENTS_DIR, [d.name for d in docs])
         
         if docs:
