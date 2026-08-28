@@ -23,6 +23,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456789:TEST-TOKEN-DO-NOT-USE"
 os.environ["OPENAI_API_KEY"] = "sk-test-dummy-key"
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-dummy-key"
+
+# Stage 2A: the accepted 137-test baseline mocks OpenAI at the SDK boundary
+# (openai_client.client.chat.completions.create) throughout. Pinning the
+# test-session provider to "openai" here keeps every one of those existing
+# mocks valid unchanged — router.py/rag/query.py now call services/text_llm.py,
+# which itself dispatches to services/openai_client.py when LLM_PROVIDER is
+# "openai", exactly the object those tests already patch. This is TEST-ONLY
+# compatibility behavior: config.py's own default (LLM_PROVIDER=anthropic)
+# is what actually ships to production and is completely unaffected by this
+# override. tests/test_stage2a_text_llm_provider.py exercises the Anthropic
+# path explicitly, per-test, via monkeypatch — see that file.
+os.environ["LLM_PROVIDER"] = "openai"
 
 # chromadb.config.Settings is a pydantic-settings BaseSettings model, so it
 # picks up ANONYMIZED_TELEMETRY from the environment automatically (no

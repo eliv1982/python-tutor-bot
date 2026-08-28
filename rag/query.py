@@ -7,7 +7,7 @@ import asyncio
 from typing import List, Dict, Optional
 
 from rag.index import vector_index
-from services.openai_client import openai_client
+from services import text_llm
 from utils.logging import logger
 from config import RAG_TOP_K
 
@@ -143,7 +143,7 @@ async def _generate_rag_response(
     })
     
     # Generate response
-    response = await openai_client.generate_text_response(messages)
+    response = await text_llm.generate_text_response(messages)
     
     return response
 
@@ -179,7 +179,7 @@ async def _fallback_response(
         "content": query
     })
     
-    response = await openai_client.generate_text_response(messages)
+    response = await text_llm.generate_text_response(messages)
     
     return f"⚠️ База знаний не содержит информации по этому вопросу.\n\n{response}"
 

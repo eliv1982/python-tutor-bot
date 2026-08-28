@@ -17,6 +17,15 @@ python-dotenv>=1.0.0,<2.0.0
 # next major rather than reverting to the stale 1.x floor.
 openai>=3.3.1,<4.0.0
 
+# Anthropic (Stage 2A: general-purpose text-tutoring path when
+# LLM_PROVIDER=anthropic, the production default — see services/text_llm.py
+# and services/anthropic_client.py). Direct official SDK only, no
+# langchain-anthropic: this repo's own usage is a single messages.create()
+# call, which needs no additional framework. Verified installable on Python
+# 3.12 and conflict-free alongside the rest of this file in a disposable
+# environment (resolved to 1.2.0 at Stage 2A-B verification time).
+anthropic>=1.0.0,<2.0.0
+
 # RAG and embeddings
 # langchain-core and langchain-text-splitters are now declared directly:
 # rag/loader.py imports langchain_core.documents.Document and

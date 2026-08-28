@@ -6,7 +6,7 @@ Routes different types of requests to appropriate handlers.
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-from services.openai_client import openai_client
+from services import text_llm
 from services.stt import transcribe_voice_message
 from services.tts import generate_voice_response
 from services.vision import analyze_image
@@ -60,7 +60,7 @@ async def route_text_request(
                 "Не используй разметку markdown — только обычный текст. Примеры кода пиши с отступом, без ** и без обратных кавычек. Объясняй концепции и лучшие практики."
             )
             messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": text}]
-            response_text = await openai_client.generate_text_response(messages)
+            response_text = await text_llm.generate_text_response(messages)
         
         # Add assistant response to history
         user_sessions.add_message(user_id, "assistant", response_text)

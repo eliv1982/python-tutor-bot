@@ -32,6 +32,50 @@ if not OPENAI_API_KEY:
 # requests to be silently redirected to a non-official endpoint.
 OFFICIAL_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
+# Text-LLM Provider Selection (Stage 2A)
+class LLMProvider:
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
+
+_VALID_LLM_PROVIDERS = (LLMProvider.ANTHROPIC, LLMProvider.OPENAI)
+
+# Selects which provider answers the three general-purpose text-tutoring
+# paths (ordinary chat, RAG answer generation, RAG fallback — see
+# services/text_llm.py). Vision/STT/TTS/image-generation/embeddings and the
+# image-generation-intent classifier are NOT affected by this setting and
+# remain OpenAI-specific regardless of its value. An unrecognized value
+# fails closed at import time (below) rather than silently defaulting to
+# either provider — same fail-fast posture as TELEGRAM_BOT_TOKEN/
+# OPENAI_API_KEY above.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", LLMProvider.ANTHROPIC)
+if LLM_PROVIDER not in _VALID_LLM_PROVIDERS:
+    raise ValueError(
+        f"LLM_PROVIDER must be one of {_VALID_LLM_PROVIDERS!r}, got {LLM_PROVIDER!r}"
+    )
+
+# Anthropic Configuration
+# Required only when LLM_PROVIDER selects Anthropic: OpenAI's key (above)
+# remains required unconditionally, since OpenAI is still needed for
+# embeddings/vision/STT/TTS/image generation/image-intent classification no
+# matter which provider answers the general text-tutoring paths.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+if LLM_PROVIDER == LLMProvider.ANTHROPIC and not ANTHROPIC_API_KEY:
+    raise ValueError(
+        "ANTHROPIC_API_KEY is not set in .env file (required when LLM_PROVIDER=anthropic)"
+    )
+
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+
+# The one and only Anthropic endpoint this application ever talks to —
+# same rationale as OFFICIAL_OPENAI_BASE_URL above: the Anthropic SDK falls
+# back to reading an ANTHROPIC_BASE_URL environment variable whenever
+# base_url isn't passed explicitly (confirmed against the installed SDK: an
+# AsyncAnthropic() constructed without an explicit base_url picks up a
+# stray ANTHROPIC_BASE_URL immediately). This constant must never be made
+# configurable via the environment — that would reopen the same
+# silent-redirection risk this pattern already closes for OpenAI.
+OFFICIAL_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+
 # Bot Modes
 class BotMode:
     TEXT = "text"

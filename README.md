@@ -10,7 +10,9 @@
 
 1. Скопируйте `.env.example` в `.env` и заполните:
    - `TELEGRAM_BOT_TOKEN` — токен от [@BotFather](https://t.me/BotFather)
-   - `OPENAI_API_KEY` — ключ OpenAI
+   - `OPENAI_API_KEY` — ключ OpenAI (обязателен всегда: embeddings, Vision, STT, TTS, генерация изображений)
+   - `LLM_PROVIDER` — провайдер основного текстового диалога/RAG-ответов: `anthropic` (по умолчанию) или `openai`
+   - `ANTHROPIC_API_KEY` — ключ Anthropic (обязателен, если `LLM_PROVIDER=anthropic`)
    - `TELEGRAM_ALLOWED_USER_IDS` — числовые Telegram user id, кому разрешён доступ (через запятую)
 2. Установите зависимости: `pip install -r requirements.txt`
 3. Запуск: `python main.py`
@@ -33,7 +35,7 @@
 
 | Команда        | Описание |
 |----------------|----------|
-| `/mode text`   | Текстовый диалог по Python (GPT-4o) |
+| `/mode text`   | Текстовый диалог по Python (LLM_PROVIDER: Anthropic Claude по умолчанию, либо OpenAI) |
 | `/mode voice`  | Голосовые ответы (Whisper + TTS) |
 | `/mode rag`    | Ответы по базе знаний с указанием источников |
 | `/mode vision` | Анализ изображений (код, ошибки, схемы) |
@@ -84,7 +86,7 @@
 - `bot.py` — экземпляр бота (pyTelegramBotAPI)
 - `config.py` — настройки, пути, режимы
 - `handlers/` — start, text, voice, image, document_upload
-- `services/` — router, openai_client, stt, tts, vision, image_generation
+- `services/` — router, text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation
 - `rag/` — index (ChromaDB), query, loader (PDF, TXT, MD, DOCX)
 - `utils/` — logging, helpers (сессии, strip_markdown, очистка файлов)
 - `data/documents/` — файлы базы знаний для RAG (добавьте свои)
@@ -93,7 +95,7 @@
 
 ## Зависимости
 
-Основные: pyTelegramBotAPI, openai, chromadb, langchain, langchain-openai, langchain-community, pypdf, python-docx, docx2txt, Pillow, pydub, aiofiles, aiohttp.
+Основные: pyTelegramBotAPI, openai, anthropic, chromadb, langchain-core, langchain-openai, langchain-community, langchain-text-splitters, pypdf, docx2txt, pydub, aiofiles, aiohttp.
 
 Подробный список: `requirements.txt`.
 
