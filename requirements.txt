@@ -1,36 +1,51 @@
-# Telegram Bot (pyTelegramBotAPI)
-pyTelegramBotAPI>=4.14.0
-python-dotenv>=1.0.0
+# Runtime dependencies only.
+# Test/development dependencies live in requirements-dev.txt.
+#
+# Constraints are bounded (floor = version verified working in the Stage
+# 1F-A audit, cap = next breaking boundary) rather than pip-freeze pins, so
+# patch/minor updates keep flowing but a silent major-version jump (the
+# root cause of the Stage 1F-A langchain/openai drift) requires a deliberate
+# constraint change.
+
+# Telegram Bot (pyTelegramBotAPI, imported as `telebot`)
+pyTelegramBotAPI>=4.36.1,<5.0.0
+python-dotenv>=1.0.0,<2.0.0
 
 # OpenAI
-openai>=1.35.0
+# Verified against the actual SDK surface this repo uses (chat.completions,
+# audio.transcriptions, audio.speech) on the 3.x line; bounded below the
+# next major rather than reverting to the stale 1.x floor.
+openai>=3.3.1,<4.0.0
 
 # RAG and embeddings
-langchain>=0.2.0
-langchain-openai>=0.1.0
-langchain-community>=0.2.0
-chromadb>=0.4.0
-pypdf>=3.17.0
-PyPDF2>=3.0.0
-python-docx>=1.0.0
-docx2txt>=0.8
-sentence-transformers>=2.2.0
+# langchain-core and langchain-text-splitters are now declared directly:
+# rag/loader.py imports langchain_core.documents.Document and
+# langchain_text_splitters.RecursiveCharacterTextSplitter directly. Top-level
+# `langchain` is no longer imported anywhere in the source tree (its one use
+# site, rag/loader.py, was migrated to langchain_core) and is intentionally
+# not declared.
+langchain-core>=1.6.0,<2.0.0
+langchain-openai>=1.6.0,<2.0.0
+langchain-community>=0.4.2,<0.5.0
+langchain-text-splitters>=1.1.2,<2.0.0
+chromadb>=1.5.9,<2.0.0
 
-# Audio processing
-pydub>=0.25.1
+# Document parsing backends. Neither `pypdf` nor `docx2txt` is imported by
+# name anywhere in this repo's source; they are runtime backends required
+# by langchain_community's PyPDFLoader and Docx2txtLoader respectively
+# (rag/loader.py). Removing them breaks PDF/DOCX ingestion at runtime.
+pypdf>=6.16.2,<7.0.0
+docx2txt>=0.8,<1.0.0
 
-# Image processing
-Pillow>=10.0.0
+# Audio processing (shells out to the system ffmpeg binary; ffmpeg itself
+# is not a pip package and is not required for the offline test suite,
+# where audio decoding is mocked)
+pydub>=0.25.1,<1.0.0
 
 # Utilities
-aiofiles>=23.2.1
-aiohttp>=3.9.0
-python-multipart>=0.0.9
+aiofiles>=23.2.1,<26.0.0
+aiohttp>=3.9.0,<4.0.0
 
 # Explicit dependencies for compatibility
 numpy>=1.24.0; python_version < '3.13'
 numpy>=1.26.0; python_version >= '3.13'
-
-# Testing
-pytest>=8.0.0
-pytest-asyncio>=0.23.0

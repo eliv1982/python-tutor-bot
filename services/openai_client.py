@@ -4,7 +4,7 @@ Provides methods for text generation, vision, STT, and TTS.
 """
 
 from typing import List, Dict, Optional
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
 from pathlib import Path
 
 from config import (
@@ -34,7 +34,26 @@ class OpenAIClient:
         # SDK itself falls back to an OPENAI_BASE_URL *environment
         # variable* when base_url isn't passed — a stray leftover in a
         # developer's .env would otherwise silently re-route requests.
-        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OFFICIAL_OPENAI_BASE_URL)
+        #
+        # http_client is likewise pinned explicitly, with trust_env=False:
+        # the SDK's underlying httpx2.AsyncClient defaults to
+        # trust_env=True, which auto-discovers a proxy from
+        # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (and lowercase variants) *and*,
+        # if none of those are set, falls back to OS-level proxy discovery
+        # (Windows Registry / macOS system config via
+        # urllib.request.getproxies()). trust_env=False disables both
+        # discovery paths at the transport layer, so this client cannot be
+        # redirected through a proxy no matter what the environment or the
+        # OS reports — env-variable cleanup (see tests/conftest.py) remains
+        # useful as defense-in-depth but is no longer the only guarantee.
+        # DefaultAsyncHttpx2Client is the SDK's own public factory for its
+        # recommended httpx2 client defaults (timeout/limits/redirects);
+        # trust_env is passed through to httpx2.AsyncClient unchanged.
+        self.client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OFFICIAL_OPENAI_BASE_URL,
+            http_client=DefaultAsyncHttpx2Client(trust_env=False),
+        )
         logger.info("OpenAI client initialized with official OpenAI API")
     
     async def generate_text_response(

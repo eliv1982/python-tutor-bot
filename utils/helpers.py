@@ -12,7 +12,7 @@ import aiofiles
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-from config import BASE_DIR
+from config import DATA_DIR
 from utils.logging import logger
 
 
@@ -214,7 +214,7 @@ async def save_file_async(file_content: bytes, extension: str = "tmp") -> Path:
         Path to the saved file
     """
     filename = f"{uuid.uuid4()}.{extension}"
-    filepath = BASE_DIR / "data" / filename
+    filepath = DATA_DIR / filename
     
     try:
         async with aiofiles.open(filepath, 'wb') as f:

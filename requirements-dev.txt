@@ -1,0 +1,12 @@
+# Test / development dependencies.
+# Install alongside requirements.txt: pip install -r requirements.txt -r requirements-dev.txt
+
+pytest>=9.1.1,<10.0.0
+pytest-asyncio>=1.4.0,<2.0.0
+
+# Enforces the offline-test guarantee: pytest.ini's addopts pass
+# --disable-socket --allow-hosts=127.0.0.1,::1 on every normal `pytest`
+# invocation, so any code path that tries a real external network call
+# fails the test run instead of silently succeeding or silently being
+# skipped.
+pytest-socket>=0.8.1,<1.0.0

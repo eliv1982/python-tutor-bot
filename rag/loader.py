@@ -6,6 +6,7 @@ Loads and processes documents from various formats.
 from pathlib import Path
 from typing import List, Dict, Optional
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import DOCUMENTS_DIR, MANAGED_UPLOADS_DIR, RAG_CHUNK_SIZE, RAG_CHUNK_OVERLAP
@@ -133,8 +134,6 @@ class DocumentLoader:
             List of text chunks
         """
         try:
-            from langchain.schema import Document
-            
             # Create document
             document = Document(
                 page_content=text,

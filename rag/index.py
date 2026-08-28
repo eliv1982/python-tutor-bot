@@ -8,6 +8,7 @@ from typing import List, Optional
 from pathlib import Path
 import chromadb
 from chromadb.config import Settings
+import openai
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -48,9 +49,31 @@ class VectorIndex:
         # the OPENAI_API_BASE env var, and would otherwise pass base_url=
         # None down to the openai SDK, which itself falls back to
         # OPENAI_BASE_URL. Passing it here overrides both.
+        #
+        # openai_proxy=None overrides langchain-openai's own OPENAI_PROXY
+        # env-var fallback (`Field(default_factory=from_env("OPENAI_PROXY",
+        # ...))`) outright: an explicit kwarg always wins over the
+        # default_factory, so this field is None regardless of what
+        # OPENAI_PROXY is set to in the environment, now or after a later
+        # .env reload.
+        #
+        # http_client/http_async_client are pinned to the openai SDK's own
+        # public "recommended defaults" factories with trust_env=False,
+        # for the same reason as services/openai_client.py: the httpx2
+        # clients langchain-openai would otherwise build internally default
+        # to trust_env=True, which auto-discovers a proxy from
+        # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY or (absent those) OS-level proxy
+        # discovery (Windows Registry / macOS system config). Passing these
+        # explicitly also short-circuits langchain-openai's own
+        # openai_proxy-driven http_client construction in
+        # validate_environment(), which would otherwise raise ValueError if
+        # both openai_proxy and http_client were simultaneously non-empty.
         self.embeddings = OpenAIEmbeddings(
             openai_api_key=OPENAI_API_KEY,
-            base_url=OFFICIAL_OPENAI_BASE_URL
+            base_url=OFFICIAL_OPENAI_BASE_URL,
+            openai_proxy=None,
+            http_client=openai.DefaultHttpx2Client(trust_env=False),
+            http_async_client=openai.DefaultAsyncHttpx2Client(trust_env=False),
         )
         
         # Initialize or load vector store
