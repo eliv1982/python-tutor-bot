@@ -3,6 +3,7 @@ Document Upload Handler.
 Allows users to upload documents (PDF, TXT, MD, DOCX) for the RAG knowledge base.
 """
 
+import asyncio
 import uuid
 from telebot import types
 from pathlib import Path
@@ -12,7 +13,7 @@ from config import MANAGED_UPLOADS_DIR, MAX_DOCUMENT_SIZE_BYTES
 from rag.loader import document_loader, SUPPORTED_EXTENSIONS
 from rag.index import vector_index
 from utils.logging import logger
-from utils.helpers import download_telegram_file, cleanup_file
+from utils.helpers import download_telegram_file, cleanup_file, submit_worker, await_worker
 from utils.access_control import require_authorized
 
 
@@ -99,6 +100,90 @@ def _store_document_exclusively(file_bytes: bytes, extension: str, attempts: int
     raise RuntimeError("Could not allocate a unique document storage path") from last_collision_error
 
 
+def _load_and_index_document(physical_path: Path, display_name: str) -> list:
+    """
+    Runs document parsing (PyPDFLoader/TextLoader/Docx2txtLoader, CPU/disk
+    bound) and Chroma indexing (OpenAIEmbeddings network call + vector-store
+    write) as a single blocking unit, so the whole pipeline can be offloaded
+    to a worker thread in one `asyncio.to_thread()` call rather than
+    thread-hopping per step. No async/Telegram/UserSession work happens
+    between these two calls in the original code, so combining them changes
+    no ordering or behavior.
+    """
+    chunks = document_loader.load_document(physical_path, display_name=display_name)
+    vector_index.add_documents(chunks)
+    return chunks
+
+
+def _resolve_cancelled_storage(storage_future: "asyncio.Future", user_id: int) -> None:
+    """
+    Called from `process_document_upload`'s `except asyncio.CancelledError:`
+    handler around the storage step, after `await_worker(storage_future)`
+    has already blocked until `storage_future` reached a terminal state —
+    genuine terminal state of the executor thread itself (see
+    `utils.helpers.submit_worker()`), not merely of an asyncio Task wrapping
+    it — so it is always safe here to inspect/act on its outcome without
+    racing the worker thread.
+
+    Cleans up ONLY a file the worker itself newly created (never a
+    bystander); sends no Telegram message (the caller is already being
+    cancelled); logs only safe, sanitized metadata (Stage 1D).
+    """
+    if storage_future.cancelled():
+        return
+    exc = storage_future.exception()
+    if exc is not None:
+        # _store_document_exclusively() already cleans up its own partial
+        # write before raising — nothing new to delete. Retrieving the
+        # exception here just keeps asyncio from ever reporting it as
+        # "exception was never retrieved".
+        logger.warning(
+            "Document upload: cancelled during storage, worker failed | user_id=%s, error_type=%s",
+            user_id, type(exc).__name__
+        )
+        return
+    created_path = storage_future.result()
+    logger.warning(
+        "Document upload: cancelled during storage, removing orphaned file | user_id=%s",
+        user_id
+    )
+    cleanup_file(created_path)
+
+
+def _resolve_cancelled_indexing(index_future: "asyncio.Future", physical_path: Path, user_id: int) -> None:
+    """
+    Called from `process_document_upload`'s `except asyncio.CancelledError:`
+    handler around the load/index step, after `await_worker(index_future)`
+    has already blocked until `index_future` reached a terminal state —
+    genuine terminal state of the executor thread itself, not merely of an
+    asyncio Task wrapping it — so it is always safe here to touch
+    `physical_path`: the parser/indexer worker is guaranteed to be done with
+    it, never still reading it.
+
+    Sends no Telegram message; logs only safe, sanitized metadata (Stage 1D).
+    """
+    if index_future.cancelled():
+        cleanup_file(physical_path)
+        return
+    exc = index_future.exception()
+    if exc is not None:
+        # Ingestion did not commit — remove the newly-owned upload, same as
+        # the non-cancelled failure path.
+        logger.warning(
+            "Document upload: cancelled during indexing, ingestion did not commit | user_id=%s, error_type=%s",
+            user_id, type(exc).__name__
+        )
+        cleanup_file(physical_path)
+        return
+    # Indexing succeeded despite cancellation: chunks are already committed
+    # into Chroma. Never delete successfully ingested data, and skip the
+    # normal success notification — the request itself was cancelled.
+    logger.warning(
+        "Document upload: cancelled after indexing already committed, retaining file | user_id=%s",
+        user_id
+    )
+
+
 async def process_document_upload(message: types.Message, document: types.Document):
     """
     Process document upload for RAG.
@@ -118,6 +203,16 @@ async def process_document_upload(message: types.Message, document: types.Docume
     considered successfully ingested, and nothing after that point —
     including a failure to send the confirmation message — rolls back or
     deletes the stored file, or reports the upload as failed.
+
+    Stage 1E.2 cancellation safety: the storage write and the load/index
+    pipeline each run via `submit_worker()` (a bare default-executor Future,
+    never a Task — see utils/helpers.py), awaited through `await_worker()`.
+    If this coroutine is cancelled — even repeatedly, or as part of a
+    broad/shutdown-style sweep — the worker is never abandoned:
+    `_resolve_cancelled_storage()` / `_resolve_cancelled_indexing()` only
+    run once the worker has genuinely reached a terminal state, then the
+    original `asyncio.CancelledError` is re-raised. No Telegram message is
+    sent while resolving a cancellation.
     """
     user_id = message.from_user.id
     original_filename = document.file_name or "document"
@@ -155,15 +250,33 @@ async def process_document_upload(message: types.Message, document: types.Docume
             )
             return
 
-        physical_path = _store_document_exclusively(file_bytes, extension)
+        # Disk write of the downloaded bytes (up to MAX_DOCUMENT_SIZE_BYTES)
+        # is blocking I/O — run it off the event loop via submit_worker(),
+        # awaited through await_worker(): if this coroutine is cancelled
+        # (even repeatedly) while the write is in flight, the worker thread
+        # is never abandoned (see _resolve_cancelled_storage()).
+        storage_future = submit_worker(_store_document_exclusively, file_bytes, extension)
+        try:
+            physical_path = await await_worker(storage_future)
+        except asyncio.CancelledError:
+            _resolve_cancelled_storage(storage_future, user_id)
+            raise
 
         logger.info(
             "Document upload: file saved | user_id=%s, storage_name=%s, size_bytes=%s",
             user_id, physical_path.name, len(file_bytes)
         )
         await bot.send_message(message.chat.id, "📄 Индексирую документ...")
-        chunks = document_loader.load_document(physical_path, display_name=original_filename)
-        vector_index.add_documents(chunks)
+        # Parsing (PDF/DOCX/TXT) + Chroma/embeddings indexing is a blocking
+        # pipeline — same submit_worker()/await_worker() pattern: repeated
+        # cancellation here must not race the worker for ownership of
+        # `physical_path` (see _resolve_cancelled_indexing()).
+        index_future = submit_worker(_load_and_index_document, physical_path, original_filename)
+        try:
+            chunks = await await_worker(index_future)
+        except asyncio.CancelledError:
+            _resolve_cancelled_indexing(index_future, physical_path, user_id)
+            raise
         logger.info("Document indexed | user_id=%s, chunks=%s", user_id, len(chunks))
     except Exception as e:
         # document_loader.load_document() can fail on local PDF/TXT/DOCX

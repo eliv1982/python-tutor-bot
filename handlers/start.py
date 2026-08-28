@@ -3,6 +3,8 @@ Start and Help Command Handlers.
 Handles /start and /help commands using pyTelegramBotAPI.
 """
 
+import asyncio
+
 from telebot import types
 from bot import bot
 from utils.logging import logger
@@ -99,7 +101,15 @@ async def cmd_stats(message: types.Message):
     logger.info("Command /stats | user_id=%s", user_id)
     try:
         from rag.query import get_knowledge_base_stats
-        stats = get_knowledge_base_stats()
+        # get_knowledge_base_stats() reaches VectorIndex's shared lock,
+        # which a concurrent upload/RAG query may hold for a while — call it
+        # off the event loop so /stats can't stall on that contention.
+        #
+        # Stage 1E.1 cancellation review: same reasoning as rag/query.py's
+        # similarity search — deliberately unshielded. It's a read-only
+        # `collection.count()`, mutates nothing, and its result is simply
+        # discarded if the caller is cancelled — no cleanup/ownership race.
+        stats = await asyncio.to_thread(get_knowledge_base_stats)
         logger.debug("Command /stats | stats=%s", stats)
         if "error" in stats:
             await bot.send_message(

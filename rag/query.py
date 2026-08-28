@@ -3,6 +3,7 @@ RAG Query Handler.
 Handles queries against the knowledge base with context-aware responses.
 """
 
+import asyncio
 from typing import List, Dict, Optional
 
 from rag.index import vector_index
@@ -27,7 +28,18 @@ async def query_knowledge_base(
     """
     try:
         logger.info("RAG query_knowledge_base | query_len=%s, top_k=%s", len(query), RAG_TOP_K)
-        results = vector_index.similarity_search_with_score(query, k=RAG_TOP_K)
+        # Chroma similarity search + OpenAIEmbeddings is synchronous and
+        # blocking (network + local vector search) — run it off the event
+        # loop so one RAG query doesn't stall unrelated Telegram updates.
+        #
+        # Stage 1E.1 cancellation review: deliberately left as a plain
+        # `asyncio.to_thread()` (no shielding). If the caller is cancelled
+        # while this is in flight, the worker thread may keep running to
+        # completion, but it is read-only (never mutates UserSession, the
+        # Chroma store, or any file) and its result is simply discarded —
+        # there is no cleanup/ownership race to resolve, unlike the
+        # document-upload storage/indexing writes.
+        results = await asyncio.to_thread(vector_index.similarity_search_with_score, query, k=RAG_TOP_K)
         logger.debug("RAG similarity_search | results_count=%s", len(results))
         if not results:
             logger.warning("RAG: no results, using fallback")

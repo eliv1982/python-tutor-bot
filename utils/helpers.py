@@ -3,6 +3,8 @@ Helper functions for the Personal Assistant Bot.
 Provides utility functions for file operations, audio conversion, etc.
 """
 
+import asyncio
+import functools
 import os
 import re
 import uuid
@@ -12,6 +14,122 @@ from typing import Optional, Tuple, Union
 
 from config import BASE_DIR
 from utils.logging import logger
+
+
+def submit_worker(func, *args, **kwargs) -> "asyncio.Future":
+    """
+    Submit `func(*args, **kwargs)` to the running event loop's DEFAULT
+    executor and return the resulting `asyncio.Future` directly.
+
+    Deliberately NOT `asyncio.create_task(asyncio.to_thread(...))`.
+    `asyncio.to_thread()` is itself just `await
+    loop.run_in_executor(None, func)` — but wrapping that coroutine in a
+    `Task` means the Task owns the suspension point, and cancelling a Task
+    cancels whatever Future it is currently suspended on (its internal
+    `_fut_waiter`). Doing that here would cancel the run_in_executor Future
+    even while the callable is already RUNNING in the executor thread:
+    `concurrent.futures.Future.cancel()` on already-running work fails
+    silently, but the asyncio-level wrapper still flips to CANCELLED
+    immediately regardless — so a cancelled Task's terminal state is NOT
+    proof the underlying thread has actually stopped. Worse, that Task
+    would be independently reachable (and cancellable) by anything that
+    walks `asyncio.all_tasks()` (e.g. a shutdown sweep), bypassing any
+    shielding a caller does around it.
+
+    The Future returned here has none of that: it is never enumerated by
+    `asyncio.all_tasks()` (it isn't a Task), and nothing in this module ever
+    calls `.cancel()` on it — so it can only ever reach a terminal state
+    because the executor thread itself actually finished (with a result or
+    an exception). `await_worker()` below relies on exactly this guarantee.
+    """
+    loop = asyncio.get_running_loop()
+    return loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+
+
+async def await_worker(future: "asyncio.Future"):
+    """
+    Await `future` (from `submit_worker()`) without ever abandoning the
+    executor thread it represents, even under repeated — or shutdown-style,
+    broad — cancellation of the calling Task.
+
+    Normal path (never cancelled): behaves exactly like `await future` — a
+    worker result is returned, a worker exception propagates normally.
+
+    Cancelled path: the FIRST `asyncio.CancelledError` delivered to this
+    coroutine is recorded and NOT allowed to escape immediately. Instead we
+    loop and re-issue `asyncio.shield(future)`. Since shielding never cancels
+    `future` itself (see `submit_worker()`), the worker thread keeps running
+    completely undisturbed no matter how many further cancellations arrive
+    at this same await point — each one is caught the same way, and only the
+    ORIGINAL CancelledError is ever preserved. This is what lets a caller
+    survive being cancelled twice (or N times) without abandoning the
+    worker, and without an internal Task that a shutdown sweep over
+    `asyncio.all_tasks()` could reach independently of this loop.
+
+    Every `CancelledError` caught here has to be one of two different
+    things, distinguished by `future.cancelled()`:
+
+    - `future.cancelled()` is False: `future` itself is still alive (or
+      finished normally/with an exception) — this CancelledError came from
+      cancelling the outer `asyncio.shield(future)` wrapper, not `future`.
+      This is the ordinary "caller was cancelled while the worker keeps
+      running" case: record it (if it's the first) and loop again.
+    - `future.cancelled()` is True: `future` itself is already terminal —
+      cancelled, not merely "cancellation requested". There is no running
+      worker left to wait for, so looping again would spin forever: every
+      future re-`shield()` of an already-cancelled Future returns
+      immediately and raises this same CancelledError again with nothing
+      ever changing (see `submit_worker()` — nothing here calls `.cancel()`
+      on `future`, but a caller could still pass in one that is already
+      cancelled, e.g. never actually submitted). This case terminates the
+      loop immediately: if an outer cancellation was already recorded, that
+      ORIGINAL one stays the caller-visible outcome (the inner Future's own
+      cancellation is discarded, never allowed to override it); otherwise
+      this cancellation — genuinely `future`'s own — is re-raised as-is.
+
+    Once `future` genuinely reaches a terminal state:
+    - if a cancellation was recorded, the ORIGINAL `CancelledError` is
+      re-raised — never a later one, and never a worker exception in its
+      place. Callers are expected to inspect `future` themselves (now
+      guaranteed done: `.cancelled()` / `.exception()` / `.result()`) in
+      their own `except asyncio.CancelledError:` handler to decide what the
+      worker's real outcome means for the resources it owns. A worker
+      exception observed this way is retrieved via `future.exception()`
+      before this function returns, so asyncio never reports it as
+      "exception was never retrieved".
+    - if no cancellation was ever recorded, a worker exception simply
+      propagates from here like `await future` would.
+    """
+    first_cancellation: Optional[asyncio.CancelledError] = None
+    while True:
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                # `future` itself is terminal — no worker left to wait for.
+                # Looping again here would never suspend (every re-shield
+                # of an already-done Future returns synchronously), which
+                # is exactly the infinite-busy-loop this branch exists to
+                # avoid. Surface whichever cancellation is caller-visible.
+                if first_cancellation is not None:
+                    raise first_cancellation
+                raise
+            if first_cancellation is None:
+                first_cancellation = exc
+            continue
+        except Exception:
+            if first_cancellation is not None:
+                # The worker failed while we were already reconciling a
+                # cancellation. That outcome belongs to the caller's own
+                # resolver (via future.exception()) — it must not replace
+                # the cancellation the caller is entitled to see.
+                break
+            raise
+        else:
+            break
+    if first_cancellation is not None:
+        raise first_cancellation
+    return result
 
 
 class TelegramDownloadError(RuntimeError):

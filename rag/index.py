@@ -3,6 +3,7 @@ Vector Index for RAG.
 Creates and manages embeddings using ChromaDB.
 """
 
+import threading
 from typing import List, Optional
 from pathlib import Path
 import chromadb
@@ -30,7 +31,18 @@ class VectorIndex:
         
         self.persist_directory = Path(persist_directory)
         self.persist_directory.mkdir(parents=True, exist_ok=True)
-        
+
+        # Guards every method below that touches self.vectorstore (Chroma +
+        # its OpenAIEmbeddings function). Neither chromadb's local
+        # PersistentClient/HNSW index nor its SQLite metadata store is
+        # documented as safe for concurrent writes (or a write racing a
+        # read) from multiple threads, and this instance is shared across
+        # every worker thread an offloaded RAG query/document-upload/
+        # startup-index call runs in. Reentrant (RLock) because
+        # index_documents_directory() calls clear_index() and
+        # add_documents() on itself while already holding the lock.
+        self._lock = threading.RLock()
+
         # Initialize embeddings
         # base_url is pinned explicitly: langchain-openai defaults it from
         # the OPENAI_API_BASE env var, and would otherwise pass base_url=
@@ -75,7 +87,8 @@ class VectorIndex:
             if not documents:
                 logger.warning("RAG index add_documents: empty list")
                 return
-            self.vectorstore.add_documents(documents)
+            with self._lock:
+                self.vectorstore.add_documents(documents)
             logger.info("RAG index add_documents | count=%s", len(documents))
         except Exception as e:
             # This call embeds documents via OpenAIEmbeddings (a network call
@@ -100,7 +113,8 @@ class VectorIndex:
             List of relevant document chunks
         """
         try:
-            results = self.vectorstore.similarity_search(query, k=k)
+            with self._lock:
+                results = self.vectorstore.similarity_search(query, k=k)
             logger.debug("RAG similarity_search | query_len=%s, k=%s, results=%s", len(query), k, len(results))
             return results
         except Exception as e:
@@ -125,7 +139,8 @@ class VectorIndex:
             List of (document, score) tuples
         """
         try:
-            results = self.vectorstore.similarity_search_with_score(query, k=k)
+            with self._lock:
+                results = self.vectorstore.similarity_search_with_score(query, k=k)
             logger.debug("RAG similarity_search_with_score | k=%s, results=%s", k, len(results))
             return results
         except Exception as e:
@@ -148,21 +163,22 @@ class VectorIndex:
             Number of documents indexed
         """
         try:
-            # Clear existing index if requested
-            if force_reindex:
-                logger.info("Clearing existing index")
-                self.clear_index()
-            
-            # Load documents
-            documents = document_loader.load_directory(directory)
-            
-            if not documents:
-                logger.warning("No documents found to index")
-                return 0
-            
-            # Add to vector store
-            self.add_documents(documents)
-            
+            with self._lock:
+                # Clear existing index if requested
+                if force_reindex:
+                    logger.info("Clearing existing index")
+                    self.clear_index()
+
+                # Load documents
+                documents = document_loader.load_directory(directory)
+
+                if not documents:
+                    logger.warning("No documents found to index")
+                    return 0
+
+                # Add to vector store
+                self.add_documents(documents)
+
             logger.info("RAG index_documents_directory | chunks=%s", len(documents))
             return len(documents)
         except Exception as e:
@@ -172,14 +188,15 @@ class VectorIndex:
     def clear_index(self):
         """Clear the entire vector store."""
         try:
-            # Delete and recreate
-            import shutil
-            if self.persist_directory.exists():
-                shutil.rmtree(self.persist_directory)
-            
-            self.persist_directory.mkdir(parents=True, exist_ok=True)
-            self._load_or_create_vectorstore()
-            
+            with self._lock:
+                # Delete and recreate
+                import shutil
+                if self.persist_directory.exists():
+                    shutil.rmtree(self.persist_directory)
+
+                self.persist_directory.mkdir(parents=True, exist_ok=True)
+                self._load_or_create_vectorstore()
+
             logger.info("RAG index cleared")
         except Exception as e:
             logger.error("RAG clear_index failed | error_type=%s", type(e).__name__)
@@ -194,8 +211,9 @@ class VectorIndex:
         """
         try:
             # ChromaDB collection stats
-            collection = self.vectorstore._collection
-            count = collection.count()
+            with self._lock:
+                collection = self.vectorstore._collection
+                count = collection.count()
 
             # No absolute filesystem path here: this dict is displayed
             # verbatim to the user by handlers/start.py's /stats command,
