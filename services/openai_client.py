@@ -70,7 +70,9 @@ class OpenAIClient:
             logger.info("OpenAI text response | model=%s, len=%s%s", model, len(result), tokens)
             return result
         except Exception as e:
-            logger.error("OpenAI text response failed | model=%s, error=%s", model, e, exc_info=True)
+            # OpenAI SDK exceptions (HTTP/auth/rate-limit) are external and
+            # must never be logged raw — only their class name is safe.
+            logger.error("OpenAI text response failed | model=%s, error_type=%s", model, type(e).__name__)
             raise
     
     async def analyze_image(
@@ -122,7 +124,7 @@ class OpenAIClient:
             logger.info("OpenAI vision done | model=%s, result_len=%s", model, len(result))
             return result
         except Exception as e:
-            logger.error("OpenAI vision failed | model=%s, error=%s", model, e, exc_info=True)
+            logger.error("OpenAI vision failed | model=%s, error_type=%s", model, type(e).__name__)
             raise
     
     async def transcribe_audio(
@@ -141,7 +143,7 @@ class OpenAIClient:
             Transcribed text
         """
         try:
-            logger.info("OpenAI Whisper transcribe | path=%s, model=%s", audio_file_path, model)
+            logger.info("OpenAI Whisper transcribe | model=%s", model)
             with open(audio_file_path, "rb") as audio_file:
                 response = await self.client.audio.transcriptions.create(
                     model=model,
@@ -152,7 +154,7 @@ class OpenAIClient:
             logger.info("OpenAI Whisper done | result_len=%s", len(response))
             return response
         except Exception as e:
-            logger.error("OpenAI Whisper failed | path=%s, error=%s", audio_file_path, e, exc_info=True)
+            logger.error("OpenAI Whisper failed | error_type=%s", type(e).__name__)
             raise
     
     async def generate_speech(
@@ -191,10 +193,10 @@ class OpenAIClient:
             # Save audio to file
             response.stream_to_file(str(output_path))
             
-            logger.info("OpenAI TTS done | path=%s", output_path)
+            logger.info("OpenAI TTS done | name=%s", output_path.name)
             return output_path
         except Exception as e:
-            logger.error("OpenAI TTS failed | voice=%s, error=%s", voice, e, exc_info=True)
+            logger.error("OpenAI TTS failed | voice=%s, error_type=%s", voice, type(e).__name__)
             raise
 
 

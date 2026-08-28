@@ -70,10 +70,16 @@ class DocumentLoader:
                 chunk.metadata['source'] = source_name
                 chunk.metadata['file_path'] = str(file_path)
 
-            logger.info("RAG loader load_document | file=%s, source=%s, chunks=%s", file_path.name, source_name, len(chunks))
+            # source_name can be a user-controlled Telegram display filename
+            # (see document_upload.py's display_name= usage) — log only the
+            # extension and chunk count, never the name itself.
+            logger.info("RAG loader load_document | extension=%s, chunks=%s", file_path.suffix.lower(), len(chunks))
             return chunks
         except Exception as e:
-            logger.error("RAG loader load_document failed | file=%s, error=%s", file_path, e, exc_info=True)
+            # Parser errors (PyPDFLoader/TextLoader/Docx2txtLoader) can echo
+            # fragments of the document's raw bytes/content in their message
+            # — never log the raw exception text or a traceback here.
+            logger.error("RAG loader load_document failed | extension=%s, error_type=%s", file_path.suffix.lower(), type(e).__name__)
             raise
     
     def load_directory(self, directory: Path = DOCUMENTS_DIR) -> List[Dict]:
@@ -105,12 +111,14 @@ class DocumentLoader:
                 try:
                     chunks = self.load_document(file_path)
                     all_chunks.extend(chunks)
-                except Exception as e:
-                    logger.warning("RAG loader: skipping file | file=%s, error=%s", file_path.name, e)
-            logger.info("RAG loader load_directory | directory=%s, total_chunks=%s", directory, len(all_chunks))
+                except Exception:
+                    # load_document() already logged the sanitized failure.
+                    logger.warning("RAG loader: skipping file | extension=%s", file_path.suffix.lower())
+            # No absolute directory path in logs (deployment layout/username).
+            logger.info("RAG loader load_directory | total_chunks=%s", len(all_chunks))
             return all_chunks
         except Exception as e:
-            logger.error("RAG loader load_directory failed | directory=%s, error=%s", directory, e, exc_info=True)
+            logger.error("RAG loader load_directory failed | error_type=%s", type(e).__name__)
             raise
     
     def load_text(self, text: str, source: str = "manual_input") -> List[Dict]:
@@ -138,9 +146,9 @@ class DocumentLoader:
             
             logger.info(f"Created {len(chunks)} chunks from text input")
             return chunks
-            
+
         except Exception as e:
-            logger.error(f"Error loading text: {e}")
+            logger.error("RAG loader load_text failed | error_type=%s", type(e).__name__)
             raise
 
 

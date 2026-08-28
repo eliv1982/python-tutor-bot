@@ -315,6 +315,14 @@ async def test_managed_upload_not_reloaded_with_opaque_source_on_startup_scan(mo
 
 @pytest.mark.asyncio
 async def test_loader_failure_cleans_up_newly_created_file(monkeypatch, tmp_path, caplog):
+    """
+    Stage 1D.1: document_loader.load_document() can fail on a provider/HTTP
+    exception too (its caller, vector_index.add_documents(), reaches
+    OpenAIEmbeddings over the network for OTHER chunks in the same request
+    lifecycle), so the failure log here only ever carries safe metadata —
+    never the raw exception text. Cleanup/user-response guarantees from
+    Stage 1B are unchanged.
+    """
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
     monkeypatch.setattr(
         document_upload.document_loader, "load_document",
@@ -334,9 +342,12 @@ async def test_loader_failure_cleans_up_newly_created_file(monkeypatch, tmp_path
     assert list(tmp_path.iterdir()) == []  # orphan file removed
     add_mock.assert_not_called()
 
-    # Real exception is logged (not hidden)...
-    assert "corrupt PDF stream at offset 42" in caplog.text
-    # ...but not exposed raw to the user.
+    # The raw exception message is never logged...
+    assert "corrupt PDF stream at offset 42" not in caplog.text
+    # ...but a safe, structured event + exception class name still is.
+    assert "Document upload failed" in caplog.text
+    assert "ValueError" in caplog.text
+    # ...and it's not exposed raw to the user either.
     last_message = send_message_mock.await_args.args[1]
     assert "corrupt PDF stream" not in last_message
     assert "ошибка" in last_message.lower()
@@ -344,6 +355,12 @@ async def test_loader_failure_cleans_up_newly_created_file(monkeypatch, tmp_path
 
 @pytest.mark.asyncio
 async def test_indexing_failure_cleans_up_newly_created_file(monkeypatch, tmp_path, caplog):
+    """
+    Stage 1D.1: vector_index.add_documents() embeds chunks via
+    OpenAIEmbeddings (a network call) before writing to Chroma, so a
+    RuntimeError here can genuinely be a provider/HTTP exception — the
+    failure log only ever carries safe metadata, never raw exception text.
+    """
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
     monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=["chunk"]))
     monkeypatch.setattr(
@@ -360,7 +377,9 @@ async def test_indexing_failure_cleans_up_newly_created_file(monkeypatch, tmp_pa
         await document_upload.process_document_upload(message, document)
 
     assert list(tmp_path.iterdir()) == []  # orphan file removed
-    assert "chroma collection unavailable" in caplog.text
+    assert "chroma collection unavailable" not in caplog.text
+    assert "Document upload failed" in caplog.text
+    assert "RuntimeError" in caplog.text
     last_message = send_message_mock.await_args.args[1]
     assert "chroma collection unavailable" not in last_message
     assert "ошибка" in last_message.lower()

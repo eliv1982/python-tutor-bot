@@ -16,8 +16,10 @@ from config import BotMode, DEFAULT_MODE
 async def cmd_start(message: types.Message):
     """Handle /start command."""
     user_id = message.from_user.id
+    # first_name is user-controlled personal data — used in the greeting
+    # text sent back to this same user below, but never logged.
     user_name = message.from_user.first_name
-    logger.info("Command /start | user_id=%s, username=%s", user_id, user_name)
+    logger.info("Command /start | user_id=%s", user_id)
     
     # Initialize user session
     user_sessions.set_mode(user_id, DEFAULT_MODE)
@@ -107,12 +109,10 @@ async def cmd_stats(message: types.Message):
             return
         
         total_docs = stats.get("total_documents", 0)
-        persist_dir = stats.get("persist_directory", "N/A")
-        
+
         stats_text = f"""📊 Статистика базы знаний
 
 📄 Документов в индексе: {total_docs}
-💾 Директория: {persist_dir}
 
 {"✅ База знаний готова к использованию!" if total_docs > 0 else "⚠️ База знаний пуста. Добавьте документы в data/documents/"}
 
@@ -121,7 +121,7 @@ async def cmd_stats(message: types.Message):
         await bot.send_message(message.chat.id, stats_text)
         
     except Exception as e:
-        logger.error("Command /stats failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        logger.error("Command /stats failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "⚠️ Ошибка получения статистики базы знаний."

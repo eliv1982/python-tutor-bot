@@ -70,7 +70,9 @@ async def handle_photo_message(message: types.Message):
             f"🔍 Анализ изображения:\n\n{strip_markdown(response['text'])}"
         )
     except Exception as e:
-        logger.error("Photo handler failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        # Wraps Telegram send calls and the OpenAI Vision call — never log
+        # raw exception text.
+        logger.error("Photo handler failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка при анализе изображения.\n"

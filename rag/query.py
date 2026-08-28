@@ -41,14 +41,19 @@ async def query_knowledge_base(
             context=context,
             conversation_history=conversation_history
         )
-        # Добавляем ссылки на источники
+        # Добавляем ссылки на источники (user-facing attribution — sent to
+        # the same user who owns/uploaded these documents, not a log).
         sources = list({doc.metadata.get("source", "?") for doc, _ in results})
         sources_str = ", ".join(sources)
         response = response.rstrip() + "\n\nИсточник(и): " + sources_str
-        logger.info("RAG query done | response_len=%s, sources=%s", len(response), sources)
+        # Source filenames can be user-controlled/confidential (Stage 1B
+        # display_name) — log only a count, never the names themselves.
+        logger.info("RAG query done | response_len=%s, source_count=%s", len(response), len(sources))
         return response
     except Exception as e:
-        logger.error("RAG query_knowledge_base failed | error=%s", e, exc_info=True)
+        # Wraps Chroma similarity search (embeddings network call) and the
+        # OpenAI chat completion — never log raw exception text.
+        logger.error("RAG query_knowledge_base failed | error_type=%s", type(e).__name__)
         # Fallback to regular GPT response
         return await _fallback_response(query, conversation_history)
 
@@ -188,7 +193,10 @@ async def add_document_to_knowledge_base(file_path: str) -> dict:
         # Add to index
         vector_index.add_documents(documents)
         
-        logger.info("RAG add_document | file=%s, chunks=%s", file_path.name, len(documents))
+        # file_path.name is caller-supplied and not guaranteed non-sensitive
+        # (this helper is currently unused, but future callers could pass a
+        # user-controlled path) — log only the chunk count.
+        logger.info("RAG add_document | chunks=%s", len(documents))
         
         return {
             "success": True,
@@ -198,11 +206,11 @@ async def add_document_to_knowledge_base(file_path: str) -> dict:
         }
         
     except Exception as e:
-        logger.error("RAG add_document failed | file=%s, error=%s", file_path, e, exc_info=True)
+        logger.error("RAG add_document failed | error_type=%s", type(e).__name__)
         return {
             "success": False,
-            "error": str(e),
-            "message": f"Ошибка при добавлении документа: {e}"
+            "error": type(e).__name__,
+            "message": "Ошибка при добавлении документа."
         }
 
 

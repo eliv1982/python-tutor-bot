@@ -101,10 +101,12 @@ async def save_file_async(file_content: bytes, extension: str = "tmp") -> Path:
     try:
         async with aiofiles.open(filepath, 'wb') as f:
             await f.write(file_content)
-        logger.debug(f"File saved: {filepath}")
+        logger.debug("File saved | name=%s", filepath.name)
         return filepath
     except Exception as e:
-        logger.error(f"Error saving file: {e}")
+        # OSError messages commonly embed the full path (and therefore the
+        # deployment's absolute directory structure) — log only the type.
+        logger.error("Error saving file | error_type=%s", type(e).__name__)
         raise
 
 
@@ -122,19 +124,22 @@ def convert_ogg_to_wav(ogg_path: Union[str, Path]) -> Path:
         # Lazy import to avoid audioop error on startup
         from pydub import AudioSegment
     except ImportError as e:
-        logger.error(f"pydub not available: {e}. Install ffmpeg and audioop support.")
+        logger.error("pydub not available | error_type=%s", type(e).__name__)
         raise
-    
+
     ogg_path = Path(ogg_path)
     wav_path = ogg_path.with_suffix('.wav')
-    
+
     try:
         audio = AudioSegment.from_ogg(ogg_path)
         audio.export(wav_path, format='wav')
-        logger.debug(f"Converted {ogg_path} to {wav_path}")
+        logger.debug("Audio conversion done | name=%s", wav_path.name)
         return wav_path
     except Exception as e:
-        logger.error(f"Error converting audio: {e}")
+        # AudioSegment.from_ogg()/export() shell out to ffmpeg; its stderr
+        # can embed absolute input paths, codec/container metadata, or
+        # user-controlled media metadata — never log raw exception text.
+        logger.error("Audio conversion failed | error_type=%s", type(e).__name__)
         raise
 
 
@@ -151,9 +156,9 @@ def cleanup_file(filepath: Union[str, Path, None]) -> None:
         filepath = Path(filepath)
         if filepath.exists():
             filepath.unlink()
-            logger.debug(f"Cleaned up file: {filepath}")
+            logger.debug("Cleaned up file | name=%s", filepath.name)
     except Exception as e:
-        logger.warning(f"Error cleaning up file {filepath}: {e}")
+        logger.warning("Error cleaning up file | error_type=%s", type(e).__name__)
 
 
 def cleanup_files(*filepaths: Union[str, Path]) -> None:

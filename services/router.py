@@ -72,10 +72,11 @@ async def route_text_request(
         }
         
     except Exception as e:
-        logger.error("route_text_request failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        # Wraps OpenAI/RAG calls — never log or return raw exception text.
+        logger.error("route_text_request failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         return {
             "text": "Извините, произошла ошибка при обработке запроса.",
-            "error": str(e)
+            "error": type(e).__name__
         }
 
 
@@ -94,7 +95,7 @@ async def route_voice_request(
         Response dictionary with 'text', 'transcription', 'voice_path', and optional 'image_path'
     """
     try:
-        logger.info("route_voice_request start | user_id=%s, path=%s", user_id, voice_path)
+        logger.info("route_voice_request start | user_id=%s", user_id)
         transcription = await transcribe_voice_message(voice_path)
         logger.info("route_voice_request: transcribed | user_id=%s, len=%s", user_id, len(transcription))
         
@@ -117,7 +118,7 @@ async def route_voice_request(
         plain_text = strip_markdown(text_response["text"])
         logger.debug("route_voice_request: generating TTS | user_id=%s, voice=%s", user_id, user_voice)
         voice_response_path = await generate_voice_response(plain_text, voice=user_voice)
-        logger.info("route_voice_request done | user_id=%s, voice_path=%s", user_id, voice_response_path)
+        logger.info("route_voice_request done | user_id=%s", user_id)
         return {
             "text": plain_text,
             "transcription": transcription,
@@ -126,10 +127,10 @@ async def route_voice_request(
         }
         
     except Exception as e:
-        logger.error("route_voice_request failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        logger.error("route_voice_request failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         return {
             "text": "Извините, произошла ошибка при обработке голосового сообщения.",
-            "error": str(e)
+            "error": type(e).__name__
         }
 
 
@@ -174,10 +175,10 @@ async def route_image_request(
         logger.info("route_image_request done | user_id=%s, analysis_len=%s", user_id, len(analysis))
         return {"text": analysis}
     except Exception as e:
-        logger.error("route_image_request failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        logger.error("route_image_request failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         return {
             "text": "Извините, произошла ошибка при анализе изображения.",
-            "error": str(e)
+            "error": type(e).__name__
         }
 
 
@@ -216,7 +217,7 @@ async def route_rag_request(
         }
         
     except Exception as e:
-        logger.error(f"Error routing RAG request: {e}")
+        logger.error("route_rag_request failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         # Fallback to regular text response
         return await route_text_request(user_id, query, mode=BotMode.TEXT)
 
@@ -278,8 +279,12 @@ async def route_image_generation_request(
         }
         
     except Exception as e:
-        logger.error("route_image_generation failed | user_id=%s, error=%s", user_id, e, exc_info=True)
-        
+        # Wraps a direct DALL-E HTTPS call carrying the Authorization
+        # header — never log raw exception text or a traceback. The
+        # str(e).lower() checks below only classify which pre-written
+        # generic message to show; they never surface e's content itself.
+        logger.error("route_image_generation failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
+
         # Add error to history
         user_sessions.add_message(user_id, "user", f"[Запрос на генерацию изображения: {original_text}]")
         
@@ -296,7 +301,7 @@ async def route_image_generation_request(
         
         return {
             "text": error_message,
-            "error": str(e),
+            "error": type(e).__name__,
             "has_image": False
         }
 

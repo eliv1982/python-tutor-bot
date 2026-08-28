@@ -18,7 +18,11 @@ async def setup_bot():
         from handlers import start, text, voice, image, document_upload
         logger.info("Setup: handlers loaded (start, text, voice, image, document_upload)")
     except Exception as e:
-        logger.error("Setup: failed to import handlers: %s", e, exc_info=True)
+        # An import failure's traceback/message can embed absolute source
+        # paths, the OS username, site-packages/dependency locations, and
+        # other environment-dependent detail — never guaranteed harmless,
+        # so only the exception's class name is logged here.
+        logger.error("Setup: handler import failed | error_type=%s", type(e).__name__)
         raise
     
     try:
@@ -28,22 +32,29 @@ async def setup_bot():
 
         docs = list(DOCUMENTS_DIR.glob('*'))
         docs = [d for d in docs if d.is_file() and d.suffix.lower() in SUPPORTED_EXTENSIONS]
-        logger.debug("Setup: RAG documents dir scan: path=%s, files=%s", DOCUMENTS_DIR, [d.name for d in docs])
-        
+        # Count only: neither the filenames nor the absolute directory path
+        # (which reveals the deployment's filesystem layout/username) are
+        # needed for this diagnostic.
+        logger.debug("Setup: RAG documents dir scan | file_count=%s", len(docs))
+
         if docs:
-            logger.info("Setup: RAG indexing started, documents=%s", [d.name for d in docs])
+            logger.info("Setup: RAG indexing started, document_count=%s", len(docs))
             count = vector_index.index_documents_directory(force_reindex=False)
             logger.info("Setup: RAG indexing done, chunks_indexed=%s", count)
         else:
             logger.info("Setup: RAG skipped, no documents in data/documents/")
     except Exception as e:
-        logger.warning("Setup: RAG init failed (non-fatal): %s", e, exc_info=True)
+        # index_documents_directory() calls OpenAIEmbeddings (network) —
+        # never log raw exception text.
+        logger.warning("Setup: RAG init failed (non-fatal) | error_type=%s", type(e).__name__)
     
     try:
         bot_info = await bot.get_me()
         logger.info("Setup: Telegram API OK, bot=@%s", bot_info.username)
     except Exception as e:
-        logger.error("Setup: Telegram get_me failed: %s", e, exc_info=True)
+        # A direct Telegram API call: its HTTP exception can embed the
+        # token-bearing request URL — never log raw exception text.
+        logger.error("Setup: Telegram get_me failed | error_type=%s", type(e).__name__)
 
 
 async def shutdown_bot():
@@ -53,7 +64,7 @@ async def shutdown_bot():
         await bot.close_session()
         logger.debug("Shutdown: session closed")
     except Exception as e:
-        logger.debug("Shutdown: close_session exception (ignored): %s", e)
+        logger.debug("Shutdown: close_session exception (ignored) | error_type=%s", type(e).__name__)
     logger.info("Shutdown: complete")
 
 
@@ -72,7 +83,11 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        # This top-level handler can catch anything bubbling out of
+        # infinity_polling(), a live Telegram API call whose exceptions can
+        # embed the token-bearing request URL — never log raw exception
+        # text or a traceback.
+        logger.error("Fatal error | error_type=%s", type(e).__name__)
         sys.exit(1)
     finally:
         await shutdown_bot()
@@ -87,4 +102,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Bot stopped")
     except Exception as e:
-        logger.error(f"Startup error: {e}", exc_info=True)
+        logger.error("Startup error | error_type=%s", type(e).__name__)

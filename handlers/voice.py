@@ -84,7 +84,7 @@ async def handle_voice_message(message: types.Message):
     """Handle voice messages."""
     user_id = message.from_user.id
     
-    logger.info("Voice message | user_id=%s, file_id=%s", user_id, message.voice.file_id if message.voice else None)
+    logger.info("Voice message | user_id=%s", user_id)
     
     await bot.send_chat_action(message.chat.id, 'typing')
     
@@ -99,7 +99,7 @@ async def handle_voice_message(message: types.Message):
         # Save to temporary file
         voice_file_path = await save_file_async(voice_bytes, "ogg")
         
-        logger.debug("Voice file saved | user_id=%s, path=%s", user_id, voice_file_path)
+        logger.debug("Voice file saved | user_id=%s, name=%s", user_id, voice_file_path.name)
         
         # Process voice request
         response = await route_voice_request(user_id, voice_file_path)
@@ -124,7 +124,7 @@ async def handle_voice_message(message: types.Message):
                     await bot.send_photo(message.chat.id, photo)
                 logger.debug("Voice: image sent | user_id=%s", user_id)
             except Exception as img_error:
-                logger.error("Voice: failed to send image | user_id=%s, error=%s", user_id, img_error)
+                logger.error("Voice: failed to send image | user_id=%s, error_type=%s", user_id, type(img_error).__name__)
             
             return
         
@@ -139,7 +139,9 @@ async def handle_voice_message(message: types.Message):
                 await bot.send_voice(message.chat.id, audio)
     
     except Exception as e:
-        logger.error("Voice message failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        # Wraps Telegram send calls (token-bearing request URL on HTTP
+        # failure) alongside STT/TTS/router calls — never log raw text.
+        logger.error("Voice message failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка при обработке голосового сообщения.\n"

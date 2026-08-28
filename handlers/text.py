@@ -149,7 +149,7 @@ async def cmd_image(message: types.Message):
                 cleanup_file(image_path)
     
     except Exception as e:
-        logger.error("Command /image failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        logger.error("Command /image failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка при генерации изображения.\n"
@@ -163,7 +163,7 @@ async def handle_text_message(message: types.Message):
     """Handle regular text messages. Если есть ожидающее изображение — это вопрос к нему."""
     user_id = message.from_user.id
     text = message.text.strip()
-    logger.info("Text message | user_id=%s, text_len=%s, preview=%s", user_id, len(text), text[:80].replace("\n", " "))
+    logger.info("Text message | user_id=%s, text_len=%s", user_id, len(text))
 
     pending_image_data_url = user_sessions.get_pending_image(user_id)
     if pending_image_data_url:
@@ -181,7 +181,9 @@ async def handle_text_message(message: types.Message):
                 f"🔍 Анализ изображения:\n\n{strip_markdown(response['text'])}"
             )
         except Exception as e:
-            logger.error("Image follow-up failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+            # Wraps Telegram send calls (token-bearing request URL on HTTP
+            # failure) alongside router/OpenAI calls — never log raw text.
+            logger.error("Image follow-up failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
             await bot.send_message(
                 message.chat.id,
                 "❌ Ошибка при анализе изображения. Попробуйте отправить изображение с подписью."
@@ -241,7 +243,9 @@ async def handle_text_message(message: types.Message):
             await bot.send_message(message.chat.id, strip_markdown(response["text"]))
     
     except Exception as e:
-        logger.error("Text message handler failed | user_id=%s, error=%s", user_id, e, exc_info=True)
+        # Wraps Telegram send calls (token-bearing request URL on HTTP
+        # failure) alongside router/OpenAI/TTS calls — never log raw text.
+        logger.error("Text message handler failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка при обработке сообщения.\n"

@@ -41,10 +41,11 @@ async def generate_voice_response(
             voice = DEFAULT_VOICE
         logger.debug("TTS generate_voice_response | voice=%s, text_len=%s", voice, len(text))
         audio_path = await openai_client.generate_speech(text, voice=voice)
-        logger.info("TTS done | path=%s", audio_path)
+        logger.info("TTS done | name=%s", audio_path.name)
         return audio_path
     except Exception as e:
-        logger.error("TTS failed | voice=%s, error=%s", voice, e, exc_info=True)
+        # Wraps an OpenAI TTS API call — never log raw exception text.
+        logger.error("TTS failed | voice=%s, error_type=%s", voice, type(e).__name__)
         raise
 
 

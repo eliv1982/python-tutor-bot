@@ -32,7 +32,9 @@ async def handle_document_message(message: types.Message):
     """Route document messages: RAG upload for PDF/TXT/MD/DOCX, info for images."""
     document = message.document
     user_id = message.from_user.id
-    logger.info("Document received | user_id=%s, file_name=%s, mime=%s, size=%s", user_id, document.file_name, document.mime_type, getattr(document, "file_size", None))
+    # document.file_name is a user-controlled Telegram display filename and
+    # may carry personal/confidential information — never logged raw.
+    logger.info("Document received | user_id=%s, mime=%s, size=%s", user_id, document.mime_type, getattr(document, "file_size", None))
     if not document.mime_type:
         logger.warning("Document: unknown mime_type | user_id=%s", user_id)
         await bot.send_message(message.chat.id, "❌ Не удалось определить тип файла.")
@@ -122,7 +124,7 @@ async def process_document_upload(message: types.Message, document: types.Docume
     extension = Path(original_filename).suffix.lower()
 
     if extension not in SUPPORTED_EXTENSIONS:
-        logger.debug("Document upload: unsupported extension | user_id=%s, original_name=%s, extension=%s", user_id, original_filename, extension)
+        logger.debug("Document upload: unsupported extension | user_id=%s, extension=%s", user_id, extension)
         await bot.send_message(
             message.chat.id,
             f"❌ Неподдерживаемое расширение файла: {extension or '(нет расширения)'}\n\n"
@@ -143,8 +145,8 @@ async def process_document_upload(message: types.Message, document: types.Docume
         # not Telegram-reported metadata, before any disk write/parsing.
         if len(file_bytes) > MAX_DOCUMENT_SIZE_BYTES:
             logger.warning(
-                "Document upload rejected: oversized | user_id=%s, original_name=%s, size_bytes=%s",
-                user_id, original_filename, len(file_bytes)
+                "Document upload rejected: oversized | user_id=%s, extension=%s, size_bytes=%s",
+                user_id, extension, len(file_bytes)
             )
             await bot.send_message(
                 message.chat.id,
@@ -156,15 +158,21 @@ async def process_document_upload(message: types.Message, document: types.Docume
         physical_path = _store_document_exclusively(file_bytes, extension)
 
         logger.info(
-            "Document upload: file saved | user_id=%s, original_name=%s, storage_name=%s, size_bytes=%s",
-            user_id, original_filename, physical_path.name, len(file_bytes)
+            "Document upload: file saved | user_id=%s, storage_name=%s, size_bytes=%s",
+            user_id, physical_path.name, len(file_bytes)
         )
         await bot.send_message(message.chat.id, "📄 Индексирую документ...")
         chunks = document_loader.load_document(physical_path, display_name=original_filename)
         vector_index.add_documents(chunks)
-        logger.info("Document indexed | user_id=%s, original_name=%s, chunks=%s", user_id, original_filename, len(chunks))
+        logger.info("Document indexed | user_id=%s, chunks=%s", user_id, len(chunks))
     except Exception as e:
-        logger.error("Document upload failed | user_id=%s, original_name=%s, error=%s", user_id, original_filename, e, exc_info=True)
+        # document_loader.load_document() can fail on local PDF/TXT/DOCX
+        # parsing, and vector_index.add_documents() reaches Chroma +
+        # OpenAIEmbeddings (a network call to OpenAI) — either can surface a
+        # provider/HTTP exception, so only the exception's class name is
+        # logged here, never its text, a traceback, or the user-controlled
+        # original filename.
+        logger.error("Document upload failed | user_id=%s, extension=%s, error_type=%s", user_id, extension, type(e).__name__)
         cleanup_file(physical_path)
         await bot.send_message(
             message.chat.id,

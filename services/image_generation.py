@@ -105,11 +105,13 @@ async def detect_image_generation_intent(text: str, conversation_history: list =
                 result['prompt'] = text
         
         logger.debug("Image generation detection | needs_generation=%s, confidence=%s", result.get('needs_generation'), result.get('confidence', 0))
-        
+
         return result
-        
+
     except Exception as e:
-        logger.error("Image generation detection failed | error=%s", e, exc_info=True)
+        # Wraps an OpenAI chat call (and JSON parsing of its output) — never
+        # log raw exception text.
+        logger.error("Image generation detection failed | error_type=%s", type(e).__name__)
         
         # Fallback: use keyword detection
         if has_strong_keyword:
@@ -171,9 +173,11 @@ async def generate_image(
                 json=payload
             ) as response:
                 if response.status != 200:
-                    error_text = await response.text()
-                    logger.error("DALL-E API error | status=%s, response=%s", response.status, error_text[:300])
-                    raise Exception(f"DALL-E API error: {response.status} - {error_text[:200]}")
+                    # The response body is provider (OpenAI) output, not a
+                    # credential itself, but it's still external/untrusted
+                    # content — log only the status code, never the body.
+                    logger.error("DALL-E API error | status=%s", response.status)
+                    raise Exception(f"DALL-E API error: HTTP {response.status}")
                 result = await response.json()
 
         image_data = result["data"][0]
@@ -181,7 +185,7 @@ async def generate_image(
         b64_data = image_data.get("b64_json")
         if b64_data:
             image_path = _save_b64_image(b64_data)
-            logger.info("DALL-E image saved from b64_json | path=%s", image_path)
+            logger.info("DALL-E image saved from b64_json | name=%s", image_path.name)
             return {
                 "image_path": image_path,
                 "revised_prompt": revised_prompt,
@@ -199,9 +203,12 @@ async def generate_image(
                 "original_prompt": prompt,
             }
         raise Exception("DALL-E response has no b64_json or url")
-        
+
     except Exception as e:
-        logger.error("DALL-E generate_image failed | error=%s", e, exc_info=True)
+        # Wraps a direct HTTPS call to OpenAI carrying the Authorization
+        # header — never log raw exception text (client errors can embed
+        # request details) or a traceback.
+        logger.error("DALL-E generate_image failed | error_type=%s", type(e).__name__)
         raise
 
 
@@ -231,11 +238,13 @@ async def download_image(url: str) -> Path:
                 async with aiofiles.open(filepath, 'wb') as f:
                     await f.write(await response.read())
         
-        logger.debug("DALL-E image downloaded | path=%s", filepath)
+        logger.debug("DALL-E image downloaded | name=%s", filepath.name)
         return filepath
-        
+
     except Exception as e:
-        logger.error("DALL-E download_image failed | error=%s", e)
+        # `url` can be a pre-signed, token-bearing storage URL — never log
+        # raw exception text (aiohttp errors can embed the request URL).
+        logger.error("DALL-E download_image failed | error_type=%s", type(e).__name__)
         raise
 
 
@@ -281,10 +290,9 @@ async def generate_image_variations(
                 data=data
             ) as response:
                 if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"DALL-E variations API error: {error_text}")
+                    logger.error("DALL-E variations API error | status=%s", response.status)
                     raise Exception(f"API error: {response.status}")
-                
+
                 result = await response.json()
         
         # Download all variations
@@ -296,8 +304,8 @@ async def generate_image_variations(
         
         logger.info(f"Generated {len(variation_paths)} variations successfully")
         return variation_paths
-        
+
     except Exception as e:
-        logger.error(f"Error generating variations: {e}")
+        logger.error("DALL-E generate_image_variations failed | error_type=%s", type(e).__name__)
         raise
 

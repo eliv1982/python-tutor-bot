@@ -53,9 +53,11 @@ class VectorIndex:
                 persist_directory=str(self.persist_directory),
                 embedding_function=self.embeddings
             )
-            logger.info("RAG index: loaded existing vector store | path=%s", self.persist_directory)
+            # persist_directory is an absolute filesystem path (can reveal
+            # the deployment's OS username/layout) — no need to log it.
+            logger.info("RAG index: loaded existing vector store")
         except Exception as e:
-            logger.warning("RAG index: could not load vectorstore, creating new | error=%s", e)
+            logger.warning("RAG index: could not load vectorstore, creating new | error_type=%s", type(e).__name__)
             self.vectorstore = Chroma(
                 persist_directory=str(self.persist_directory),
                 embedding_function=self.embeddings
@@ -76,7 +78,10 @@ class VectorIndex:
             self.vectorstore.add_documents(documents)
             logger.info("RAG index add_documents | count=%s", len(documents))
         except Exception as e:
-            logger.error("RAG index add_documents failed | error=%s", e, exc_info=True)
+            # This call embeds documents via OpenAIEmbeddings (a network call
+            # to OpenAI) before writing to Chroma, so the exception may be a
+            # provider error — never log its raw text or a traceback.
+            logger.error("RAG index add_documents failed | error_type=%s", type(e).__name__)
             raise
     
     def similarity_search(
@@ -99,7 +104,9 @@ class VectorIndex:
             logger.debug("RAG similarity_search | query_len=%s, k=%s, results=%s", len(query), k, len(results))
             return results
         except Exception as e:
-            logger.error("RAG similarity_search failed | error=%s", e, exc_info=True)
+            # similarity_search embeds `query` via OpenAIEmbeddings (network
+            # call) before searching Chroma — never log raw exception text.
+            logger.error("RAG similarity_search failed | error_type=%s", type(e).__name__)
             raise
     
     def similarity_search_with_score(
@@ -122,7 +129,7 @@ class VectorIndex:
             logger.debug("RAG similarity_search_with_score | k=%s, results=%s", k, len(results))
             return results
         except Exception as e:
-            logger.error("RAG similarity_search_with_score failed | error=%s", e, exc_info=True)
+            logger.error("RAG similarity_search_with_score failed | error_type=%s", type(e).__name__)
             raise
     
     def index_documents_directory(
@@ -156,10 +163,10 @@ class VectorIndex:
             # Add to vector store
             self.add_documents(documents)
             
-            logger.info("RAG index_documents_directory | directory=%s, chunks=%s", directory, len(documents))
+            logger.info("RAG index_documents_directory | chunks=%s", len(documents))
             return len(documents)
         except Exception as e:
-            logger.error("RAG index_documents_directory failed | error=%s", e, exc_info=True)
+            logger.error("RAG index_documents_directory failed | error_type=%s", type(e).__name__)
             raise
     
     def clear_index(self):
@@ -175,7 +182,7 @@ class VectorIndex:
             
             logger.info("RAG index cleared")
         except Exception as e:
-            logger.error("RAG clear_index failed | error=%s", e, exc_info=True)
+            logger.error("RAG clear_index failed | error_type=%s", type(e).__name__)
             raise
     
     def get_stats(self) -> dict:
@@ -189,15 +196,22 @@ class VectorIndex:
             # ChromaDB collection stats
             collection = self.vectorstore._collection
             count = collection.count()
-            
+
+            # No absolute filesystem path here: this dict is displayed
+            # verbatim to the user by handlers/start.py's /stats command,
+            # and an absolute path can reveal the deployment's OS
+            # username/directory layout.
             return {
                 "total_documents": count,
-                "persist_directory": str(self.persist_directory)
+                "status": "ok",
             }
             
         except Exception as e:
-            logger.error("RAG get_stats failed | error=%s", e)
-            return {"error": str(e)}
+            # get_stats()'s "error" field is displayed verbatim to the user
+            # by handlers/start.py's /stats command, so it must never carry
+            # raw exception text (which could echo Chroma/provider internals).
+            logger.error("RAG get_stats failed | error_type=%s", type(e).__name__)
+            return {"error": "Не удалось получить статистику базы знаний."}
 
 
 # Global index instance

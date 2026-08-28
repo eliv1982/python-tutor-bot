@@ -61,7 +61,8 @@ async def analyze_image(
         logger.info("Vision analyze_image done | result_len=%s", len(result))
         return result
     except Exception as e:
-        logger.error("Vision analyze_image failed | error=%s", e, exc_info=True)
+        # Wraps an OpenAI Vision API call — never log raw exception text.
+        logger.error("Vision analyze_image failed | error_type=%s", type(e).__name__)
         raise
 
 
@@ -106,7 +107,7 @@ def encode_image_to_base64(image_path: Path) -> str:
             image_data = image_file.read()
         return encode_image_bytes_to_data_url(image_data, filename_hint=str(image_path))
     except Exception as e:
-        logger.error("Vision encode_image failed | path=%s, error=%s", image_path, e)
+        logger.error("Vision encode_image failed | error_type=%s", type(e).__name__)
         raise
 
 
