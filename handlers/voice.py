@@ -5,10 +5,11 @@ Handles voice messages with STT and TTS using pyTelegramBotAPI.
 
 from telebot import types
 from bot import bot
-from services.router import route_voice_request
+from app.tutor import route_voice_request
+from app.session import user_sessions
 from services.tts import get_available_voices, get_voice_info
 from utils.logging import logger
-from utils.helpers import user_sessions, save_file_async, cleanup_files, strip_markdown, download_telegram_file
+from utils.helpers import save_file_async, cleanup_files, strip_markdown, download_telegram_file
 from utils.access_control import require_authorized
 from config import VoiceType
 

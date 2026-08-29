@@ -86,7 +86,7 @@ async def test_real_voice_handler_path_does_not_touch_real_repo_data_dir(monkeyp
     mutate it in any way — this is a pure before/after listing comparison.
     """
     import handlers.voice as voice_handler
-    import services.router as router_module
+    import app.tutor as router_module
     from unittest.mock import AsyncMock
     from types import SimpleNamespace
 

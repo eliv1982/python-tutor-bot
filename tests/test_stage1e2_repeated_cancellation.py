@@ -61,12 +61,12 @@ async def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -
 @pytest.mark.asyncio
 async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     created_path_holder = {}
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     def fake_store(file_bytes, extension, display_name, owner_user_id):
         started.set()
@@ -74,7 +74,7 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
         path = tmp_path / f"owned_upload{extension}"
         path.write_bytes(file_bytes)
         created_path_holder["path"] = path
-        return document_upload.StoredUpload(
+        return app_documents.StoredUpload(
             physical_path=path,
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
@@ -84,9 +84,9 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
 
     load_mock = Mock()
     add_mock = Mock()
-    monkeypatch.setattr(document_upload, "_store_document_exclusively", fake_store)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
+    monkeypatch.setattr(app_documents, "_store_document_exclusively", fake_store)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", load_mock)
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -145,12 +145,12 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
 @pytest.mark.asyncio
 async def test_cancel_twice_during_indexing_success_still_retains_file(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     call_count = {"n": 0}
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     def fake_load_and_index(stored, display_name):
         call_count["n"] += 1
@@ -158,7 +158,7 @@ async def test_cancel_twice_during_indexing_success_still_retains_file(monkeypat
         assert release.wait(timeout=5), "release was never set by the test"
         return ["chunk-a", "chunk-b"]
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -220,7 +220,7 @@ async def test_worker_exception_after_repeated_cancel_is_retrieved_and_stays_pri
     still runs, and the caller ends up seeing CancelledError — never the
     worker's own exception in its place."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     sensitive_detail = (
@@ -228,14 +228,14 @@ async def test_worker_exception_after_repeated_cancel_is_retrieved_and_stays_pri
         "Authorization: Bearer sk-FAKE-DOUBLE-CANCEL-SECRET"
     )
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     def fake_load_and_index(stored, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError(sensitive_detail)
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -384,12 +384,12 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
     never creates a second, independently-cancellable Task wrapping the
     executor work (see utils/helpers.py)."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     created_path_holder = {}
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     def fake_store(file_bytes, extension, display_name, owner_user_id):
         started.set()
@@ -397,7 +397,7 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
         path = tmp_path / f"owned_upload{extension}"
         path.write_bytes(file_bytes)
         created_path_holder["path"] = path
-        return document_upload.StoredUpload(
+        return app_documents.StoredUpload(
             physical_path=path,
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
@@ -407,9 +407,9 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
 
     load_mock = Mock()
     add_mock = Mock()
-    monkeypatch.setattr(document_upload, "_store_document_exclusively", fake_store)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
+    monkeypatch.setattr(app_documents, "_store_document_exclusively", fake_store)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", load_mock)
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",

@@ -2,7 +2,7 @@
 Text-LLM Provider Facade.
 
 The ONLY place provider selection lives for the three general-purpose
-text-tutoring paths (ordinary chat in services/router.py; RAG answer
+text-tutoring paths (ordinary chat in app/tutor.py; RAG answer
 generation and RAG fallback in rag/query.py). Deliberately tiny: a single
 explicit dispatch on config.LLM_PROVIDER, no retry, no fallback between
 providers. A selected provider's failure propagates unchanged to the

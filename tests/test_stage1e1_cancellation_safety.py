@@ -62,12 +62,12 @@ async def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -
 @pytest.mark.asyncio
 async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_file(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     created_path_holder = {}
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     bystander = tmp_path / "bystander.txt"
     bystander.write_bytes(b"UNRELATED PRE-EXISTING CONTENT")
@@ -78,7 +78,7 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
         path = tmp_path / f"owned_upload{extension}"
         path.write_bytes(file_bytes)
         created_path_holder["path"] = path
-        return document_upload.StoredUpload(
+        return app_documents.StoredUpload(
             physical_path=path,
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
@@ -88,9 +88,9 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
 
     load_mock = Mock()
     add_mock = Mock()
-    monkeypatch.setattr(document_upload, "_store_document_exclusively", fake_store)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
+    monkeypatch.setattr(app_documents, "_store_document_exclusively", fake_store)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", load_mock)
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -152,12 +152,12 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
 @pytest.mark.asyncio
 async def test_cancel_during_indexing_success_retains_file_and_sends_no_success_message(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     call_count = {"n": 0}
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
     # Real storage step (fast, not cancelled) so a real owned file exists.
 
     def fake_load_and_index(stored, display_name):
@@ -166,7 +166,7 @@ async def test_cancel_during_indexing_success_retains_file_and_sends_no_success_
         assert release.wait(timeout=5), "release was never set by the test"
         return ["chunk-a", "chunk-b"]
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -226,7 +226,7 @@ async def test_cancel_during_indexing_failure_removes_file_only_after_worker_end
     monkeypatch, tmp_path, caplog
 ):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     started = threading.Event()
     release = threading.Event()
     sensitive_detail = (
@@ -234,14 +234,14 @@ async def test_cancel_during_indexing_failure_removes_file_only_after_worker_end
         "Authorization: Bearer sk-FAKE1234567890SECRET"
     )
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     def fake_load_and_index(stored, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError(sensitive_detail)
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",

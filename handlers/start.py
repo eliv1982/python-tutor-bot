@@ -8,7 +8,7 @@ import asyncio
 from telebot import types
 from bot import bot
 from utils.logging import logger
-from utils.helpers import user_sessions
+from app.session import user_sessions
 from utils.access_control import require_authorized
 from config import BotMode, DEFAULT_MODE
 

@@ -24,13 +24,14 @@ import pytest
 from telebot import types
 
 import handlers.document_upload as document_upload
+import app.documents as app_documents
 import handlers.image as image
 import handlers.start as start
 import handlers.text as text
 import handlers.voice as voice
 import utils.access_control as access_control
 from bot import bot as shared_bot
-from utils.helpers import user_sessions
+from app.session import user_sessions
 
 AUTHORIZED_ID = 111111111
 UNAUTHORIZED_ID = 222222222
@@ -270,7 +271,7 @@ async def test_unauthorized_voice_does_not_download_or_call_stt(monkeypatch):
 @pytest.mark.asyncio
 async def test_unauthorized_document_does_not_download_store_or_index(monkeypatch, tmp_path):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
     process_mock = AsyncMock()
     monkeypatch.setattr(document_upload, "process_document_upload", process_mock)
     monkeypatch.setattr(document_upload.bot, "get_file", AsyncMock())

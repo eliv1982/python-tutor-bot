@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import config
-from utils.helpers import user_sessions
+from app.session import user_sessions
 
 TEST_TOKEN = config.TELEGRAM_BOT_TOKEN  # dummy token from tests/conftest.py
 FAKE_TELEGRAM_TOKEN = "987654321:FAKE-TOKEN-FOR-LOG-LEAK-TEST"

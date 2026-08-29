@@ -93,16 +93,16 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
     Preserves Stage 1B guarantees: exclusive write, cleanup untouched on
     success, source attribution."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     caller_thread_id = _main_thread_id()
     store_thread_id = {}
     helper_thread_id = {}
     helper_call_count = {"n": 0}
     reconcile_call_count = {"n": 0}
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    real_store = document_upload._store_document_exclusively
+    real_store = app_documents._store_document_exclusively
 
     def spy_store(file_bytes, extension, display_name, owner_user_id, attempts=5):
         store_thread_id["id"] = threading.get_ident()
@@ -112,7 +112,7 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
         reconcile_call_count["n"] += 1
         return ("reindexed", 1)
 
-    real_load_and_index = document_upload._load_and_index_document
+    real_load_and_index = app_documents._load_and_index_document
 
     def spy_load_and_index(stored, display_name):
         # This IS the callable handed to asyncio.to_thread() in
@@ -123,9 +123,9 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
         helper_thread_id["id"] = threading.get_ident()
         return real_load_and_index(stored, display_name)
 
-    monkeypatch.setattr(document_upload, "_store_document_exclusively", spy_store)
-    monkeypatch.setattr(document_upload, "_load_and_index_document", spy_load_and_index)
-    monkeypatch.setattr(document_upload.get_vector_index(), "reconcile_document", fake_reconcile_document)
+    monkeypatch.setattr(app_documents, "_store_document_exclusively", spy_store)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", spy_load_and_index)
+    monkeypatch.setattr(app_documents.get_vector_index(), "reconcile_document", fake_reconcile_document)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -164,16 +164,16 @@ async def test_document_upload_offloaded_failure_preserves_privacy_and_cleanup(m
     error boundary — generic user message, sanitized (Stage 1D) log, and the
     partially-created file cleaned up — exactly as before offloading."""
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     sensitive_detail = "corrupt PDF stream at absolute path C:\\Users\\confidential\\report.pdf"
     monkeypatch.setattr(
-        document_upload.document_loader, "load_document_bytes",
+        app_documents.document_loader, "load_document_bytes",
         Mock(side_effect=ValueError(sensitive_detail)),
     )
     add_mock = Mock()
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -312,9 +312,9 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
     search on a worker thread and then mutates UserSession on completion.
     Every UserSession.add_message() call must happen on the event-loop
     (caller's) thread — never from inside the offloaded worker thread."""
-    import services.router as router_module
-    from services.router import route_text_request
-    from utils.helpers import user_sessions
+    import app.tutor as router_module
+    from app.tutor import route_text_request
+    from app.session import user_sessions
     import rag.query as rag_query
     from services.openai_client import openai_client
     from config import BotMode

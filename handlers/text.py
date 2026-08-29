@@ -5,9 +5,10 @@ Handles regular text messages from users using pyTelegramBotAPI.
 
 from telebot import types
 from bot import bot
-from services.router import route_text_request, route_image_request
+from app.tutor import route_text_request, route_image_request
+from app.session import user_sessions
 from utils.logging import logger
-from utils.helpers import user_sessions, strip_markdown
+from utils.helpers import strip_markdown
 from utils.access_control import require_authorized
 from config import BotMode
 
@@ -126,7 +127,7 @@ async def cmd_image(message: types.Message):
     
     try:
         # Generate image directly
-        from services.router import route_image_generation_request
+        from app.tutor import route_image_generation_request
         from utils.helpers import cleanup_file
         
         response = await route_image_generation_request(

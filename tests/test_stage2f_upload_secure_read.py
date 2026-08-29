@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import handlers.document_upload as document_upload
+import app.documents as app_documents
 from rag.identity import sha256_hex, upload_document_id
 from rag.index import VectorIndex
 from rag.safe_files import SecureReadError, read_regular_file_secure
@@ -37,7 +38,7 @@ from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
 from rag_fakes import DeterministicFakeEmbeddings
 
 
-def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: bytes, display_name: str, owner_user_id: int = 1) -> "document_upload.StoredUpload":
+def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: bytes, display_name: str, owner_user_id: int = 1) -> "app_documents.StoredUpload":
     uploads_dir.mkdir(parents=True, exist_ok=True)
     physical = uploads_dir / f"{stem}{extension}"
     physical.write_bytes(content)
@@ -45,7 +46,7 @@ def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: b
     content_sha256 = sha256_hex(content)
     sidecar_path = sidecar_path_for(physical)
     write_sidecar_atomic(sidecar_path, build_sidecar(document_id, display_name, physical.name, content_sha256, owner_user_id=owner_user_id))
-    return document_upload.StoredUpload(
+    return app_documents.StoredUpload(
         physical_path=physical, sidecar_path=sidecar_path,
         document_id=document_id, content_sha256=content_sha256, owner_user_id=owner_user_id,
     )
@@ -70,12 +71,12 @@ def _patch_telegram(monkeypatch, file_bytes: bytes):
 def test_normal_managed_upload_secure_read_succeeds_and_indexes_correct_bytes(monkeypatch, tmp_path):
     uploads_dir = tmp_path / "uploads"
     stored = _make_stored_upload(uploads_dir, "a" * 32, ".txt", b"Ordinary managed upload content.", "notes.txt")
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="normal_upload_test")
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
     try:
-        chunk_count = document_upload._load_and_index_document(stored, "notes.txt")
+        chunk_count = app_documents._load_and_index_document(stored, "notes.txt")
         assert chunk_count == 1
 
         results = vi.similarity_search("Ordinary managed upload content.", requesting_user_id=1, k=1)
@@ -114,7 +115,7 @@ def test_stable_source_symlink_rejected_by_secure_read_directly(tmp_path):
         sidecar_path_for(link_path),
         build_sidecar(document_id, "escape.txt", link_path.name, sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=1),
     )
-    stored = document_upload.StoredUpload(
+    stored = app_documents.StoredUpload(
         physical_path=link_path, sidecar_path=sidecar_path_for(link_path),
         document_id=document_id, content_sha256=sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=1,
     )
@@ -123,7 +124,7 @@ def test_stable_source_symlink_rejected_by_secure_read_directly(tmp_path):
         read_regular_file_secure(link_path, root=uploads_dir)
     # Same rejection reached through the actual production entry point.
     with pytest.raises(SecureReadError):
-        document_upload._load_and_index_document(stored, "escape.txt")
+        app_documents._load_and_index_document(stored, "escape.txt")
 
 
 @pytest.mark.asyncio
@@ -135,15 +136,15 @@ async def test_stable_source_symlink_end_to_end_cleanup_runs(monkeypatch, tmp_pa
     upload cleanup (source + sidecar + defensive Qdrant delete) must run —
     nothing left behind."""
     uploads_dir = tmp_path / "uploads"
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     vi_mock = Mock()
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi_mock)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi_mock)
 
     external = tmp_path / "external_content.txt"
     external.write_bytes(b"EXTERNAL CONTENT THAT MUST NEVER BE INDEXED")
 
-    real_store = document_upload._store_document_exclusively
+    real_store = app_documents._store_document_exclusively
 
     def storing_then_swapping_for_symlink(file_bytes, extension, display_name, owner_user_id, attempts=5):
         stored = real_store(file_bytes, extension, display_name, owner_user_id, attempts=attempts)
@@ -154,7 +155,7 @@ async def test_stable_source_symlink_end_to_end_cleanup_runs(monkeypatch, tmp_pa
             pytest.skip("symlink creation not permitted on this platform/user")
         return stored
 
-    monkeypatch.setattr(document_upload, "_store_document_exclusively", storing_then_swapping_for_symlink)
+    monkeypatch.setattr(app_documents, "_store_document_exclusively", storing_then_swapping_for_symlink)
 
     _patch_telegram(monkeypatch, b"original valid content")
     message, document = _make_document_message(1, "notes.txt")
@@ -179,10 +180,10 @@ async def test_deterministic_check_open_swap_rejected_and_cleanup_runs(monkeypat
     reject it; external bytes must never reach the loader/Qdrant; cleanup
     must leave no managed source/sidecar/Qdrant orphan."""
     uploads_dir = tmp_path / "uploads"
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     vi_mock = Mock()
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi_mock)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi_mock)
 
     external = tmp_path / "external_content.txt"
     external.write_bytes(b"EXTERNAL CONTENT THAT MUST NEVER BE INDEXED")
@@ -197,7 +198,7 @@ async def test_deterministic_check_open_swap_rejected_and_cleanup_runs(monkeypat
     def racing_secure_read(path, *, root):
         return read_regular_file_secure(path, root=root, _test_pre_open_hook=swap_hook)
 
-    monkeypatch.setattr(document_upload, "read_regular_file_secure", racing_secure_read)
+    monkeypatch.setattr(app_documents, "read_regular_file_secure", racing_secure_read)
 
     _patch_telegram(monkeypatch, b"original valid content")
     message, document = _make_document_message(1, "notes.txt")
@@ -223,13 +224,13 @@ def test_hash_mismatch_fails_before_qdrant_mutation(monkeypatch, tmp_path):
     stored = _make_stored_upload(uploads_dir, "c" * 32, ".txt", b"original stored content", "notes.txt")
     # Tamper with the on-disk content AFTER the sidecar/hash were recorded.
     stored.physical_path.write_bytes(b"tampered content, different from the recorded hash")
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="hash_mismatch_test")
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
     try:
         with pytest.raises(Exception) as exc_info:
-            document_upload._load_and_index_document(stored, "notes.txt")
+            app_documents._load_and_index_document(stored, "notes.txt")
         assert type(exc_info.value).__name__ == "SourceMutatedError"
         assert vi.get_stats(requesting_user_id=1)["total_documents"] == 0  # no Qdrant mutation occurred
     finally:
@@ -259,28 +260,28 @@ def test_reconcile_parses_bytes_directly_never_via_a_reopened_pathname(monkeypat
     uploads_dir = tmp_path / "uploads"
     original_bytes = b"content for in-memory-parsing proof"
     stored = _make_stored_upload(uploads_dir, "d" * 32, ".txt", original_bytes, "notes.txt")
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     # The path-based loader (which would reopen whatever pathname it's
     # given) must never be invoked at all for a managed upload.
-    path_based_load = Mock(wraps=document_upload.document_loader.load_document)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", path_based_load)
+    path_based_load = Mock(wraps=app_documents.document_loader.load_document)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", path_based_load)
 
     captured_bytes = []
-    real_load_document_bytes = document_upload.document_loader.load_document_bytes
+    real_load_document_bytes = app_documents.document_loader.load_document_bytes
 
     def spying_load_document_bytes(source_bytes, **kwargs):
         captured_bytes.append(source_bytes)
         return real_load_document_bytes(source_bytes, **kwargs)
 
-    monkeypatch.setattr(document_upload.document_loader, "load_document_bytes", spying_load_document_bytes)
+    monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", spying_load_document_bytes)
 
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="no_reopen_test")
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
     try:
         pre_existing = set(uploads_dir.iterdir())
 
-        document_upload._load_and_index_document(stored, "notes.txt")
+        app_documents._load_and_index_document(stored, "notes.txt")
 
         path_based_load.assert_not_called()  # no pathname-based reopen at all
         assert len(captured_bytes) == 1
@@ -300,19 +301,19 @@ async def test_original_pathname_replaced_after_secure_read_has_no_effect_on_ind
     consume the replacement/external content; the already-captured
     original bytes are what get indexed."""
     uploads_dir = tmp_path / "uploads"
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="post_read_swap_test")
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
 
-    real_secure_read = document_upload.read_regular_file_secure
+    real_secure_read = app_documents.read_regular_file_secure
 
     def racing_secure_read(path, *, root):
         secure_bytes = real_secure_read(path, root=root)
         Path(path).write_bytes(b"REPLACEMENT CONTENT AFTER SECURE READ - must never be indexed")
         return secure_bytes
 
-    monkeypatch.setattr(document_upload, "read_regular_file_secure", racing_secure_read)
+    monkeypatch.setattr(app_documents, "read_regular_file_secure", racing_secure_read)
 
     _patch_telegram(monkeypatch, b"Content captured before any replacement occurs.")
     message, document = _make_document_message(1, "notes.txt")
@@ -334,12 +335,12 @@ async def test_original_pathname_replaced_after_secure_read_has_no_effect_on_ind
 def test_indexed_payload_carries_no_temp_or_absolute_path(monkeypatch, tmp_path):
     uploads_dir = tmp_path / "uploads"
     stored = _make_stored_upload(uploads_dir, "e" * 32, ".txt", b"Payload privacy check content.", "My Report.txt")
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="safe_payload_test")
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
     try:
-        document_upload._load_and_index_document(stored, "My Report.txt")
+        app_documents._load_and_index_document(stored, "My Report.txt")
 
         results = vi.similarity_search("Payload privacy check content.", requesting_user_id=1, k=1)
         assert len(results) == 1
@@ -375,7 +376,7 @@ def test_extension_selects_correct_format_for_in_memory_parsing(monkeypatch, tmp
         original_bytes,
         f"report{extension}",
     )
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     captured = {}
 
@@ -384,12 +385,12 @@ def test_extension_selects_correct_format_for_in_memory_parsing(monkeypatch, tmp
         captured["suffix"] = kwargs.get("suffix")
         return []
 
-    monkeypatch.setattr(document_upload.document_loader, "load_document_bytes", spy_load_document_bytes)
+    monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", spy_load_document_bytes)
 
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name=f"format_test_{extension.strip('.')}")
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
     try:
-        document_upload._load_and_index_document(stored, f"report{extension}")
+        app_documents._load_and_index_document(stored, f"report{extension}")
 
         assert captured["suffix"].lower() == extension
         assert captured["source_bytes"] == original_bytes

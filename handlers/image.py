@@ -5,10 +5,11 @@ Handles image analysis with GPT-4 Vision using pyTelegramBotAPI.
 
 from telebot import types
 from bot import bot
-from services.router import route_image_request
+from app.tutor import route_image_request
+from app.session import user_sessions
 from services.vision import encode_image_bytes_to_data_url
 from utils.logging import logger
-from utils.helpers import cleanup_file, user_sessions, strip_markdown, download_telegram_file
+from utils.helpers import cleanup_file, strip_markdown, download_telegram_file
 from utils.access_control import require_authorized
 from config import MAX_TELEGRAM_IMAGE_BYTES
 

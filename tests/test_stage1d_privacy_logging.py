@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from utils.helpers import user_sessions
+from app.session import user_sessions
 
 FAKE_OPENAI_KEY = "sk-FAKE1234567890ABCDEFSECRETKEYDONOTUSE"
 FAKE_TELEGRAM_TOKEN = "123456789:FAKE-STAGE1D-TOKEN-FOR-LOG-LEAK-TEST"
@@ -171,7 +171,7 @@ async def test_vision_processing_failure_leaks_nothing_and_returns_generic_messa
     assert FAKE_TELEGRAM_TOKEN not in log_text
     assert "api.telegram.org" not in log_text
     assert leaking_message not in log_text
-    # route_image_request() (services/router.py) absorbs the exception and
+    # route_image_request() (app/tutor.py) absorbs the exception and
     # returns a generic response, so handlers/image.py's own try succeeds —
     # the safe, structured event fires one layer down the call stack.
     assert "route_image_request failed" in log_text
@@ -186,11 +186,11 @@ async def test_vision_processing_failure_leaks_nothing_and_returns_generic_messa
 async def test_voice_stt_failure_leaks_nothing_and_returns_generic_message(monkeypatch, caplog):
     """End-to-end handler test: route_voice_request's transcription step
     fails with a sensitive exception. The audio-conversion step (pydub/
-    ffmpeg) is bypassed by mocking services.router.transcribe_voice_message
+    ffmpeg) is bypassed by mocking app.tutor.transcribe_voice_message
     directly, so this test stays offline and independent of any local
     ffmpeg installation."""
     import handlers.voice as voice_handler
-    import services.router as router_module
+    import app.tutor as router_module
 
     user_id = 9003
     raw_transcript_like_text = "I have a heart condition called SecretDiagnosisXYZ"
@@ -283,8 +283,8 @@ async def test_document_confidential_filename_and_token_exception_fully_sanitize
     started), and the user receives a generic message.
     """
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     confidential_filename = "Ivanov_passport_scan_CONFIDENTIAL.pdf"
     leaking_message = _leaking_exception_message()
@@ -334,7 +334,7 @@ async def test_document_upload_received_log_never_contains_filename(monkeypatch,
     """The 'Document received' event fires before any download/processing
     is attempted, and must never carry the raw Telegram display filename."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     confidential_filename = "board_meeting_minutes_SECRET.docx"
     document = SimpleNamespace(
         file_name=confidential_filename,

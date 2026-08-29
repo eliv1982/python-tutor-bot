@@ -155,7 +155,7 @@ def test_no_cross_user_retrieval_even_at_perfect_similarity(index_factory):
 @pytest.mark.asyncio
 async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(monkeypatch, tmp_path):
     """Full-stack proof: Telegram document upload (handlers/document_upload.py)
-    -> router (services/router.py) -> rag.query.query_knowledge_base() ->
+    -> router (app/tutor.py) -> rag.query.query_knowledge_base() ->
     VectorIndex, for two DIFFERENT Telegram users, never leaks one user's
     private upload into the other's RAG answer — proven through the real
     production call chain, not just VectorIndex directly."""
@@ -163,6 +163,7 @@ async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(m
     from unittest.mock import AsyncMock
 
     import handlers.document_upload as document_upload
+    import app.documents as app_documents
     import rag.query as rag_query
     from services.openai_client import openai_client
 
@@ -171,9 +172,9 @@ async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(m
         embeddings=DeterministicFakeEmbeddings(),
         collection_name="e2e_isolation_test",
     )
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
     monkeypatch.setattr(rag_query, "get_vector_index", lambda: vi)
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path / "uploads")
     monkeypatch.setattr(document_upload.bot, "send_message", AsyncMock())
 
     secret_text = "User A's confidential exam answers: the capital of France quiz key is Paris."

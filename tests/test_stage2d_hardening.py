@@ -65,7 +65,7 @@ def _copy_importable_tree(dest_root: Path) -> None:
 
 # ===========================================================================
 # Section C / O: utils.helpers.cleanup_file() must report its REAL outcome,
-# and handlers.document_upload._cleanup_new_upload() must aggregate every
+# and handlers.app_documents._cleanup_new_upload() must aggregate every
 # component honestly.
 # ===========================================================================
 
@@ -108,8 +108,8 @@ def test_cleanup_file_returns_false_when_removal_genuinely_fails(tmp_path):
 
 def _make_stored_upload(physical_path: Path, sidecar_path: Path):
     import handlers.document_upload as document_upload
-
-    return document_upload.StoredUpload(
+    import app.documents as app_documents
+    return app_documents.StoredUpload(
         physical_path=physical_path,
         sidecar_path=sidecar_path,
         document_id="upload:" + "a" * 32,
@@ -121,7 +121,7 @@ def _make_stored_upload(physical_path: Path, sidecar_path: Path):
 def test_cleanup_new_upload_returns_false_when_physical_unlink_fails(monkeypatch, tmp_path):
     """Requirement 1: Qdrant succeeds + physical unlink fails -> False."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical = tmp_path / "physical_dir"
     physical.mkdir()
     (physical / "child").write_text("x", encoding="utf-8")
@@ -129,9 +129,9 @@ def test_cleanup_new_upload_returns_false_when_physical_unlink_fails(monkeypatch
     sidecar.write_text("{}", encoding="utf-8")
 
     stored = _make_stored_upload(physical, sidecar)
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     assert physical.exists()  # the unlink genuinely failed
@@ -141,7 +141,7 @@ def test_cleanup_new_upload_returns_false_when_physical_unlink_fails(monkeypatch
 def test_cleanup_new_upload_returns_false_when_sidecar_unlink_fails(monkeypatch, tmp_path):
     """Requirement 2: Qdrant succeeds + sidecar unlink fails -> False."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical = tmp_path / "physical.txt"
     physical.write_text("x", encoding="utf-8")
     sidecar = tmp_path / "sidecar_dir"
@@ -149,9 +149,9 @@ def test_cleanup_new_upload_returns_false_when_sidecar_unlink_fails(monkeypatch,
     (sidecar / "child").write_text("x", encoding="utf-8")
 
     stored = _make_stored_upload(physical, sidecar)
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     assert not physical.exists()
@@ -162,7 +162,7 @@ def test_cleanup_new_upload_attempts_every_component_even_when_multiple_fail(mon
     """Requirement 4: multiple cleanup failures -> every component is
     still attempted (never short-circuited after the first failure)."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical = tmp_path / "physical_dir"
     physical.mkdir()
     (physical / "child").write_text("x", encoding="utf-8")
@@ -174,18 +174,18 @@ def test_cleanup_new_upload_attempts_every_component_even_when_multiple_fail(mon
 
     qdrant_mock = Mock()
     qdrant_mock.delete_document = Mock(side_effect=RuntimeError("simulated Qdrant failure"))
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: qdrant_mock)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: qdrant_mock)
 
     calls = []
-    real_cleanup_file = document_upload.cleanup_file
+    real_cleanup_file = app_documents.cleanup_file
 
     def spy_cleanup_file(path):
         calls.append(path)
         return real_cleanup_file(path)
 
-    monkeypatch.setattr(document_upload, "cleanup_file", spy_cleanup_file)
+    monkeypatch.setattr(app_documents, "cleanup_file", spy_cleanup_file)
 
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     assert calls == [physical, sidecar]  # both attempted despite Qdrant already failing
@@ -196,14 +196,14 @@ def test_cleanup_new_upload_attempts_every_component_even_when_multiple_fail(mon
 def test_cleanup_new_upload_treats_already_missing_files_as_clean(monkeypatch, tmp_path):
     """Requirement 5: missing file counts as already cleaned."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical = tmp_path / "already_gone.txt"  # never created
     sidecar = tmp_path / "already_gone.meta.json"  # never created
 
     stored = _make_stored_upload(physical, sidecar)
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
-    assert document_upload._cleanup_new_upload(stored) is True
+    assert app_documents._cleanup_new_upload(stored) is True
 
 
 @pytest.mark.asyncio
@@ -227,10 +227,10 @@ async def test_lifecycle_never_claims_complete_cleanup_while_physical_file_still
     from unittest.mock import AsyncMock
 
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(side_effect=ValueError("simulated parse failure")))
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", Mock(side_effect=ValueError("simulated parse failure")))
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
     monkeypatch.setattr(document_upload.bot, "get_file", AsyncMock(return_value=SimpleNamespace(file_path="documents/notes.txt")))
     monkeypatch.setattr(document_upload.bot, "download_file", AsyncMock(return_value=b"some content"))

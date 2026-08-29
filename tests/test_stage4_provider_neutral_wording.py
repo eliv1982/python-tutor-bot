@@ -27,7 +27,7 @@ from telebot import types
 import handlers.start as start
 import handlers.text as text
 from bot import bot as shared_bot
-from utils.helpers import user_sessions
+from app.session import user_sessions
 
 
 @pytest.fixture(autouse=True)

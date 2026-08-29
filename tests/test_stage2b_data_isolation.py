@@ -89,10 +89,10 @@ async def test_real_repo_state_unchanged_around_a_representative_stage2b_workloa
 
     # --- representative workload 1: a full document-upload pipeline ---
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=[]))
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", Mock())
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_documents.document_loader, "load_document", Mock(return_value=[]))
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", Mock())
     monkeypatch.setattr(
         document_upload.bot, "get_file",
         AsyncMock(return_value=SimpleNamespace(file_path="documents/notes.txt")),

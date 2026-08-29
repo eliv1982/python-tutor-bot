@@ -92,7 +92,7 @@
 
 | Файл | Назначение |
 |------|------------|
-| **`services/router.py`** | Промпт для обычного текстового режима (строка с «Ты — персональный тьютор по Python…»). Замените роль и инструкции на свои (например, «тьютор по JavaScript», «ответы по внутренней документации»). |
+| **`app/tutor.py`** | Промпт для обычного текстового режима (строка с «Ты — персональный тьютор по Python…»). Замените роль и инструкции на свои (например, «тьютор по JavaScript», «ответы по внутренней документации»). |
 | **`rag/query.py`** | Промпты для режима RAG: описание роли и правил ответа по контексту (`_generate_rag_response`) и fallback, когда по базе ответа нет (`_fallback_response`). Подстройте формулировки под вашу тематику и стиль ответов. |
 
 Менять код логики не обязательно — достаточно обновить тексты промптов и наполнить `data/documents/` нужными материалами.
@@ -104,11 +104,12 @@
 - `main.py` — точка входа, подключение обработчиков и индексация RAG
 - `bot.py` — экземпляр бота (pyTelegramBotAPI)
 - `config.py` — настройки, пути, режимы
-- `handlers/` — start, text, voice, image, document_upload
-- `services/` — router, text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation
+- `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры)
+- `app/` — Telegram-независимый прикладной слой (Stage 5B): tutor (оркестрация диалога), session (состояние пользователя), documents (транзакция загрузки/индексации документа)
+- `services/` — text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation
 - `rag/` — index (Qdrant), query, loader (PDF, TXT, MD, DOCX), identity (стабильные ID документов/чанков), sidecar (метаданные загруженных документов)
 - `scripts/` — `rebuild_qdrant.py`, ручная полная переиндексация Qdrant из исходников
-- `utils/` — logging, helpers (сессии, strip_markdown, очистка файлов)
+- `utils/` — logging, helpers (Telegram-утилиты: скачивание файлов, strip_markdown, очистка файлов)
 - `data/documents/` — версионируемая база знаний RAG (`.md`, закоммичены) + `uploads/` (загруженные через Telegram документы, в репозиторий не коммитятся)
 - `data/qdrant/` — локальное хранилище Qdrant (в репозиторий не коммитится, полностью восстановимо через `python -m scripts.rebuild_qdrant`)
 - `data/generated_images/` — сгенерированные DALL-E изображения

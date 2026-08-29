@@ -223,16 +223,17 @@ def _patch_telegram(monkeypatch, document_upload, file_bytes: bytes):
 @pytest.mark.asyncio
 async def test_sidecar_creation_failure_cleans_up_the_physical_file(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
+    import app.documents as app_documents
     import rag.sidecar as sidecar_module
 
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=[]))
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", Mock())
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", Mock(return_value=[]))
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", Mock())
 
     def failing_write_sidecar(sidecar_path, data):
         raise OSError("simulated sidecar write failure")
 
-    monkeypatch.setattr(document_upload, "write_sidecar_atomic", failing_write_sidecar)
+    monkeypatch.setattr(app_documents, "write_sidecar_atomic", failing_write_sidecar)
 
     _patch_telegram(monkeypatch, document_upload, b"some content")
     message, document = _make_document_message(1, "notes.txt")
@@ -248,15 +249,15 @@ async def test_sidecar_creation_failure_cleans_up_the_physical_file(monkeypatch,
 @pytest.mark.asyncio
 async def test_indexing_failure_cleans_up_both_physical_file_and_sidecar(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=["chunk"]))
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", Mock(return_value=["chunk"]))
     monkeypatch.setattr(
-        document_upload.get_vector_index(), "add_documents",
+        app_documents.get_vector_index(), "add_documents",
         Mock(side_effect=RuntimeError("simulated embedding/upsert failure")),
     )
     delete_document_mock = Mock()
-    monkeypatch.setattr(document_upload.get_vector_index(), "delete_document", delete_document_mock)
+    monkeypatch.setattr(app_documents.get_vector_index(), "delete_document", delete_document_mock)
 
     _patch_telegram(monkeypatch, document_upload, b"some content")
     message, document = _make_document_message(1, "notes.txt")
@@ -270,6 +271,7 @@ async def test_indexing_failure_cleans_up_both_physical_file_and_sidecar(monkeyp
 @pytest.mark.asyncio
 async def test_cancelled_indexing_before_commit_leaves_no_orphan_artifacts(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
+    import app.documents as app_documents
     import threading
 
     started = threading.Event()
@@ -280,10 +282,10 @@ async def test_cancelled_indexing_before_commit_leaves_no_orphan_artifacts(monke
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
     delete_document_mock = Mock()
-    monkeypatch.setattr(document_upload.get_vector_index(), "delete_document", delete_document_mock)
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents.get_vector_index(), "delete_document", delete_document_mock)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     _patch_telegram(monkeypatch, document_upload, b"some content")
     message, document = _make_document_message(1, "notes.txt")

@@ -43,6 +43,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import app.documents as app_documents
 from rag.index import VectorIndex
 from rag_fakes import DeterministicFakeEmbeddings
 
@@ -66,16 +67,16 @@ def real_upload_env(monkeypatch, tmp_path):
     """A brand-new-upload environment backed by REAL local-persistent
     Qdrant (not mocked) so tests can assert on genuine indexed state."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     vi = VectorIndex(
         persist_directory=tmp_path / "qdrant",
         embeddings=DeterministicFakeEmbeddings(),
         collection_name="upload_lifecycle_test",
     )
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: vi)
 
     uploads_dir = tmp_path / "uploads"
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -115,8 +116,8 @@ async def test_cancel_during_status_message_after_storage_leaves_no_orphan(real_
 
     load_mock = Mock()
     add_mock = Mock()
-    monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
+    monkeypatch.setattr(app_documents.document_loader, "load_document", load_mock)
+    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", add_mock)
 
     message, document = _make_message(42, "notes.txt")
     task = asyncio.create_task(document_upload.process_document_upload(message, document))
@@ -158,7 +159,7 @@ async def test_cancel_while_indexing_worker_runs_leaves_no_orphan(real_upload_en
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError("never reached in this test path")
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     message, document = _make_message(42, "notes.txt")
     task = asyncio.create_task(document_upload.process_document_upload(message, document))
@@ -196,7 +197,7 @@ async def test_repeated_cancellation_while_indexing_worker_runs_leaves_no_orphan
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     message, document = _make_message(42, "notes.txt")
     task = asyncio.create_task(document_upload.process_document_upload(message, document))
@@ -229,14 +230,14 @@ async def test_cancel_after_worker_succeeds_before_observed_retains_everything(r
 
     started = threading.Event()
     release = threading.Event()
-    real_load_and_index = document_upload._load_and_index_document
+    real_load_and_index = app_documents._load_and_index_document
 
     def fake_load_and_index(stored, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         return real_load_and_index(stored, display_name)
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     message, document = _make_message(42, "notes.txt")
     task = asyncio.create_task(document_upload.process_document_upload(message, document))
@@ -275,7 +276,7 @@ async def test_ordinary_indexing_failure_leaves_no_orphan(real_upload_env, monke
     vi = real_upload_env.vi
     uploads_dir = real_upload_env.uploads_dir
 
-    monkeypatch.setattr(document_upload.document_loader, "load_document_bytes", Mock(side_effect=ValueError("simulated parse failure")))
+    monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", Mock(side_effect=ValueError("simulated parse failure")))
 
     message, document = _make_message(42, "notes.txt")
     await document_upload.process_document_upload(message, document)
@@ -335,7 +336,7 @@ async def test_cleanup_targets_document_id_not_display_filename(real_upload_env,
 
     # Second upload, SAME display filename, fails during indexing.
     monkeypatch.setattr(
-        document_upload.document_loader, "load_document_bytes",
+        app_documents.document_loader, "load_document_bytes",
         Mock(side_effect=ValueError("simulated parse failure for the second upload")),
     )
     message2, document2 = _make_message(42, "shared_name.txt", file_id="fid2")
@@ -384,7 +385,7 @@ async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(re
     document_upload = real_upload_env.document_upload
     vi = real_upload_env.vi
 
-    real_secure_read = document_upload.read_regular_file_secure
+    real_secure_read = app_documents.read_regular_file_secure
 
     def racing_secure_read(path, *, root):
         secure_bytes = real_secure_read(path, root=root)
@@ -397,7 +398,7 @@ async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(re
         Path(path).write_bytes(b"MUTATED CONTENT - must never be indexed under the old hash")
         return secure_bytes
 
-    monkeypatch.setattr(document_upload, "read_regular_file_secure", racing_secure_read)
+    monkeypatch.setattr(app_documents, "read_regular_file_secure", racing_secure_read)
 
     message, document = _make_message(42, "notes.txt")
     await document_upload.process_document_upload(message, document)
@@ -423,22 +424,22 @@ async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(re
 
 def test_cleanup_new_upload_returns_false_when_qdrant_cleanup_fails(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical = tmp_path / "abc.txt"
     physical.write_bytes(b"content")
     sidecar = tmp_path / "abc.meta.json"
     sidecar.write_text("{}", encoding="utf-8")
-    stored = document_upload.StoredUpload(
+    stored = app_documents.StoredUpload(
         physical_path=physical, sidecar_path=sidecar,
         document_id="upload:" + "a" * 32, content_sha256="b" * 64, owner_user_id=1,
     )
 
     monkeypatch.setattr(
-        document_upload.get_vector_index(), "delete_document",
+        app_documents.get_vector_index(), "delete_document",
         Mock(side_effect=RuntimeError("simulated Qdrant cleanup failure")),
     )
 
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     # Filesystem cleanup still completed regardless of the Qdrant failure.
@@ -448,19 +449,19 @@ def test_cleanup_new_upload_returns_false_when_qdrant_cleanup_fails(monkeypatch,
 
 def test_cleanup_new_upload_returns_true_on_full_success(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical = tmp_path / "abc.txt"
     physical.write_bytes(b"content")
     sidecar = tmp_path / "abc.meta.json"
     sidecar.write_text("{}", encoding="utf-8")
-    stored = document_upload.StoredUpload(
+    stored = app_documents.StoredUpload(
         physical_path=physical, sidecar_path=sidecar,
         document_id="upload:" + "a" * 32, content_sha256="b" * 64, owner_user_id=1,
     )
 
-    monkeypatch.setattr(document_upload.get_vector_index(), "delete_document", Mock())
+    monkeypatch.setattr(app_documents.get_vector_index(), "delete_document", Mock())
 
-    assert document_upload._cleanup_new_upload(stored) is True
+    assert app_documents._cleanup_new_upload(stored) is True
     assert not physical.exists()
     assert not sidecar.exists()
 
@@ -482,9 +483,9 @@ async def test_cancellation_still_propagates_when_qdrant_cleanup_also_fails(real
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
     monkeypatch.setattr(
-        document_upload.get_vector_index(), "delete_document",
+        app_documents.get_vector_index(), "delete_document",
         Mock(side_effect=RuntimeError("simulated Qdrant cleanup failure")),
     )
 

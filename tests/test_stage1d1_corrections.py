@@ -34,7 +34,7 @@ import pytest
 from telebot import types
 from telebot.async_telebot import AsyncTeleBot
 
-from utils.helpers import user_sessions
+from app.session import user_sessions
 
 FAKE_OPENAI_KEY = "sk-FAKE1234567890ABCDEFSECRETKEYDONOTUSE"
 FAKE_TELEGRAM_TOKEN = "123456789:FAKE-STAGE1D1-TOKEN-FOR-LOG-LEAK-TEST"
@@ -167,12 +167,12 @@ async def test_document_indexing_provider_exception_fully_sanitized(monkeypatch,
     guarantees from Stage 1B still hold.
     """
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
 
     leaking_message = _leaking_exception_message()
     monkeypatch.setattr(
-        document_upload.get_vector_index(), "reconcile_document",
+        app_documents.get_vector_index(), "reconcile_document",
         Mock(side_effect=Exception(leaking_message)),
     )
 
@@ -455,7 +455,7 @@ async def test_tts_external_failure_generic_telegram_response(monkeypatch, caplo
     the user only as a generic message."""
     import handlers.text as text_handler
     from services.openai_client import openai_client
-    from utils.helpers import user_sessions as sessions
+    from app.session import user_sessions as sessions
 
     user_id = 9104
     sessions.set_mode(user_id, "voice")

@@ -180,14 +180,14 @@ def test_write_sidecar_atomic_cleanup_unlinks_symlink_without_touching_a_live_ta
 
 
 # ===========================================================================
-# Section K/L: handlers.document_upload._cleanup_new_upload() aggregation
+# Section K/L: handlers.app_documents._cleanup_new_upload() aggregation
 # over dangling-symlink physical/sidecar artifacts.
 # ===========================================================================
 
 def _make_stored_upload(physical_path: Path, sidecar_path: Path):
     import handlers.document_upload as document_upload
-
-    return document_upload.StoredUpload(
+    import app.documents as app_documents
+    return app_documents.StoredUpload(
         physical_path=physical_path,
         sidecar_path=sidecar_path,
         document_id="upload:" + "a" * 32,
@@ -198,14 +198,14 @@ def _make_stored_upload(physical_path: Path, sidecar_path: Path):
 
 def test_cleanup_new_upload_removes_both_dangling_symlinks(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical_link = _make_dangling_symlink(tmp_path, "physical.txt")
     sidecar_link = _make_dangling_symlink(tmp_path, "sidecar.meta.json")
 
     stored = _make_stored_upload(physical_link, sidecar_link)
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is True
     assert not os.path.lexists(physical_link)
@@ -216,7 +216,7 @@ def test_cleanup_new_upload_returns_false_when_a_dangling_symlink_unlink_fails(m
     import pathlib
 
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical_link = _make_dangling_symlink(tmp_path, "physical.txt")
     sidecar_link = _make_dangling_symlink(tmp_path, "sidecar.meta.json")
 
@@ -228,10 +228,10 @@ def test_cleanup_new_upload_returns_false_when_a_dangling_symlink_unlink_fails(m
         return real_unlink(self, *args, **kwargs)
 
     monkeypatch.setattr(pathlib.Path, "unlink", failing_unlink_for_physical)
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
     stored = _make_stored_upload(physical_link, sidecar_link)
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     assert os.path.lexists(physical_link)  # genuinely still there
@@ -243,16 +243,16 @@ def test_cleanup_new_upload_returns_false_on_qdrant_failure_with_filesystem_succ
     genuinely removed — the overall result must still be False (every
     component must succeed, not merely a majority)."""
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical_link = _make_dangling_symlink(tmp_path, "physical.txt")
     sidecar_link = _make_dangling_symlink(tmp_path, "sidecar.meta.json")
 
     qdrant_mock = Mock()
     qdrant_mock.delete_document = Mock(side_effect=RuntimeError("simulated Qdrant failure"))
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: qdrant_mock)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: qdrant_mock)
 
     stored = _make_stored_upload(physical_link, sidecar_link)
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     assert not os.path.lexists(physical_link)  # filesystem cleanup genuinely succeeded
@@ -267,7 +267,7 @@ def test_cleanup_new_upload_attempts_all_three_components_with_dangling_symlinks
     import pathlib
 
     import handlers.document_upload as document_upload
-
+    import app.documents as app_documents
     physical_link = _make_dangling_symlink(tmp_path, "physical.txt")
     sidecar_link = _make_dangling_symlink(tmp_path, "sidecar.meta.json")
 
@@ -282,19 +282,19 @@ def test_cleanup_new_upload_attempts_all_three_components_with_dangling_symlinks
 
     qdrant_mock = Mock()
     qdrant_mock.delete_document = Mock(side_effect=RuntimeError("simulated Qdrant failure"))
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: qdrant_mock)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: qdrant_mock)
 
     calls = []
-    real_cleanup_file = document_upload.cleanup_file
+    real_cleanup_file = app_documents.cleanup_file
 
     def spy_cleanup_file(path):
         calls.append(path)
         return real_cleanup_file(path)
 
-    monkeypatch.setattr(document_upload, "cleanup_file", spy_cleanup_file)
+    monkeypatch.setattr(app_documents, "cleanup_file", spy_cleanup_file)
 
     stored = _make_stored_upload(physical_link, sidecar_link)
-    result = document_upload._cleanup_new_upload(stored)
+    result = app_documents._cleanup_new_upload(stored)
 
     assert result is False
     assert calls == [physical_link, sidecar_link]  # both attempted despite Qdrant already failing
@@ -330,9 +330,9 @@ def _patch_telegram(monkeypatch, document_upload, file_bytes: bytes):
 @pytest.mark.asyncio
 async def test_lifecycle_cleans_up_a_dangling_symlink_left_by_a_swapped_physical_file(monkeypatch, tmp_path):
     import handlers.document_upload as document_upload
-
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload, "get_vector_index", lambda: Mock())
+    import app.documents as app_documents
+    monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
+    monkeypatch.setattr(app_documents, "get_vector_index", lambda: Mock())
 
     def fake_load_and_index(stored, display_name):
         # Simulate the physical file being replaced with a dangling
@@ -350,7 +350,7 @@ async def test_lifecycle_cleans_up_a_dangling_symlink_left_by_a_swapped_physical
         outside_target.unlink()
         raise RuntimeError("simulated indexing failure")
 
-    monkeypatch.setattr(document_upload, "_load_and_index_document", fake_load_and_index)
+    monkeypatch.setattr(app_documents, "_load_and_index_document", fake_load_and_index)
 
     _patch_telegram(monkeypatch, document_upload, b"some content")
     message, document = _make_document_message(1, "notes.txt")

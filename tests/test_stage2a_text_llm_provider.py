@@ -76,7 +76,7 @@ FAKE_PROVIDER_HOST = "192.0.2.1"
 def _clean_sessions():
     """Reset the in-memory session store between tests (router/RAG-path tests
     add history entries under the user_ids they use)."""
-    from utils.helpers import user_sessions
+    from app.session import user_sessions
     user_sessions.sessions.clear()
     yield
     user_sessions.sessions.clear()
@@ -1033,7 +1033,7 @@ def test_text_llm_facade_has_no_exception_handling():
 # ============================================================================
 
 async def test_router_ordinary_tutor_path_uses_text_llm_facade(monkeypatch):
-    from services.router import route_text_request
+    from app.tutor import route_text_request
 
     # Intent classifier stays directly on OpenAI (Stage 2A scope) — return
     # a non-JSON string so detect_image_generation_intent's own except

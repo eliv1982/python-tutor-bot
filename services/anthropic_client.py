@@ -48,7 +48,7 @@ def _split_system_message(
     "mid-conversation operator message" feature this application does not
     use — Sonnet 5 does not support it at all). Only a LEADING system
     message is recognized, matching this application's own message-
-    construction convention (services/router.py and rag/query.py always
+    construction convention (app/tutor.py and rag/query.py always
     place it first when present, never elsewhere).
 
     Fails clearly (ValueError) rather than silently reinterpreting anything:
