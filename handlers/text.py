@@ -38,7 +38,7 @@ async def callback_mode(callback: types.CallbackQuery):
     user_sessions.set_mode(user_id, mode)
     logger.info("Mode switched (button) | user_id=%s, new_mode=%s", user_id, mode)
     descriptions = {
-        BotMode.TEXT: "📝 Текстовый режим — диалог по Python с GPT-4o",
+        BotMode.TEXT: "📝 Текстовый режим — диалог по Python",
         BotMode.VOICE: "🎤 Голосовой режим — ответы голосом и текстом",
         BotMode.VISION: "📸 Режим Vision — анализ изображений (код, ошибки)",
         BotMode.RAG: "📚 Режим RAG — ответы по базе знаний (документы)",
@@ -70,7 +70,7 @@ async def cmd_mode(message: types.Message):
         user_sessions.set_mode(user_id, new_mode)
         logger.info("Mode switched (command) | user_id=%s, new_mode=%s", user_id, new_mode)
         mode_descriptions = {
-            BotMode.TEXT: "📝 Текстовый режим — диалог по Python с GPT-4o",
+            BotMode.TEXT: "📝 Текстовый режим — диалог по Python",
             BotMode.VOICE: "🎤 Голосовой режим — ответы голосом и текстом",
             BotMode.VISION: "📸 Режим Vision — анализ изображений (код, ошибки)",
             BotMode.RAG: "📚 Режим RAG — ответы по базе знаний (документы)",

@@ -54,7 +54,7 @@ async def cmd_help(message: types.Message):
     help_text = """📖 Personal Python Tutor — справка
 
 Режимы (команда /mode):
-• /mode text — текстовый диалог по Python (GPT-4o)
+• /mode text — текстовый диалог по Python
 • /mode voice — голосовые ответы: отправь голос → Whisper → ответ голосом и текстом
 • /mode rag — ответы по базе знаний (твои PDF/TXT/MD/DOCX)
 • /mode vision — анализ изображений (скриншоты кода, ошибки, схемы)
@@ -72,7 +72,7 @@ async def cmd_help(message: types.Message):
 • [Фото ошибки] «Почему падает этот код?»
 • В RAG: загрузи конспект → спроси по нему
 
-Стек: GPT-4o, Whisper, TTS, Vision, Qdrant (RAG)."""
+Стек: LLM (Anthropic/OpenAI), Whisper, TTS, Vision, Qdrant (RAG)."""
     
     await bot.send_message(message.chat.id, help_text)
 
