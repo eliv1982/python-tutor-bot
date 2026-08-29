@@ -138,9 +138,6 @@ MAX_TELEGRAM_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB
 # file is written to disk, parsed, or indexed.
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
-# Database Configuration
-DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/embeddings.db")
-
 # Data paths: DATA_DIR/DOCUMENTS_DIR/MANAGED_UPLOADS_DIR are imported from
 # rag/constants.py above (pure Path math, no credential dependency).
 #
@@ -164,7 +161,6 @@ DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/embeddings.db")
 # imports config, before a test monkeypatches this path to a tmp_path.
 # handlers/document_upload.py creates it lazily, only when an upload
 # actually needs to write to it.
-EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
 
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)
