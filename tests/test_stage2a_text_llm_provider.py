@@ -370,6 +370,18 @@ def test_config_subprocess_isolation_mechanism_is_real_not_coincidental(tmp_path
     (fake_project / "config.py").write_text(
         (PROJECT_ROOT / "config.py").read_text(encoding="utf-8"), encoding="utf-8"
     )
+    # Stage 2B-D Section E: config.py now does `from rag.constants import
+    # (...)` at its own top level (pure, side-effect-free constants) — the
+    # copied config.py above needs the real rag/constants.py (and rag's own
+    # __init__.py) importable alongside it, or `import config` fails with
+    # ModuleNotFoundError before ever reaching the ANTHROPIC_API_KEY check
+    # this test is actually about. Only rag/constants.py + rag/__init__.py
+    # are copied — never rag/index.py etc., which this fake project has no
+    # need for and which would pull in heavy third-party imports.
+    import shutil as _shutil
+    (fake_project / "rag").mkdir()
+    _shutil.copy2(PROJECT_ROOT / "rag" / "__init__.py", fake_project / "rag" / "__init__.py")
+    _shutil.copy2(PROJECT_ROOT / "rag" / "constants.py", fake_project / "rag" / "constants.py")
     (fake_project / ".env").write_text(
         "ANTHROPIC_API_KEY=sk-ant-fake-rescue-value-never-the-real-secret\n",
         encoding="utf-8",
@@ -1052,7 +1064,7 @@ async def test_rag_response_path_uses_text_llm_facade(monkeypatch):
         page_content="Some retrieved passage.",
     )
     monkeypatch.setattr(
-        rag_query.vector_index, "similarity_search_with_score",
+        rag_query.get_vector_index(), "similarity_search_with_score",
         lambda query, k=3: [(fake_doc, 0.1)],
     )
     facade_mock = AsyncMock(return_value="RAG-grounded answer.")
@@ -1069,7 +1081,7 @@ async def test_rag_fallback_path_uses_text_llm_facade(monkeypatch):
     import rag.query as rag_query
 
     monkeypatch.setattr(
-        rag_query.vector_index, "similarity_search_with_score",
+        rag_query.get_vector_index(), "similarity_search_with_score",
         lambda query, k=3: [],
     )
     facade_mock = AsyncMock(return_value="General-knowledge answer.")

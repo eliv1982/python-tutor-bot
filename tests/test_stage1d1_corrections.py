@@ -158,8 +158,10 @@ async def test_dispatcher_exception_handler_does_not_send_telegram_message(monke
 @pytest.mark.asyncio
 async def test_document_indexing_provider_exception_fully_sanitized(monkeypatch, tmp_path, caplog):
     """
-    vector_index.add_documents() embeds chunks via OpenAIEmbeddings before
-    writing to Chroma, so a provider/HTTP exception can genuinely surface
+    vector_index.reconcile_document() (Stage 2B-F: the call
+    _load_and_index_document() now makes, superseding the old direct
+    add_documents() call) embeds chunks via OpenAIEmbeddings before
+    writing to Qdrant, so a provider/HTTP exception can genuinely surface
     here. Simulates exactly that shape (token/API-key/URL-bearing) and
     proves it never reaches the logs, while cleanup/generic-response
     guarantees from Stage 1B still hold.
@@ -167,11 +169,10 @@ async def test_document_indexing_provider_exception_fully_sanitized(monkeypatch,
     import handlers.document_upload as document_upload
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=["chunk"]))
 
     leaking_message = _leaking_exception_message()
     monkeypatch.setattr(
-        document_upload.vector_index, "add_documents",
+        document_upload.get_vector_index(), "reconcile_document",
         Mock(side_effect=Exception(leaking_message)),
     )
 
@@ -230,7 +231,7 @@ async def test_rag_source_filename_not_logged_but_attribution_preserved(monkeypa
         page_content="Some retrieved passage.",
     )
     monkeypatch.setattr(
-        rag_query.vector_index, "similarity_search_with_score",
+        rag_query.get_vector_index(), "similarity_search_with_score",
         Mock(return_value=[(fake_doc, 0.1)]),
     )
 
@@ -267,7 +268,7 @@ def test_rag_add_document_helper_does_not_log_filename(monkeypatch, caplog, tmp_
     # (`from rag.loader import document_loader`) inside the function body,
     # so the module-level singleton on rag.loader is the patch target.
     monkeypatch.setattr(rag_loader.document_loader, "load_document", Mock(return_value=["chunk-a", "chunk-b"]))
-    monkeypatch.setattr(rag_query.vector_index, "add_documents", Mock())
+    monkeypatch.setattr(rag_query.get_vector_index(), "add_documents", Mock())
 
     with caplog.at_level(logging.DEBUG):
         result = asyncio.run(rag_query.add_document_to_knowledge_base(str(confidential_path)))
@@ -352,15 +353,14 @@ def test_ogg_to_wav_conversion_failure_leaks_nothing(monkeypatch, tmp_path, capl
 def test_get_stats_never_returns_absolute_path(monkeypatch, tmp_path):
     import rag.index as rag_index
 
-    sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "chroma_db"
+    sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "qdrant"
     sensitive_dir.mkdir(parents=True)
-    monkeypatch.setattr(rag_index.vector_index, "persist_directory", sensitive_dir)
+    monkeypatch.setattr(rag_index.get_vector_index(), "persist_directory", sensitive_dir)
 
-    fake_collection = Mock()
-    fake_collection.count = Mock(return_value=3)
-    monkeypatch.setattr(rag_index.vector_index.vectorstore, "_collection", fake_collection)
+    fake_count_result = SimpleNamespace(count=3)
+    monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(return_value=fake_count_result))
 
-    stats = rag_index.vector_index.get_stats()
+    stats = rag_index.get_vector_index().get_stats()
 
     assert "persist_directory" not in stats
     assert str(sensitive_dir) not in str(stats)
@@ -373,13 +373,12 @@ async def test_stats_command_output_never_contains_absolute_path(monkeypatch, tm
     import handlers.start as start_handler
     import rag.index as rag_index
 
-    sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "chroma_db"
+    sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "qdrant"
     sensitive_dir.mkdir(parents=True)
-    monkeypatch.setattr(rag_index.vector_index, "persist_directory", sensitive_dir)
+    monkeypatch.setattr(rag_index.get_vector_index(), "persist_directory", sensitive_dir)
 
-    fake_collection = Mock()
-    fake_collection.count = Mock(return_value=5)
-    monkeypatch.setattr(rag_index.vector_index.vectorstore, "_collection", fake_collection)
+    fake_count_result = SimpleNamespace(count=5)
+    monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(return_value=fake_count_result))
 
     send_message_mock = AsyncMock()
     monkeypatch.setattr(start_handler.bot, "send_message", send_message_mock)
@@ -395,20 +394,28 @@ async def test_stats_command_output_never_contains_absolute_path(monkeypatch, tm
 
 @pytest.mark.asyncio
 async def test_rag_init_and_index_logs_have_no_absolute_path(monkeypatch, tmp_path, caplog):
-    """rag/index.py's own operational logs (load/create vectorstore,
+    """rag/index.py's own operational logs (Qdrant client init,
     index_documents_directory) must not carry self.persist_directory."""
     import rag.index as rag_index
 
-    sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "chroma_db"
-    monkeypatch.setattr(rag_index.vector_index, "persist_directory", sensitive_dir)
-    monkeypatch.setattr(rag_index.vector_index, "add_documents", Mock())
-    monkeypatch.setattr(
-        rag_index.document_loader, "load_directory",
-        Mock(return_value=["chunk"]),
-    )
+    sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "qdrant"
+    monkeypatch.setattr(rag_index.get_vector_index(), "persist_directory", sensitive_dir)
+    # index_documents_directory() now reconciles each file via
+    # reconcile_document() (Stage 2B-C Blocker 2) rather than calling
+    # add_documents() directly — mock the higher-level method instead so
+    # this log-redaction test never reaches the real (production)
+    # OpenAIEmbeddings client.
+    monkeypatch.setattr(rag_index.get_vector_index(), "reconcile_document", Mock(return_value=("reindexed", 1)))
+
+    docs_root = tmp_path / "C_Users_confidential_deploy_user" / "documents"
+    docs_root.mkdir(parents=True)
+    (docs_root / "notes.md").write_text("hello", encoding="utf-8")
 
     with caplog.at_level(logging.DEBUG):
-        rag_index.vector_index.index_documents_directory(directory=tmp_path)
+        # reference_filenames=None: this test exercises generic
+        # directory-scan log-redaction, not the BUILTIN_REFERENCE_FILES
+        # manifest gate — "notes.md" isn't one of the real manifest names.
+        rag_index.get_vector_index().index_documents_directory(directory=docs_root, reference_filenames=None)
 
     assert "confidential_deploy_user" not in caplog.text
     assert str(sensitive_dir) not in caplog.text

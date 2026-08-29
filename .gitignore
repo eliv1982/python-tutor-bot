@@ -38,9 +38,16 @@ ENV/
 # Data (в репозиторий не коммитить)
 data/embeddings.db
 data/chroma_db/
+data/qdrant/
 data/generated_images/
 data/documents/*
 !data/documents/.gitkeep
+# Version-controlled reference knowledge base (Stage 2B): these ARE part
+# of the product and must be tracked. Managed Telegram uploads
+# (data/documents/uploads/, including their .meta.json sidecars) stay
+# gitignored via the blanket data/documents/* rule above — this negation
+# only re-includes plain files directly under data/documents/.
+!data/documents/*.md
 data/*.mp3
 data/*.ogg
 data/*.wav

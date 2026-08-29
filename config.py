@@ -7,6 +7,26 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Pure, side-effect-free constants (Stage 2B-D Section E) — re-exported
+# here for the full, credential-validating application. rag/constants.py
+# is the single canonical source: rag/loader.py, rag/sidecar.py,
+# rag/index.py, and scripts/rebuild_qdrant.py's dry-run path import these
+# directly from there instead of from this module, specifically so they
+# never trigger the credential-validating code below merely by needing a
+# path or a fixed manifest.
+from rag.constants import (
+    BUILTIN_REFERENCE_FILES,
+    DATA_DIR,
+    DOCUMENTS_DIR,
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    MANAGED_UPLOADS_DIR,
+    OFFICIAL_OPENAI_BASE_URL,
+    QDRANT_COLLECTION_NAME,
+    RAG_CHUNK_OVERLAP,
+    RAG_CHUNK_SIZE,
+)
+
 # Load environment variables
 load_dotenv()
 
@@ -23,14 +43,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY is not set in .env file")
 
-# The one and only OpenAI endpoint this application ever talks to. Passed
-# explicitly to every OpenAI-backed client (chat/vision/STT/TTS, image
-# generation, embeddings) rather than left unset, because the underlying
-# SDKs each fall back to reading their own base-URL environment variable
-# when no explicit value is given. This constant must never be made
-# configurable via the environment again — that would reopen a way for
-# requests to be silently redirected to a non-official endpoint.
-OFFICIAL_OPENAI_BASE_URL = "https://api.openai.com/v1"
+# OFFICIAL_OPENAI_BASE_URL: see rag/constants.py (imported above) — the one
+# and only OpenAI endpoint this application ever talks to. Passed explicitly
+# to every OpenAI-backed client (chat/vision/STT/TTS, image generation,
+# embeddings) rather than left unset, because the underlying SDKs each fall
+# back to reading their own base-URL environment variable when no explicit
+# value is given. This constant must never be made configurable via the
+# environment — that would reopen a way for requests to be silently
+# redirected to a non-official endpoint.
 
 # Text-LLM Provider Selection (Stage 2A)
 class LLMProvider:
@@ -121,21 +141,22 @@ MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 # Database Configuration
 DB_PATH = BASE_DIR / os.getenv("DB_PATH", "data/embeddings.db")
 
-# Data paths
-DATA_DIR = BASE_DIR / "data"
-DOCUMENTS_DIR = DATA_DIR / "documents"
-EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
-
-# Physical storage root for application-managed Telegram document uploads
-# (opaque UUID-named files, see handlers/document_upload.py). Nested under
-# DOCUMENTS_DIR but deliberately excluded from rag/loader.py's
-# load_directory() startup/reference scan: an upload is already indexed
-# into the persistent Chroma store at upload time with its original
-# filename as source metadata, so blindly rescanning disk on startup would
-# re-index it a second time under its opaque UUID filename. Interim design
-# until the later PostgreSQL/Qdrant document registry stage — if the
-# Chroma store is manually destroyed, uploads are not reconstructed from
-# disk; that recovery path belongs to the later registry architecture.
+# Data paths: DATA_DIR/DOCUMENTS_DIR/MANAGED_UPLOADS_DIR are imported from
+# rag/constants.py above (pure Path math, no credential dependency).
+#
+# MANAGED_UPLOADS_DIR is the physical storage root for application-managed
+# Telegram document uploads (opaque UUID-named files, see
+# handlers/document_upload.py). Each upload also gets a durable
+# `<uuid>.meta.json` sidecar next to it (see rag/sidecar.py) recording its
+# original display filename and content hash — the physical file + sidecar
+# together are the durable source of truth for the upload, independent of
+# Qdrant. Nested under DOCUMENTS_DIR but deliberately excluded from
+# rag/loader.py's load_directory() startup/reference scan: an upload is
+# indexed at upload time under its real display filename as source
+# metadata, so blindly rescanning disk on startup would re-index it a
+# second time under its opaque UUID filename. If Qdrant is destroyed,
+# uploads ARE reconstructable from disk — see scripts/rebuild_qdrant.py,
+# which rebuilds from source file + sidecar, never from Qdrant itself.
 #
 # Deliberately NOT created here (unlike DATA_DIR/DOCUMENTS_DIR below):
 # config.py is imported by every test module, and an eager mkdir would
@@ -143,7 +164,7 @@ EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
 # imports config, before a test monkeypatches this path to a tmp_path.
 # handlers/document_upload.py creates it lazily, only when an upload
 # actually needs to write to it.
-MANAGED_UPLOADS_DIR = DOCUMENTS_DIR / "uploads"
+EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
 
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)
@@ -153,10 +174,36 @@ DOCUMENTS_DIR.mkdir(exist_ok=True)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = BASE_DIR / "bot.log"
 
-# RAG Configuration
-RAG_CHUNK_SIZE = 1000
-RAG_CHUNK_OVERLAP = 200
+# RAG Configuration: RAG_CHUNK_SIZE/RAG_CHUNK_OVERLAP are imported from
+# rag/constants.py above.
 RAG_TOP_K = 3
+
+# EMBEDDING_MODEL/EMBEDDING_DIMENSIONS (Stage 2B) and QDRANT_COLLECTION_NAME
+# are imported from rag/constants.py above. EMBEDDING_MODEL/
+# EMBEDDING_DIMENSIONS make the current effective LangChain OpenAIEmbeddings
+# default explicit rather than implicit, so Qdrant's collection vector size
+# can be a fixed constant instead of something discovered via a live
+# embed_query() probe. Never change EMBEDDING_MODEL without also planning a
+# full Qdrant rebuild (see scripts/rebuild_qdrant.py), since old and new
+# points would no longer be comparable in the same collection.
+#
+# Qdrant Configuration (Stage 2B): local persistent mode only — no server
+# URL / API key here; that belongs to a later deployment stage. Storage
+# path is DATA_DIR / "qdrant", computed where VectorIndex reads the
+# (possibly test-redirected) DATA_DIR.
+
+# BUILTIN_REFERENCE_FILES (Stage 2B-C Blocker 5) is imported from
+# rag/constants.py above — the single source of truth for the explicit
+# manifest of built-in product-knowledge reference documents. Startup
+# reference indexing and rebuild planning enumerate EXACTLY these filenames
+# under DOCUMENTS_DIR, never an unconstrained directory scan by extension —
+# a stray legacy `.txt` file or an arbitrary extra `.md`/`.pdf`/`.docx`
+# dropped into DOCUMENTS_DIR must never be silently promoted into built-in
+# product knowledge. A missing manifest file is a hard, reported failure
+# (see rag.loader.list_builtin_reference_files()), never a silent reduction
+# of what gets indexed. Managed Telegram uploads are a separate, unaffected
+# path (rag/sidecar.py + MANAGED_UPLOADS_DIR above) and keep supporting
+# .pdf/.txt/.md/.docx.
 
 # OpenAI Settings
 TEMPERATURE = 0.7

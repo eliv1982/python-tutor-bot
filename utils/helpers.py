@@ -261,22 +261,54 @@ def convert_ogg_to_wav(ogg_path: Union[str, Path]) -> Path:
         raise
 
 
-def cleanup_file(filepath: Union[str, Path, None]) -> None:
+def cleanup_file(filepath: Union[str, Path, None]) -> bool:
     """
     Delete a file safely. Ignores None.
-    
+
     Args:
         filepath: Path to the file to delete (or None to skip)
+
+    Returns:
+        True if `filepath` is absent after this call — it didn't exist to
+        begin with, or the unlink succeeded. False if it still exists (the
+        unlink attempt failed). Never raises solely for a failed
+        best-effort cleanup (Stage 2B-D Blocker 2): a caller that needs to
+        know whether cleanup actually completed must check this return
+        value rather than assume "no exception" means "gone". Existing
+        callers that ignore the return value (there were several before
+        this fix) remain source-compatible.
+
+    Stage 2B-E Blocker 2 (Codex REJECTED Stage 2B-D): `Path.exists()`
+    FOLLOWS a symlink to check whether its TARGET exists — it says nothing
+    about whether the lexical directory entry itself (the symlink) is
+    still there. A dangling symlink (target missing/removed) therefore
+    reported `exists() == False` on both sides of this function: the
+    `if filepath.exists():` guard skipped calling `unlink()` on it at all,
+    and the final `not filepath.exists()` check then reported `True` —
+    "cleanup succeeded" — while the symlink itself was still sitting on
+    disk, completely untouched. The cleanup invariant this function
+    actually promises is about the ARTIFACT DIRECTORY ENTRY, not whatever
+    it may or may not point at, so every check below uses
+    `os.path.lexists()` (never `Path.exists()`), which reports the
+    lexical entry's own presence regardless of whether it's a symlink or
+    whether that symlink's target exists.
     """
     if filepath is None:
-        return
+        return True
+    filepath = Path(filepath)
+    if not os.path.lexists(filepath):
+        return True
     try:
-        filepath = Path(filepath)
-        if filepath.exists():
-            filepath.unlink()
-            logger.debug("Cleaned up file | name=%s", filepath.name)
+        filepath.unlink()
+        logger.debug("Cleaned up file | name=%s", filepath.name)
     except Exception as e:
         logger.warning("Error cleaning up file | error_type=%s", type(e).__name__)
+    try:
+        return not os.path.lexists(filepath)
+    except Exception:
+        # Can't even confirm the entry is gone — report incomplete rather
+        # than silently claiming success.
+        return False
 
 
 def cleanup_files(*filepaths: Union[str, Path]) -> None:

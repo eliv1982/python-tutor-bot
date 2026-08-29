@@ -49,7 +49,7 @@ async def test_rag_similarity_search_runs_off_event_loop_thread(monkeypatch):
         recorded_thread_id["id"] = threading.get_ident()
         return [(fake_doc, 0.1)]
 
-    monkeypatch.setattr(rag_query.vector_index, "similarity_search_with_score", synthetic_blocking_search)
+    monkeypatch.setattr(rag_query.get_vector_index(), "similarity_search_with_score", synthetic_blocking_search)
     monkeypatch.setattr(
         openai_client.client.chat.completions, "create",
         AsyncMock(return_value=SimpleNamespace(
@@ -79,11 +79,16 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
     Stage 1E.1 strengthening: the load+index step is proven to run as ONE
     offloaded unit by spying on `_load_and_index_document` itself — the
     actual callable passed to `asyncio.to_thread()` — rather than merely
-    comparing the thread IDs the loader/add_documents calls happened to run
-    on. Two independently-offloaded `to_thread` calls could coincidentally
-    land on the same default-executor thread, so thread-ID equality alone
-    does not prove a single-callable boundary; call-count on the wrapper
-    itself does.
+    comparing the thread IDs the loader/indexing calls happened to run on.
+    Two independently-offloaded `to_thread` calls could coincidentally land
+    on the same default-executor thread, so thread-ID equality alone does
+    not prove a single-callable boundary; call-count on the wrapper itself
+    does.
+
+    Stage 2B-F: `_load_and_index_document()` now makes exactly ONE
+    Qdrant-facing call (`reconcile_document()`, superseding the old
+    separate `document_loader.load_document()` + `add_documents()` pair) —
+    mocked here as a single unit rather than two separate fakes.
 
     Preserves Stage 1B guarantees: exclusive write, cleanup untouched on
     success, source attribution."""
@@ -93,39 +98,34 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
     store_thread_id = {}
     helper_thread_id = {}
     helper_call_count = {"n": 0}
-    load_call_count = {"n": 0}
-    add_call_count = {"n": 0}
+    reconcile_call_count = {"n": 0}
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
     real_store = document_upload._store_document_exclusively
 
-    def spy_store(file_bytes, extension, attempts=5):
+    def spy_store(file_bytes, extension, display_name, attempts=5):
         store_thread_id["id"] = threading.get_ident()
-        return real_store(file_bytes, extension, attempts=attempts)
+        return real_store(file_bytes, extension, display_name, attempts=attempts)
 
-    def fake_load_document(physical_path, display_name=None):
-        load_call_count["n"] += 1
-        return [SimpleNamespace(metadata={"source": display_name})]
-
-    def fake_add_documents(chunks):
-        add_call_count["n"] += 1
+    def fake_reconcile_document(document_id, file_path, **kwargs):
+        reconcile_call_count["n"] += 1
+        return ("reindexed", 1)
 
     real_load_and_index = document_upload._load_and_index_document
 
-    def spy_load_and_index(physical_path, display_name):
+    def spy_load_and_index(stored, display_name):
         # This IS the callable handed to asyncio.to_thread() in
         # handlers/document_upload.py — proving it runs exactly once, off
-        # the caller's thread, proves both load_document() and
-        # add_documents() happened inside that single offloaded unit.
+        # the caller's thread, proves both the secure read and
+        # reconcile_document() happened inside that single offloaded unit.
         helper_call_count["n"] += 1
         helper_thread_id["id"] = threading.get_ident()
-        return real_load_and_index(physical_path, display_name)
+        return real_load_and_index(stored, display_name)
 
     monkeypatch.setattr(document_upload, "_store_document_exclusively", spy_store)
     monkeypatch.setattr(document_upload, "_load_and_index_document", spy_load_and_index)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", fake_load_document)
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", fake_add_documents)
+    monkeypatch.setattr(document_upload.get_vector_index(), "reconcile_document", fake_reconcile_document)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -148,11 +148,10 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
     # The combined helper is invoked exactly once through the offloaded
     # boundary — the actual proof of "one unit", independent of thread IDs.
     assert helper_call_count["n"] == 1
-    assert load_call_count["n"] == 1
-    assert add_call_count["n"] == 1
+    assert reconcile_call_count["n"] == 1
 
     created = list(tmp_path.iterdir())
-    assert len(created) == 1  # exclusive write still happened exactly once
+    assert len(created) == 2  # physical file + its durable sidecar, exclusive write still happened exactly once
 
     success_text = send_message_mock.await_args.args[1]
     assert "успешно загружен" in success_text
@@ -170,11 +169,11 @@ async def test_document_upload_offloaded_failure_preserves_privacy_and_cleanup(m
 
     sensitive_detail = "corrupt PDF stream at absolute path C:\\Users\\confidential\\report.pdf"
     monkeypatch.setattr(
-        document_upload.document_loader, "load_document",
+        document_upload.document_loader, "load_document_bytes",
         Mock(side_effect=ValueError(sensitive_detail)),
     )
     add_mock = Mock()
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -267,7 +266,7 @@ async def test_event_loop_stays_responsive_during_offloaded_rag_query(monkeypatc
         assert release.wait(timeout=5), "release was never set by the test"
         return [(fake_doc, 0.1)]
 
-    monkeypatch.setattr(rag_query.vector_index, "similarity_search_with_score", blocking_search)
+    monkeypatch.setattr(rag_query.get_vector_index(), "similarity_search_with_score", blocking_search)
     monkeypatch.setattr(
         openai_client.client.chat.completions, "create",
         AsyncMock(return_value=SimpleNamespace(
@@ -332,7 +331,7 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
         search_thread_id["id"] = threading.get_ident()
         return [(fake_doc, 0.1)]
 
-    monkeypatch.setattr(rag_query.vector_index, "similarity_search_with_score", blocking_search)
+    monkeypatch.setattr(rag_query.get_vector_index(), "similarity_search_with_score", blocking_search)
     monkeypatch.setattr(
         openai_client.client.chat.completions, "create",
         AsyncMock(return_value=SimpleNamespace(
@@ -374,7 +373,7 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
 def test_vector_index_add_documents_acquires_lock_around_underlying_call(monkeypatch):
     """Deterministic (non-probabilistic) proof that
     `VectorIndex.add_documents()` acquires `self._lock` strictly BEFORE
-    entering the underlying `vectorstore.add_documents()` call, holds it
+    entering the underlying Qdrant `client.upsert()` call, holds it
     for the call's entire duration, and releases it only after.
 
     Stage 1E.3 correction: Stage 1E.2's version (6 threads + a
@@ -408,9 +407,10 @@ def test_vector_index_add_documents_acquires_lock_around_underlying_call(monkeyp
        trivially succeed.
 
     Together these prove the real nested-call structure
-    (`with self._lock: ... self.vectorstore.add_documents(...)`) is
-    exactly what runs — not merely that it's statistically likely."""
+    (`with self._lock: ... self.client.upsert(...)`) is exactly what
+    runs — not merely that it's statistically likely."""
     import rag.index as rag_index
+    from langchain_core.documents import Document
 
     events = []
     events_lock = threading.Lock()
@@ -443,23 +443,35 @@ def test_vector_index_add_documents_acquires_lock_around_underlying_call(monkeyp
             self._real_lock.release()
 
     recording_lock = RecordingRLock()
-    monkeypatch.setattr(rag_index.vector_index, "_lock", recording_lock)
+    monkeypatch.setattr(rag_index.get_vector_index(), "_lock", recording_lock)
+    # No real OpenAI call: embed_documents() runs (inside the lock, before
+    # the Qdrant call) against a deterministic local stub. embeddings is a
+    # pydantic BaseModel instance (OpenAIEmbeddings) that rejects setting
+    # attributes outside its declared fields, so the whole attribute is
+    # swapped on the VectorIndex instance instead of patching a method
+    # onto the model itself.
+    class _StubEmbeddings:
+        def embed_documents(self, texts):
+            return [[0.0] * 1536 for _ in texts]
 
-    entered_vectorstore = threading.Event()
-    release_vectorstore = threading.Event()
+    monkeypatch.setattr(rag_index.get_vector_index(), "embeddings", _StubEmbeddings())
 
-    def fake_chroma_add_documents(documents):
+    entered_qdrant = threading.Event()
+    release_qdrant = threading.Event()
+
+    def fake_upsert(collection_name, points, **kwargs):
         with events_lock:
-            events.append("vectorstore_entered")
-        entered_vectorstore.set()
-        assert release_vectorstore.wait(timeout=5), "test setup: release_vectorstore was never set"
+            events.append("qdrant_entered")
+        entered_qdrant.set()
+        assert release_qdrant.wait(timeout=5), "test setup: release_qdrant was never set"
 
-    monkeypatch.setattr(rag_index.vector_index.vectorstore, "add_documents", fake_chroma_add_documents)
+    monkeypatch.setattr(rag_index.get_vector_index().client, "upsert", fake_upsert)
 
-    worker_thread = threading.Thread(target=lambda: rag_index.vector_index.add_documents(["chunk"]))
+    doc = Document(page_content="chunk text", metadata={"document_id": "doc1", "chunk_index": 0, "source": "notes.txt"})
+    worker_thread = threading.Thread(target=lambda: rag_index.get_vector_index().add_documents([doc]))
     worker_thread.start()
 
-    assert entered_vectorstore.wait(timeout=5), "worker never reached the underlying vectorstore call"
+    assert entered_qdrant.wait(timeout=5), "worker never reached the underlying Qdrant upsert call"
 
     # Mechanical mutual-exclusion proof (not timing inference): the worker
     # is deterministically known (via the Event above) to be inside the
@@ -468,17 +480,17 @@ def test_vector_index_add_documents_acquires_lock_around_underlying_call(monkeyp
     # short bounded timeout — RLock ownership is per-thread, so this can
     # only succeed if nothing is actually holding the lock.
     acquired = recording_lock.acquire(blocking=True, timeout=0.2)
-    assert not acquired, "lock was not held during the underlying vectorstore call"
+    assert not acquired, "lock was not held during the underlying Qdrant upsert call"
 
-    release_vectorstore.set()
+    release_qdrant.set()
     worker_thread.join(timeout=5)
     assert not worker_thread.is_alive(), "worker thread never terminated"
 
     # Exact event order: the lock was entered before, and exited after,
     # the underlying call — nothing more, nothing less.
-    assert events == ["lock_enter", "vectorstore_entered", "lock_exit"], (
+    assert events == ["lock_enter", "qdrant_entered", "lock_exit"], (
         f"add_documents() did not acquire the lock strictly around the "
-        f"underlying vectorstore call: {events!r}"
+        f"underlying Qdrant upsert call: {events!r}"
     )
 
     # The lock is free again afterward — released, not leaked.
@@ -487,14 +499,14 @@ def test_vector_index_add_documents_acquires_lock_around_underlying_call(monkeyp
 
 
 def test_vector_index_nested_locked_methods_do_not_deadlock(monkeypatch, tmp_path):
-    """index_documents_directory() calls clear_index() and add_documents()
-    on itself while already holding VectorIndex._lock.
+    """index_documents_directory() calls clear_index() and
+    reconcile_document() on itself while already holding VectorIndex._lock.
 
     Stage 1E.1 strengthening: merely asserting `_lock` is an RLock (as the
     original Stage 1E test did) doesn't prove the actual nested production
     path avoids deadlock — it only proves the lock TYPE is reentrant. This
     exercises the real path end-to-end (index_documents_directory ->
-    clear_index -> add_documents, each reacquiring the lock) with
+    clear_index -> reconcile_document, each reacquiring the lock) with
     loader/vectorstore mocked out (no Chroma/network/filesystem side
     effects beyond an isolated tmp_path), run on a background thread with a
     bounded `join(timeout=...)` — a regression to a non-reentrant lock would
@@ -508,47 +520,58 @@ def test_vector_index_nested_locked_methods_do_not_deadlock(monkeypatch, tmp_pat
     the whole pytest process from exiting even after this test reports
     failure. Marking it `daemon=True` means a genuine deadlock here fails
     just this test (via the `is_alive()` assertion after the bounded join)
-    instead of hanging the entire suite."""
+    instead of hanging the entire suite.
+
+    Stage 2B: exercises THREE nested lock reacquisitions on the real
+    production path — index_documents_directory() -> clear_index()
+    (deletes every existing point via the collection's client.delete())
+    -> (per changed file) reconcile_document() -> _replace_document_points()
+    -> self.client.upsert(). Only the actual network/Qdrant-write
+    boundary (client.upsert) is stubbed; every VectorIndex method in
+    between, including the lock acquisition itself, runs for real — and
+    a dedicated isolated VectorIndex (tmp_path, deterministic local fake
+    embeddings) is used instead of the shared production singleton, so
+    this test cannot wipe or pollute real cross-test state."""
     import rag.index as rag_index
+    from rag_fakes import DeterministicFakeEmbeddings
 
-    fake_documents = ["chunk-a", "chunk-b"]
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "a.md").write_text("hello a", encoding="utf-8")
 
-    load_directory_mock = Mock(return_value=fake_documents)
-    monkeypatch.setattr(rag_index.document_loader, "load_directory", load_directory_mock)
-    add_documents_mock = Mock()
-    monkeypatch.setattr(rag_index.vector_index.vectorstore, "add_documents", add_documents_mock)
-
-    # clear_index() deletes/recreates persist_directory and calls
-    # _load_or_create_vectorstore() — isolate to a fresh tmp_path and stub
-    # vectorstore reconstruction so no real Chroma/network call happens.
-    monkeypatch.setattr(rag_index.vector_index, "persist_directory", tmp_path / "chroma_isolated")
-    reload_vectorstore_mock = Mock()
-    monkeypatch.setattr(rag_index.vector_index, "_load_or_create_vectorstore", reload_vectorstore_mock)
+    vi = rag_index.VectorIndex(
+        persist_directory=tmp_path / "qdrant_isolated",
+        embeddings=DeterministicFakeEmbeddings(),
+        collection_name="nested_lock_test",
+    )
+    upsert_mock = Mock()
+    monkeypatch.setattr(vi.client, "upsert", upsert_mock)
 
     result_holder = {}
     error_holder = {}
 
     def run_nested_path():
         try:
-            result_holder["count"] = rag_index.vector_index.index_documents_directory(
-                directory=tmp_path, force_reindex=True
+            result_holder["count"] = vi.index_documents_directory(
+                directory=docs_dir, force_reindex=True, reference_filenames=None
             )
         except BaseException as e:
             error_holder["error"] = e
 
-    # daemon=True: see docstring above — a genuine deadlock must fail only
-    # this test, never hang the pytest process.
-    t = threading.Thread(target=run_nested_path, daemon=True)
-    t.start()
-    t.join(timeout=5)
+    try:
+        # daemon=True: see docstring above — a genuine deadlock must fail
+        # only this test, never hang the pytest process.
+        t = threading.Thread(target=run_nested_path, daemon=True)
+        t.start()
+        t.join(timeout=5)
 
-    assert not t.is_alive(), "index_documents_directory -> clear_index -> add_documents deadlocked"
-    assert "error" not in error_holder, f"nested locked path raised: {error_holder.get('error')!r}"
-    # clear_index() actually ran (first nested lock reacquisition)...
-    reload_vectorstore_mock.assert_called_once()
-    # ...and the load+add pipeline actually ran too (second nested lock
-    # reacquisition, via self.add_documents() called from inside
-    # index_documents_directory() while it still holds the outer lock).
-    load_directory_mock.assert_called_once_with(tmp_path)
-    add_documents_mock.assert_called_once_with(fake_documents)
-    assert result_holder.get("count") == len(fake_documents)
+        assert not t.is_alive(), "index_documents_directory -> clear_index -> reconcile_document -> _replace_document_points deadlocked"
+        assert "error" not in error_holder, f"nested locked path raised: {error_holder.get('error')!r}"
+        # The load+add pipeline actually ran (nested lock reacquisitions
+        # via clear_index() and reconcile_document() -> _replace_document_points()
+        # called from inside index_documents_directory() while it still
+        # holds the outer lock).
+        upsert_mock.assert_called_once()
+        assert result_holder.get("count") == 1
+    finally:
+        vi.close()

@@ -6,7 +6,7 @@ Handles queries against the knowledge base with context-aware responses.
 import asyncio
 from typing import List, Dict, Optional
 
-from rag.index import vector_index
+from rag.index import get_vector_index
 from services import text_llm
 from utils.logging import logger
 from config import RAG_TOP_K
@@ -28,7 +28,7 @@ async def query_knowledge_base(
     """
     try:
         logger.info("RAG query_knowledge_base | query_len=%s, top_k=%s", len(query), RAG_TOP_K)
-        # Chroma similarity search + OpenAIEmbeddings is synchronous and
+        # Qdrant similarity search + OpenAIEmbeddings is synchronous and
         # blocking (network + local vector search) — run it off the event
         # loop so one RAG query doesn't stall unrelated Telegram updates.
         #
@@ -36,10 +36,10 @@ async def query_knowledge_base(
         # `asyncio.to_thread()` (no shielding). If the caller is cancelled
         # while this is in flight, the worker thread may keep running to
         # completion, but it is read-only (never mutates UserSession, the
-        # Chroma store, or any file) and its result is simply discarded —
+        # Qdrant store, or any file) and its result is simply discarded —
         # there is no cleanup/ownership race to resolve, unlike the
         # document-upload storage/indexing writes.
-        results = await asyncio.to_thread(vector_index.similarity_search_with_score, query, k=RAG_TOP_K)
+        results = await asyncio.to_thread(get_vector_index().similarity_search_with_score, query, k=RAG_TOP_K)
         logger.debug("RAG similarity_search | results_count=%s", len(results))
         if not results:
             logger.warning("RAG: no results, using fallback")
@@ -63,7 +63,7 @@ async def query_knowledge_base(
         logger.info("RAG query done | response_len=%s, source_count=%s", len(response), len(sources))
         return response
     except Exception as e:
-        # Wraps Chroma similarity search (embeddings network call) and the
+        # Wraps Qdrant similarity search (embeddings network call) and the
         # OpenAI chat completion — never log raw exception text.
         logger.error("RAG query_knowledge_base failed | error_type=%s", type(e).__name__)
         # Fallback to regular GPT response
@@ -203,7 +203,7 @@ async def add_document_to_knowledge_base(file_path: str) -> dict:
         documents = document_loader.load_document(file_path)
         
         # Add to index
-        vector_index.add_documents(documents)
+        get_vector_index().add_documents(documents)
         
         # file_path.name is caller-supplied and not guaranteed non-sensitive
         # (this helper is currently unused, but future callers could pass a
@@ -233,5 +233,5 @@ def get_knowledge_base_stats() -> dict:
     Returns:
         Dictionary with statistics
     """
-    return vector_index.get_stats()
+    return get_vector_index().get_stats()
 

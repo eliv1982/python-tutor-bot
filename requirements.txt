@@ -32,17 +32,31 @@ anthropic>=1.0.0,<2.0.0
 # langchain_text_splitters.RecursiveCharacterTextSplitter directly. Top-level
 # `langchain` is no longer imported anywhere in the source tree (its one use
 # site, rag/loader.py, was migrated to langchain_core) and is intentionally
-# not declared.
+# not declared. langchain-community is still required: rag/loader.py's
+# PyPDFLoader/TextLoader/Docx2txtLoader come from it, independent of any
+# vector-store integration.
 langchain-core>=1.6.0,<2.0.0
 langchain-openai>=1.6.0,<2.0.0
 langchain-community>=0.4.2,<0.5.0
 langchain-text-splitters>=1.1.2,<2.0.0
-chromadb>=1.5.9,<2.0.0
 
-# Document parsing backends. Neither `pypdf` nor `docx2txt` is imported by
-# name anywhere in this repo's source; they are runtime backends required
-# by langchain_community's PyPDFLoader and Docx2txtLoader respectively
-# (rag/loader.py). Removing them breaks PDF/DOCX ingestion at runtime.
+# Vector store (Stage 2B): direct official client, local persistent mode
+# only (no server/Docker deployment yet). Deliberately NOT langchain-qdrant
+# or qdrant-client[fastembed] — this repo builds its own OpenAIEmbeddings
+# and talks to qdrant-client's plain QdrantClient API directly (see
+# rag/index.py), so neither a LangChain vector-store wrapper nor a bundled
+# local embedding model is needed. Verified installable and conflict-free
+# on Python 3.12 in a disposable environment; 1.19.0 was the current PyPI
+# release at Stage 2B-B verification time.
+qdrant-client>=1.19.0,<2.0.0
+
+# Document parsing backends. `pypdf` is not imported by name anywhere in
+# this repo's source; it's a runtime backend required by langchain_community's
+# PyPDFLoader/PyPDFParser (rag/loader.py). `docx2txt` IS imported by name
+# in rag/loader.py (Stage 2B-F Blocker 1: parsing managed-upload bytes
+# in-memory via `docx2txt.process(io.BytesIO(...))`, never a Docx2txtLoader
+# pathname reopen — see load_document_bytes()). Removing either breaks
+# PDF/DOCX ingestion at runtime.
 pypdf>=6.16.2,<7.0.0
 docx2txt>=0.8,<1.0.0
 

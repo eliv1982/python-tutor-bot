@@ -68,19 +68,24 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_store(file_bytes, extension):
+    def fake_store(file_bytes, extension, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         path = tmp_path / f"owned_upload{extension}"
         path.write_bytes(file_bytes)
         created_path_holder["path"] = path
-        return path
+        return document_upload.StoredUpload(
+            physical_path=path,
+            sidecar_path=tmp_path / "owned_upload.meta.json",
+            document_id="upload:test-fake",
+            content_sha256="deadbeef",
+        )
 
     load_mock = Mock()
     add_mock = Mock()
     monkeypatch.setattr(document_upload, "_store_document_exclusively", fake_store)
     monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -146,7 +151,7 @@ async def test_cancel_twice_during_indexing_success_still_retains_file(monkeypat
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_load_and_index(physical_path, display_name):
+    def fake_load_and_index(stored, display_name):
         call_count["n"] += 1
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
@@ -173,8 +178,8 @@ async def test_cancel_twice_during_indexing_success_still_retains_file(monkeypat
     await _wait_until(started.is_set)
 
     created_before_cancel = [p for p in tmp_path.iterdir() if p.is_file()]
-    assert len(created_before_cancel) == 1
-    physical_path = created_before_cancel[0]
+    assert len(created_before_cancel) == 2
+    physical_path = next(p for p in created_before_cancel if not p.name.endswith(".meta.json"))
 
     task.cancel()
     await asyncio.sleep(0)
@@ -224,7 +229,7 @@ async def test_worker_exception_after_repeated_cancel_is_retrieved_and_stays_pri
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_load_and_index(physical_path, display_name):
+    def fake_load_and_index(stored, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError(sensitive_detail)
@@ -250,8 +255,8 @@ async def test_worker_exception_after_repeated_cancel_is_retrieved_and_stays_pri
     await _wait_until(started.is_set)
 
     created_before_cancel = [p for p in tmp_path.iterdir() if p.is_file()]
-    assert len(created_before_cancel) == 1
-    physical_path = created_before_cancel[0]
+    assert len(created_before_cancel) == 2
+    physical_path = next(p for p in created_before_cancel if not p.name.endswith(".meta.json"))
 
     task.cancel()
     await asyncio.sleep(0)
@@ -385,19 +390,24 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_store(file_bytes, extension):
+    def fake_store(file_bytes, extension, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         path = tmp_path / f"owned_upload{extension}"
         path.write_bytes(file_bytes)
         created_path_holder["path"] = path
-        return path
+        return document_upload.StoredUpload(
+            physical_path=path,
+            sidecar_path=tmp_path / "owned_upload.meta.json",
+            document_id="upload:test-fake",
+            content_sha256="deadbeef",
+        )
 
     load_mock = Mock()
     add_mock = Mock()
     monkeypatch.setattr(document_upload, "_store_document_exclusively", fake_store)
     monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",

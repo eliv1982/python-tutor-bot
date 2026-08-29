@@ -72,7 +72,7 @@ async def cmd_help(message: types.Message):
 • [Фото ошибки] «Почему падает этот код?»
 • В RAG: загрузи конспект → спроси по нему
 
-Стек: GPT-4o, Whisper, TTS, Vision, ChromaDB (RAG)."""
+Стек: GPT-4o, Whisper, TTS, Vision, Qdrant (RAG)."""
     
     await bot.send_message(message.chat.id, help_text)
 

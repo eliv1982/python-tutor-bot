@@ -399,12 +399,10 @@ async def test_stats_command_never_forwards_raw_exception_to_user(monkeypatch, c
     import rag.index as rag_index
 
     # Exercise the real VectorIndex.get_stats() implementation (not a
-    # replacement mock) by making the underlying Chroma collection access
-    # itself fail, so the sanitization inside get_stats() is what's tested.
+    # replacement mock) by making the underlying Qdrant client call itself
+    # fail, so the sanitization inside get_stats() is what's tested.
     leaking_message = _leaking_exception_message()
-    broken_collection = Mock()
-    broken_collection.count = Mock(side_effect=RuntimeError(leaking_message))
-    monkeypatch.setattr(rag_index.vector_index.vectorstore, "_collection", broken_collection)
+    monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(side_effect=RuntimeError(leaking_message)))
 
     send_message_mock = AsyncMock()
     monkeypatch.setattr(start_handler.bot, "send_message", send_message_mock)

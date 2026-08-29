@@ -30,6 +30,7 @@ scan is exercised, rag.loader.MANAGED_UPLOADS_DIR) to a pytest tmp_path,
 so the real (gitignored) data/documents directory is never touched.
 """
 
+import itertools
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,9 @@ import pytest
 
 import handlers.document_upload as document_upload
 import rag.loader as rag_loader
+from rag.index import VectorIndex
 from rag.loader import SUPPORTED_EXTENSIONS, document_loader as real_document_loader
+from rag_fakes import DeterministicFakeEmbeddings
 
 UUID_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -88,8 +91,8 @@ def _patch_telegram(monkeypatch, file_bytes: bytes, file_path: str = "documents/
 ])
 async def test_path_traversal_impossible_by_construction(monkeypatch, tmp_path, malicious_name):
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=[]))
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", Mock())
+    monkeypatch.setattr(document_upload.document_loader, "load_document_bytes", Mock(return_value=[]))
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", Mock())
 
     _patch_telegram(monkeypatch, b"hello world")
     message, document = _make_document_message(1, malicious_name)
@@ -97,14 +100,16 @@ async def test_path_traversal_impossible_by_construction(monkeypatch, tmp_path, 
     await document_upload.process_document_upload(message, document)
 
     created = list(tmp_path.iterdir())
-    assert len(created) == 1, f"expected exactly one file created inside tmp_path, got {created}"
-    physical_path = created[0]
+    assert len(created) == 2, f"expected exactly one physical file + one sidecar inside tmp_path, got {created}"
+    physical_path = next(p for p in created if not p.name.endswith(".meta.json"))
+    sidecar_path = next(p for p in created if p.name.endswith(".meta.json"))
 
     # Proves the path is application-generated, not merely sanitized: the
     # stem must be a uuid4 hex, bearing no relation to the malicious name.
     assert UUID_HEX_RE.match(physical_path.stem), physical_path.name
     assert physical_path.suffix == ".txt"
     assert physical_path.name != Path(malicious_name).name
+    assert sidecar_path.name == f"{physical_path.stem}.meta.json"
 
     # And it must actually live inside the intended root.
     assert physical_path.resolve().parent == tmp_path.resolve()
@@ -117,8 +122,8 @@ async def test_path_traversal_impossible_by_construction(monkeypatch, tmp_path, 
 @pytest.mark.asyncio
 async def test_duplicate_original_filenames_do_not_overwrite(monkeypatch, tmp_path):
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=[]))
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", Mock())
+    monkeypatch.setattr(document_upload.document_loader, "load_document_bytes", Mock(return_value=[]))
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", Mock())
 
     _patch_telegram(monkeypatch, b"first content")
     message1, document1 = _make_document_message(1, "notes.txt", file_id="id-1")
@@ -129,11 +134,13 @@ async def test_duplicate_original_filenames_do_not_overwrite(monkeypatch, tmp_pa
     await document_upload.process_document_upload(message2, document2)
 
     created = list(tmp_path.iterdir())
-    assert len(created) == 2
-    names = {p.name for p in created}
+    assert len(created) == 4  # 2 physical files + 2 sidecars
+    physical_files = [p for p in created if not p.name.endswith(".meta.json")]
+    assert len(physical_files) == 2
+    names = {p.name for p in physical_files}
     assert len(names) == 2  # different physical identities
 
-    contents = {p.read_bytes() for p in created}
+    contents = {p.read_bytes() for p in physical_files}
     assert contents == {b"first content", b"second content, different bytes"}
 
 
@@ -147,7 +154,7 @@ async def test_unsupported_extension_rejected_before_loader_and_index(monkeypatc
     load_mock = Mock()
     add_mock = Mock()
     monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     send_message_mock = AsyncMock()
     monkeypatch.setattr(document_upload.bot, "send_message", send_message_mock)
@@ -209,7 +216,7 @@ async def test_oversized_document_rejected_before_parsing_and_indexing(monkeypat
     load_mock = Mock()
     add_mock = Mock()
     monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     oversized_bytes = b"x" * 101
     _patch_telegram(monkeypatch, oversized_bytes)
@@ -230,9 +237,19 @@ async def test_oversized_document_rejected_before_parsing_and_indexing(monkeypat
 
 @pytest.mark.asyncio
 async def test_original_filename_preserved_as_rag_source_not_uuid(monkeypatch, tmp_path):
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    add_mock = Mock()
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    """
+    Stage 2B-F: `_load_and_index_document()` now indexes via
+    `VectorIndex.reconcile_document(..., source_bytes=...)`, not a direct
+    `add_documents()` call — a real local-persistent Qdrant (deterministic
+    fake embeddings, never a real provider call) is used here so the
+    actually-indexed payload can be inspected directly, exactly as it will
+    be retrieved, rather than intercepting an internal call that no longer
+    exists on this path.
+    """
+    vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="original_filename_test")
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
     # Use the REAL loader (TextLoader for .txt) to prove end-to-end that a
     # UUID storage filename does not leak into displayed/cited sources.
     monkeypatch.setattr(document_upload, "document_loader", real_document_loader)
@@ -240,17 +257,27 @@ async def test_original_filename_preserved_as_rag_source_not_uuid(monkeypatch, t
     _patch_telegram(monkeypatch, b"Python is a great language for tutoring.")
     message, document = _make_document_message(1, "My Study Notes.txt")
 
-    await document_upload.process_document_upload(message, document)
+    try:
+        await document_upload.process_document_upload(message, document)
 
-    assert add_mock.call_count == 1
-    chunks = add_mock.call_args.args[0]
-    assert len(chunks) >= 1
-    for chunk in chunks:
-        assert chunk.metadata["source"] == "My Study Notes.txt"
-        assert not UUID_HEX_RE.match(Path(chunk.metadata["source"]).stem)
-        # file_path metadata may still carry the physical (uuid) path —
-        # that's an internal detail, not what gets displayed/cited.
-        assert UUID_HEX_RE.match(Path(chunk.metadata["file_path"]).stem)
+        physical_files = [p for p in uploads_dir.iterdir() if not p.name.endswith(".meta.json")]
+        assert len(physical_files) == 1
+
+        results = vi.similarity_search("Python is a great language for tutoring.", k=1)
+        assert len(results) == 1
+        metadata = results[0].metadata
+        assert metadata["source"] == "My Study Notes.txt"
+        assert not UUID_HEX_RE.match(Path(metadata["source"]).stem)
+        # The internal (uuid-named) temp-snapshot/managed-storage path is
+        # never part of the safe Qdrant payload at all (Stage 2B-F Section
+        # C: no snapshot path may reach Qdrant metadata).
+        assert "file_path" not in metadata
+        # (Stage 2B) stable identity/fingerprint metadata is attached too.
+        assert metadata["document_id"].startswith("upload:")
+        assert metadata["stored_name"] == physical_files[0].name
+        assert metadata["content_sha256"]
+    finally:
+        vi.close()
 
 
 # ---------------------------------------------------------------------------
@@ -280,18 +307,20 @@ async def test_managed_upload_not_reloaded_with_opaque_source_on_startup_scan(mo
     monkeypatch.setattr(rag_loader, "MANAGED_UPLOADS_DIR", managed_dir)
     monkeypatch.setattr(document_upload, "document_loader", real_document_loader)
 
-    add_mock = Mock()
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    # Stage 2B-F: real local Qdrant instead of intercepting add_documents()
+    # directly, which _load_and_index_document() no longer calls — see
+    # test_original_filename_preserved_as_rag_source_not_uuid above.
+    vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="startup_scan_test")
+    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
 
     _patch_telegram(monkeypatch, b"Python functions are defined with the def keyword.")
     message, document = _make_document_message(1, "python_notes.txt")
     await document_upload.process_document_upload(message, document)
 
     # Step 2: initial ingest used the original filename as source.
-    assert add_mock.call_count == 1
-    uploaded_chunks = add_mock.call_args.args[0]
-    assert len(uploaded_chunks) >= 1
-    assert all(c.metadata["source"] == "python_notes.txt" for c in uploaded_chunks)
+    results = vi.similarity_search("Python functions are defined with the def keyword.", k=1)
+    assert len(results) == 1
+    assert results[0].metadata["source"] == "python_notes.txt"
 
     # A manually-managed reference document living alongside (not inside)
     # the uploads subdirectory, to prove the scan still indexes real
@@ -301,12 +330,15 @@ async def test_managed_upload_not_reloaded_with_opaque_source_on_startup_scan(mo
     )
 
     # Step 3/4: exercise the startup/reference scan directly.
-    reloaded_chunks = real_document_loader.load_directory(documents_dir)
-    reloaded_sources = {c.metadata["source"] for c in reloaded_chunks}
+    try:
+        reloaded_chunks = real_document_loader.load_directory(documents_dir)
+        reloaded_sources = {c.metadata["source"] for c in reloaded_chunks}
 
-    assert reloaded_sources == {"python_intro.txt"}
-    for source in reloaded_sources:
-        assert not UUID_HEX_RE.match(Path(source).stem)
+        assert reloaded_sources == {"python_intro.txt"}
+        for source in reloaded_sources:
+            assert not UUID_HEX_RE.match(Path(source).stem)
+    finally:
+        vi.close()
 
 
 # ---------------------------------------------------------------------------
@@ -316,20 +348,22 @@ async def test_managed_upload_not_reloaded_with_opaque_source_on_startup_scan(mo
 @pytest.mark.asyncio
 async def test_loader_failure_cleans_up_newly_created_file(monkeypatch, tmp_path, caplog):
     """
-    Stage 1D.1: document_loader.load_document() can fail on a provider/HTTP
-    exception too (its caller, vector_index.add_documents(), reaches
-    OpenAIEmbeddings over the network for OTHER chunks in the same request
-    lifecycle), so the failure log here only ever carries safe metadata —
-    never the raw exception text. Cleanup/user-response guarantees from
-    Stage 1B are unchanged.
+    Stage 1D.1: document_loader.load_document_bytes() (Stage 2B-F: the
+    in-memory bytes parser reconcile_document() now calls for managed
+    uploads) can fail on a provider/HTTP exception too (its caller,
+    vector_index.reconcile_document(), reaches OpenAIEmbeddings over the
+    network for OTHER chunks in the same request lifecycle), so the
+    failure log here only ever carries safe metadata — never the raw
+    exception text. Cleanup/user-response guarantees from Stage 1B are
+    unchanged.
     """
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
     monkeypatch.setattr(
-        document_upload.document_loader, "load_document",
+        document_upload.document_loader, "load_document_bytes",
         Mock(side_effect=ValueError("corrupt PDF stream at offset 42")),
     )
     add_mock = Mock()
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     _patch_telegram(monkeypatch, b"%PDF-1.4 fake pdf bytes")
     send_message_mock = document_upload.bot.send_message
@@ -356,16 +390,17 @@ async def test_loader_failure_cleans_up_newly_created_file(monkeypatch, tmp_path
 @pytest.mark.asyncio
 async def test_indexing_failure_cleans_up_newly_created_file(monkeypatch, tmp_path, caplog):
     """
-    Stage 1D.1: vector_index.add_documents() embeds chunks via
-    OpenAIEmbeddings (a network call) before writing to Chroma, so a
-    RuntimeError here can genuinely be a provider/HTTP exception — the
-    failure log only ever carries safe metadata, never raw exception text.
+    Stage 1D.1: vector_index.reconcile_document() (Stage 2B-F: the call
+    _load_and_index_document() now makes, superseding the old direct
+    add_documents() call) embeds chunks via OpenAIEmbeddings (a network
+    call) before writing to Qdrant, so a RuntimeError here can genuinely
+    be a provider/HTTP exception — the failure log only ever carries safe
+    metadata, never raw exception text.
     """
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=["chunk"]))
     monkeypatch.setattr(
-        document_upload.vector_index, "add_documents",
-        Mock(side_effect=RuntimeError("chroma collection unavailable")),
+        document_upload.get_vector_index(), "reconcile_document",
+        Mock(side_effect=RuntimeError("qdrant collection unavailable")),
     )
 
     _patch_telegram(monkeypatch, b"some text content")
@@ -377,11 +412,11 @@ async def test_indexing_failure_cleans_up_newly_created_file(monkeypatch, tmp_pa
         await document_upload.process_document_upload(message, document)
 
     assert list(tmp_path.iterdir()) == []  # orphan file removed
-    assert "chroma collection unavailable" not in caplog.text
+    assert "qdrant collection unavailable" not in caplog.text
     assert "Document upload failed" in caplog.text
     assert "RuntimeError" in caplog.text
     last_message = send_message_mock.await_args.args[1]
-    assert "chroma collection unavailable" not in last_message
+    assert "qdrant collection unavailable" not in last_message
     assert "ошибка" in last_message.lower()
 
 
@@ -392,18 +427,22 @@ async def test_indexing_failure_cleans_up_newly_created_file(monkeypatch, tmp_pa
 @pytest.mark.asyncio
 async def test_notification_failure_after_successful_ingestion_does_not_rollback(monkeypatch, tmp_path, caplog):
     """
-    Goal 2 regression (Stage 1B.1 / hardened in 1B.2): vector_index.add_documents()
-    succeeding must be the ingestion success boundary. A later failure sending
-    the final "success" Telegram message must not delete the already-ingested
-    file, must not be reported to the user as a failed upload, must not
-    trigger a second cleanup attempt — and (1B.2) the exception itself, which
-    can be a pyTelegramBotAPI HTTP error carrying a token-bearing Telegram API
-    URL, must never reach the logs verbatim or via exc_info.
+    Goal 2 regression (Stage 1B.1 / hardened in 1B.2): vector_index.
+    reconcile_document() (Stage 2B-F: the call _load_and_index_document()
+    now makes) succeeding must be the ingestion success boundary. A later
+    failure sending the final "success" Telegram message must not delete
+    the already-ingested file, must not be reported to the user as a
+    failed upload, must not trigger a second cleanup attempt — and (1B.2)
+    the exception itself, which can be a pyTelegramBotAPI HTTP error
+    carrying a token-bearing Telegram API URL, must never reach the logs
+    verbatim or via exc_info. Real local Qdrant (deterministic fake
+    embeddings) rather than mocking add_documents(), which
+    _load_and_index_document() no longer calls directly.
     """
-    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    add_mock = Mock()
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=["chunk-a", "chunk-b"]))
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", uploads_dir)
+    vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=DeterministicFakeEmbeddings(), collection_name="notification_failure_test")
+    monkeypatch.setattr(document_upload, "get_vector_index", lambda: vi)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -433,27 +472,30 @@ async def test_notification_failure_after_successful_ingestion_does_not_rollback
     message, document = _make_document_message(1, "notes.txt")
 
     import logging
-    with caplog.at_level(logging.DEBUG):
-        await document_upload.process_document_upload(message, document)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            await document_upload.process_document_upload(message, document)
 
-    # Ingestion happened exactly once and was never treated as failed.
-    add_mock.assert_called_once()
-    created = list(tmp_path.iterdir())
-    assert len(created) == 1, "successfully ingested file must not be deleted"
+        # Ingestion happened exactly once and was never treated as failed.
+        assert vi.get_stats()["total_documents"] >= 1
+        created = list(uploads_dir.iterdir())
+        assert len(created) == 2, "successfully ingested file + its sidecar must not be deleted"
 
-    # The failure was logged safely (event name + user_id + exception type)...
-    log_text = caplog.text
-    assert "notification failed" in log_text.lower()
-    assert "already committed" in log_text.lower()
-    assert "Exception" in log_text  # exception class/type is the safe part
-    # ...but neither the fake token, the token-bearing URL, nor the raw
-    # exception text was logged, and no traceback was emitted for it.
-    assert fake_token not in log_text
-    assert leaking_message not in log_text
-    assert "api.telegram.org" not in log_text
-    assert "Traceback" not in log_text
-    # ...and no misleading "upload failed" message was ever sent to the user.
-    assert not any("ошибка при загрузке" in m.lower() for m in sent_messages)
+        # The failure was logged safely (event name + user_id + exception type)...
+        log_text = caplog.text
+        assert "notification failed" in log_text.lower()
+        assert "already committed" in log_text.lower()
+        assert "Exception" in log_text  # exception class/type is the safe part
+        # ...but neither the fake token, the token-bearing URL, nor the raw
+        # exception text was logged, and no traceback was emitted for it.
+        assert fake_token not in log_text
+        assert leaking_message not in log_text
+        assert "api.telegram.org" not in log_text
+        assert "Traceback" not in log_text
+        # ...and no misleading "upload failed" message was ever sent to the user.
+        assert not any("ошибка при загрузке" in m.lower() for m in sent_messages)
+    finally:
+        vi.close()
 
 
 # ---------------------------------------------------------------------------
@@ -468,15 +510,21 @@ async def test_exclusive_creation_does_not_overwrite_existing_candidate(monkeypa
     already occupies that path.
     """
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(document_upload.document_loader, "load_document", Mock(return_value=[]))
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", Mock())
+    monkeypatch.setattr(document_upload.document_loader, "load_document_bytes", Mock(return_value=[]))
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", Mock())
 
     colliding_hex = "a" * 32
     fresh_hex = "b" * 32
     existing_path = tmp_path / f"{colliding_hex}.txt"
     existing_path.write_bytes(b"PRECIOUS EXISTING CONTENT")
 
-    hex_values = iter([colliding_hex, fresh_hex])
+    # First two calls drive the physical-file collision/retry under test;
+    # `document_upload.uuid` and `rag.sidecar`'s own `uuid` import are the
+    # SAME module object (Python caches imports in sys.modules), so this
+    # patch also affects the sidecar's internal temp-file uuid4() call —
+    # an unbounded repeat() keeps the test robust to that without needing
+    # a distinct assertion on it.
+    hex_values = itertools.chain([colliding_hex, fresh_hex], itertools.repeat("c" * 32))
     monkeypatch.setattr(
         document_upload.uuid, "uuid4",
         lambda: SimpleNamespace(hex=next(hex_values)),
@@ -487,10 +535,12 @@ async def test_exclusive_creation_does_not_overwrite_existing_candidate(monkeypa
     await document_upload.process_document_upload(message, document)
 
     fresh_path = tmp_path / f"{fresh_hex}.txt"
+    fresh_sidecar = tmp_path / f"{fresh_hex}.meta.json"
     assert existing_path.read_bytes() == b"PRECIOUS EXISTING CONTENT"  # untouched
     assert fresh_path.exists()
     assert fresh_path.read_bytes() == b"new upload bytes"
-    assert len(list(tmp_path.iterdir())) == 2
+    assert fresh_sidecar.exists()
+    assert len(list(tmp_path.iterdir())) == 3  # bystander + fresh physical + fresh sidecar
 
 
 def test_store_document_exclusively_cleans_up_after_write_failure(monkeypatch, tmp_path):
@@ -535,7 +585,7 @@ def test_store_document_exclusively_cleans_up_after_write_failure(monkeypatch, t
     monkeypatch.setattr(document_upload, "open", fake_open, raising=False)
 
     with pytest.raises(OSError, match="simulated disk write failure"):
-        document_upload._store_document_exclusively(b"payload bytes", ".txt")
+        document_upload._store_document_exclusively(b"payload bytes", ".txt", "notes.txt")
 
     assert len(created_paths) == 1, "exactly one candidate should have been exclusively created"
     assert not created_paths[0].exists(), "the partially-written file must be cleaned up"
@@ -567,7 +617,7 @@ async def test_document_download_exception_does_not_leak_token_in_logs(monkeypat
     monkeypatch.setattr(document_upload.bot, "get_file", raise_leaking_error)
     monkeypatch.setattr(document_upload.bot, "send_message", AsyncMock())
     monkeypatch.setattr(document_upload.document_loader, "load_document", Mock())
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", Mock())
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", Mock())
 
     message, document = _make_document_message(1, "notes.pdf")
 

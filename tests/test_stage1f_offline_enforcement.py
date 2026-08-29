@@ -63,8 +63,8 @@ real hostname, so nothing here is DNS-dependent):
    mechanism itself hasn't regressed).
 
 Sections 1-3 and 5 additionally exercise the REAL application singletons
-(`services.openai_client.openai_client`, `rag.index.vector_index`) — not
-just a throwaway client built the same way — so a future refactor that
+(`services.openai_client.openai_client`, `rag.index.get_vector_index()`) —
+not just a throwaway client built the same way — so a future refactor that
 drops the explicit no-trust configuration from those constructors fails
 this suite, per the second audit's specific complaint that the first
 remediation only proved a generic client scenario.
@@ -538,14 +538,16 @@ def test_real_openai_client_singleton_has_no_trust_transport():
 def test_real_vector_index_singleton_embeddings_have_no_trust_transport():
     """
     Requirement G, narrow configuration assertion on the REAL rag/index.py
-    vector_index singleton's OpenAIEmbeddings (already constructed at
-    conftest.py's pytest_configure time). Fails immediately if a future
-    refactor drops the explicit openai_proxy=None / http_client= /
-    http_async_client= kwargs from VectorIndex.__init__.
+    shared VectorIndex singleton's OpenAIEmbeddings. get_vector_index()
+    constructs it lazily (Stage 2B-D Blocker 4 — no longer eagerly at
+    conftest.py's pytest_configure time), against rag_constants.DATA_DIR
+    which conftest.py redirects for the whole session either way. Fails
+    immediately if a future refactor drops the explicit openai_proxy=None /
+    http_client= / http_async_client= kwargs from VectorIndex.__init__.
     """
     import rag.index as rag_index
 
-    embeddings = rag_index.vector_index.embeddings
+    embeddings = rag_index.get_vector_index().embeddings
     assert embeddings.openai_proxy is None
     assert embeddings.client._client._client.trust_env is False
     assert embeddings.async_client._client._client.trust_env is False
@@ -596,22 +598,29 @@ _DOTENV_REINTRO_SCRIPT = textwrap.dedent(
     dotenv.load_dotenv(dotenv_path=env_path, override=True)
 
     import config as app_config
+    import rag.constants as rag_constants
 
     data_dir = tmp_root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     app_config.DATA_DIR = data_dir
     app_config.LOG_FILE = tmp_root / "bot.log"
+    # rag/index.py's get_vector_index() reads rag_constants.DATA_DIR (Stage
+    # 2B-D Section H), not app_config.DATA_DIR — must redirect this too,
+    # BEFORE the get_vector_index() call below, or the real repository's
+    # own data/qdrant would be created by this subprocess.
+    rag_constants.DATA_DIR = data_dir
 
     import services.openai_client as oc
     import rag.index as ri
 
+    vector_index = ri.get_vector_index()
     result = {
         "http_proxy_present": os.environ.get("HTTP_PROXY"),
         "openai_proxy_present": os.environ.get("OPENAI_PROXY"),
         "openai_client_trust_env": oc.openai_client.client._client.trust_env,
-        "embeddings_openai_proxy_field": ri.vector_index.embeddings.openai_proxy,
-        "embeddings_sync_trust_env": ri.vector_index.embeddings.client._client._client.trust_env,
-        "embeddings_async_trust_env": ri.vector_index.embeddings.async_client._client._client.trust_env,
+        "embeddings_openai_proxy_field": vector_index.embeddings.openai_proxy,
+        "embeddings_sync_trust_env": vector_index.embeddings.client._client._client.trust_env,
+        "embeddings_async_trust_env": vector_index.embeddings.async_client._client._client.trust_env,
     }
     print("RESULT_JSON=" + json.dumps(result))
     """

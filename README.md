@@ -61,11 +61,30 @@
 
 ### 1. База знаний (RAG)
 
-- Положите в папку **`data/documents/`** файлы по вашей теме: `.txt`, `.md`, `.pdf`, `.docx`.
-- При старте бот автоматически проиндексирует их в ChromaDB. Либо отправьте документы боту в Telegram — они сохранятся в `data/documents/` и будут проиндексированы.
+- Встроенная база знаний — ровно четыре версионируемых файла в `data/documents/`, перечисленные явным списком в `config.BUILTIN_REFERENCE_FILES` (см. ниже) — это НЕ произвольное сканирование папки: случайный `.txt`/`.md`-файл, оставшийся в `data/documents/`, в индекс не попадёт.
+- Отправьте документ боту в Telegram (`.txt`, `.md`, `.pdf`, `.docx`), чтобы добавить СВОИ материалы — он сохранится в `data/documents/uploads/` (файл + сопроводительный `.meta.json` с оригинальным именем) и будет проиндексирован индивидуально, независимо от встроенного списка.
+- При старте бот автоматически сверяет Qdrant со встроенными файлами (изменившиеся или новые — без лишних повторных обращений к эмбеддингам при неизменном содержимом).
 - В режиме **`/mode rag`** ответы строятся по этим документам, в конце сообщения указывается источник (имя файла).
 
 Чем полнее и аккуратнее база документов, тем точнее ответы в режиме RAG.
+
+#### Векторное хранилище (Qdrant)
+
+С этой версии RAG использует **Qdrant** (локальный persistent-режим, `qdrant-client`) вместо ChromaDB:
+
+- Данные хранятся локально в `data/qdrant/` — отдельный Qdrant-сервер не требуется, сетевые обращения к нему отсутствуют. **No Qdrant API key or Qdrant server is required in local mode.**
+- Qdrant — это **производное (rebuildable) состояние**, а не источник истины. Источник истины — версионируемые Markdown-файлы, перечисленные в `config.BUILTIN_REFERENCE_FILES` (см. ниже) и, для загруженных через Telegram документов, пара «физический файл + `.meta.json`» в `data/documents/uploads/`.
+- Полная переиндексация из исходников (без обращения к устаревшему ChromaDB) выполняется вручную, ТОЛЬКО как модуль (прямой запуск файла не работает — см. docstring скрипта):
+  ```
+  python -m scripts.rebuild_qdrant            # dry-run: только проверка и подсчёт, без изменений
+  python -m scripts.rebuild_qdrant --apply     # реальная переиндексация (не разрушает существующий индекс: сверяет с источником, недостающее/изменившееся переиндексирует, лишнее удаляет только после успеха всех документов)
+  ```
+  Dry-run (без `--apply`) не требует никаких провайдерских ключей (`TELEGRAM_BOT_TOKEN`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`) и не требует файла `.env` — он только читает исходники на диске (встроенные Markdown-файлы + `.meta.json`-сайдкары загрузок) и ничего не пишет: ни в Qdrant, ни в `bot.log`. `--apply` требует обычной конфигурации эмбеддингов/провайдера (`OPENAI_API_KEY`), поскольку реально обращается к OpenAI Embeddings и мутирует Qdrant.
+- Старое локальное хранилище ChromaDB (`data/chroma_db/`), если оно осталось от предыдущей версии, **не мигрируется автоматически** и ни для чего в рантайме больше не используется. После проверки работы Qdrant его можно удалить вручную.
+
+#### Встроенная база знаний по Python
+
+`config.BUILTIN_REFERENCE_FILES` явно перечисляет четыре версионируемых (закоммиченных в репозиторий) справочных файла на английском языке в `data/documents/`: `python-fundamentals.md`, `functions-classes-errors.md`, `testing-debugging.md`, `async-python-and-apis.md`. Они демонстрируют кросс-языковой RAG (материалы на английском, диалог с ботом — на русском) и служат отправной точкой базы знаний; при адаптации под другую тематику их можно заменить своими материалами, обновив список в `config.py`.
 
 ### 2. Системные промпты
 
@@ -87,15 +106,17 @@
 - `config.py` — настройки, пути, режимы
 - `handlers/` — start, text, voice, image, document_upload
 - `services/` — router, text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation
-- `rag/` — index (ChromaDB), query, loader (PDF, TXT, MD, DOCX)
+- `rag/` — index (Qdrant), query, loader (PDF, TXT, MD, DOCX), identity (стабильные ID документов/чанков), sidecar (метаданные загруженных документов)
+- `scripts/` — `rebuild_qdrant.py`, ручная полная переиндексация Qdrant из исходников
 - `utils/` — logging, helpers (сессии, strip_markdown, очистка файлов)
-- `data/documents/` — файлы базы знаний для RAG (добавьте свои)
+- `data/documents/` — версионируемая база знаний RAG (`.md`, закоммичены) + `uploads/` (загруженные через Telegram документы, в репозиторий не коммитятся)
+- `data/qdrant/` — локальное хранилище Qdrant (в репозиторий не коммитится, полностью восстановимо через `python -m scripts.rebuild_qdrant`)
 - `data/generated_images/` — сгенерированные DALL-E изображения
 - `.env.example` — шаблон переменных окружения
 
 ## Зависимости
 
-Основные: pyTelegramBotAPI, openai, anthropic, chromadb, langchain-core, langchain-openai, langchain-community, langchain-text-splitters, pypdf, docx2txt, pydub, aiofiles, aiohttp.
+Основные: pyTelegramBotAPI, openai, anthropic, qdrant-client, langchain-core, langchain-openai, langchain-community, langchain-text-splitters, pypdf, docx2txt, pydub, aiofiles, aiohttp.
 
 Подробный список: `requirements.txt`.
 

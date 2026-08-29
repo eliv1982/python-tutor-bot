@@ -72,19 +72,24 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
     bystander = tmp_path / "bystander.txt"
     bystander.write_bytes(b"UNRELATED PRE-EXISTING CONTENT")
 
-    def fake_store(file_bytes, extension):
+    def fake_store(file_bytes, extension, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         path = tmp_path / f"owned_upload{extension}"
         path.write_bytes(file_bytes)
         created_path_holder["path"] = path
-        return path
+        return document_upload.StoredUpload(
+            physical_path=path,
+            sidecar_path=tmp_path / "owned_upload.meta.json",
+            document_id="upload:test-fake",
+            content_sha256="deadbeef",
+        )
 
     load_mock = Mock()
     add_mock = Mock()
     monkeypatch.setattr(document_upload, "_store_document_exclusively", fake_store)
     monkeypatch.setattr(document_upload.document_loader, "load_document", load_mock)
-    monkeypatch.setattr(document_upload.vector_index, "add_documents", add_mock)
+    monkeypatch.setattr(document_upload.get_vector_index(), "add_documents", add_mock)
 
     monkeypatch.setattr(
         document_upload.bot, "get_file",
@@ -154,7 +159,7 @@ async def test_cancel_during_indexing_success_retains_file_and_sends_no_success_
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
     # Real storage step (fast, not cancelled) so a real owned file exists.
 
-    def fake_load_and_index(physical_path, display_name):
+    def fake_load_and_index(stored, display_name):
         call_count["n"] += 1
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
@@ -180,10 +185,11 @@ async def test_cancel_during_indexing_success_retains_file_and_sends_no_success_
 
     await _wait_until(started.is_set)
 
-    # Storage already committed a real file by the time indexing started.
+    # Real storage step (not cancelled) already committed a physical file
+    # + its sidecar by the time indexing started.
     created_before_cancel = [p for p in tmp_path.iterdir() if p.is_file()]
-    assert len(created_before_cancel) == 1
-    physical_path = created_before_cancel[0]
+    assert len(created_before_cancel) == 2
+    physical_path = next(p for p in created_before_cancel if not p.name.endswith(".meta.json"))
 
     task.cancel()
 
@@ -229,7 +235,7 @@ async def test_cancel_during_indexing_failure_removes_file_only_after_worker_end
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_load_and_index(physical_path, display_name):
+    def fake_load_and_index(stored, display_name):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         raise RuntimeError(sensitive_detail)
@@ -255,8 +261,9 @@ async def test_cancel_during_indexing_failure_removes_file_only_after_worker_end
     await _wait_until(started.is_set)
 
     created_before_cancel = [p for p in tmp_path.iterdir() if p.is_file()]
-    assert len(created_before_cancel) == 1
-    physical_path = created_before_cancel[0]
+    assert len(created_before_cancel) == 2
+    physical_path = next(p for p in created_before_cancel if not p.name.endswith(".meta.json"))
+    sidecar_path = next(p for p in created_before_cancel if p.name.endswith(".meta.json"))
 
     task.cancel()
 
@@ -272,8 +279,10 @@ async def test_cancel_during_indexing_failure_removes_file_only_after_worker_end
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    # Removed only after the worker actually terminated (with a failure).
+    # Removed only after the worker actually terminated (with a failure) —
+    # both the physical file and its sidecar, no orphan left behind.
     assert not physical_path.exists()
+    assert not sidecar_path.exists()
 
     log_text = caplog.text
     assert sensitive_detail not in log_text

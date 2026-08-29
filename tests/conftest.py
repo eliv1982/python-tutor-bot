@@ -9,6 +9,7 @@ load_dotenv() never overrides a variable that is already present in
 os.environ.
 """
 
+import logging
 import os
 import shutil
 import sys
@@ -36,15 +37,6 @@ os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-dummy-key"
 # override. tests/test_stage2a_text_llm_provider.py exercises the Anthropic
 # path explicitly, per-test, via monkeypatch — see that file.
 os.environ["LLM_PROVIDER"] = "openai"
-
-# chromadb.config.Settings is a pydantic-settings BaseSettings model, so it
-# picks up ANONYMIZED_TELEMETRY from the environment automatically (no
-# Chroma Settings object needs to be constructed or threaded through
-# rag/index.py for this). Set before rag.index (imported below) or anything
-# else can construct a Chroma client, so the test suite's offline guarantee
-# doesn't depend on chromadb's default best-effort telemetry call succeeding
-# or failing quietly against a real endpoint.
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 # --- Stage 1F-B remediation: localhost-proxy bypass (Codex finding) -------
 #
@@ -123,36 +115,47 @@ def pytest_configure(config):
     """
     Test-only isolation, run once before any test module is collected.
 
-    Several application modules read filesystem paths from config.py — some
-    bind a copy at their OWN first-import time (`from config import
-    SOME_PATH`), some read `config.DATA_DIR` fresh on every call. Either
-    way, they need a redirected value in place before they're ever
-    imported/called for the first time in the session:
+    Stage 2B-D: `rag/index.py`'s VectorIndex singleton and
+    `utils/logging.py`'s FileHandler are no longer created merely by
+    importing their modules (Blockers 4/G) — each now requires an EXPLICIT
+    call (`get_vector_index()` / `configure_logging()`) before any Qdrant
+    state or bot.log is created. This fixture therefore no longer needs to
+    "win a race" against those modules' own first import; it only needs
+    the redirected paths to be in place before whichever test is the FIRST
+    to actually call one of those explicit entry points, anywhere in the
+    session — which is trivially satisfied by doing the redirect here, in
+    a hook that runs before any test module is even collected.
 
-    - `rag/index.py`'s `vector_index = VectorIndex()` singleton persists to
-      `DATA_DIR / "chroma_db"` (bound at rag.index's own import time).
-    - `utils/logging.py`'s `logger` singleton opens a `FileHandler` on
-      `LOG_FILE` (bound at utils.logging's own import time).
+    Several application modules still read filesystem paths from config.py
+    (and, since Stage 2B-D, from the pure rag/constants.py module some of
+    those paths now canonically live in) — some bind a copy at their OWN
+    first-import time (`from config import SOME_PATH`), some read
+    `rag_constants.DATA_DIR` fresh at the point of use. Either way, they
+    need a redirected value in place before they're ever imported/called
+    for the first time in the session:
+
+    - `rag/index.py`'s `get_vector_index()` singleton persists to
+      `rag_constants.DATA_DIR / "qdrant"`, read fresh at construction time
+      (never bound at rag.index's own import time — Stage 2B-D removed the
+      eager `vector_index = VectorIndex()` singleton entirely).
+    - `utils/logging.py`'s `configure_logging()` opens a `FileHandler` on
+      `config.LOG_FILE`, read fresh at call time.
     - `utils/helpers.py`'s `save_file_async()` (used by the real voice
-      handler to store a downloaded .ogg) reads `DATA_DIR` (bound at
+      handler to store a downloaded .ogg) reads `config.DATA_DIR` (bound at
       utils.helpers' own import time — Stage 1F-B remediation: this used to
       hardcode `BASE_DIR / "data"`, bypassing this redirect entirely, which
       is exactly how a real voice-handler test was found writing a real
       file under the repo's real `data/` directory).
 
-    Earlier revisions of this fixture redirected DATA_DIR/LOG_FILE only for
-    the duration of the two proactive imports below, then restored the real
-    values — which meant any module imported LATER during collection (like
-    utils/helpers.py, imported by ordinary test files, not by this fixture)
-    would bind to the REAL path instead. The redirect below is now left in
-    place for the ENTIRE test session (no restore): every module that reads
-    config.DATA_DIR/LOG_FILE at any point in the session — proactively
-    triggered here or naturally imported later during collection — sees
-    only the temp path. This changes no production code path outside
-    pytest (config.py's real defaults are untouched; only this module's own
-    copy of the already-imported `config` module's attributes is patched).
+    The redirect below is left in place for the ENTIRE test session (no
+    restore): every module/call that reads config.DATA_DIR/LOG_FILE or
+    rag_constants.DATA_DIR at any point in the session sees only the temp
+    path. This changes no production code path outside pytest (config.py's
+    and rag/constants.py's real defaults are untouched; only these already-
+    imported modules' own copies of their attributes are patched).
     """
     import config as app_config
+    import rag.constants as rag_constants
 
     # Stage 1F-C: re-run the same neutralization AFTER config.py's own
     # load_dotenv() has already executed (triggered by the `import config`
@@ -176,10 +179,64 @@ def pytest_configure(config):
     tmp_data_dir = session_root / "data"
     tmp_data_dir.mkdir()
     app_config.DATA_DIR = tmp_data_dir
+    # rag/index.py's get_vector_index() reads rag_constants.DATA_DIR (not
+    # config.DATA_DIR) for its default persist_directory — see rag/index.py
+    # Section H. Redirected here too so the FIRST EXPLICIT get_vector_index()
+    # call anywhere in the session — whenever/wherever that happens to be —
+    # never resolves into the real repository's data/qdrant.
+    rag_constants.DATA_DIR = tmp_data_dir
+    rag_constants.DOCUMENTS_DIR = tmp_data_dir / "documents"
+    rag_constants.MANAGED_UPLOADS_DIR = rag_constants.DOCUMENTS_DIR / "uploads"
+    # Stage 2B-E Section M (Codex non-blocking finding): config.py
+    # re-exports DOCUMENTS_DIR/MANAGED_UPLOADS_DIR too (bound at config's
+    # own first-import time, same as DATA_DIR above) — redirecting only
+    # rag_constants' copies left app_config.DOCUMENTS_DIR/MANAGED_UPLOADS_DIR
+    # still pointing at the real repository paths for any test/module that
+    # reads them via `from config import ...` / `config.DOCUMENTS_DIR`. No
+    # test actually leaked real state through this gap, but it's a latent
+    # footgun for the next one that does — redirect both here too, to the
+    # SAME temp values rag_constants already uses.
+    app_config.DOCUMENTS_DIR = rag_constants.DOCUMENTS_DIR
+    app_config.MANAGED_UPLOADS_DIR = rag_constants.MANAGED_UPLOADS_DIR
 
     tmp_log_file = session_root / "logs" / "bot.log"
     tmp_log_file.parent.mkdir()
     app_config.LOG_FILE = tmp_log_file
 
-    import utils.logging  # noqa: F401  (binds its FileHandler to tmp_log_file)
-    import rag.index  # noqa: F401  (binds vector_index singleton to tmp_data_dir/chroma_db)
+    # Explicit call (Stage 2B-D Section G) — installs a real FileHandler
+    # against tmp_log_file for the duration of the test session, exactly
+    # mirroring production's real startup behavior but against a temp path.
+    # Never touches the real, non-redirected bot.log.
+    from utils.logging import configure_logging
+    configure_logging()
+
+    # Stage 2B-C Section K (Codex finding): pytest.Config.add_cleanup()
+    # callbacks run in LIFO order (last registered runs FIRST), so
+    # registering this AFTER the rmtree cleanup above means it runs BEFORE
+    # it — closing the shared VectorIndex singleton's local-persistent
+    # Qdrant client (releasing its storage-path lock/file handles), if one
+    # was ever constructed this session, and the shared logger's
+    # FileHandler (flushing/releasing tmp_log_file) BEFORE shutil.rmtree()
+    # ever attempts to remove session_root. Without this, Windows keeps
+    # those handles open past the end of the test session, and
+    # shutil.rmtree(..., ignore_errors=True) then silently leaves
+    # session_root undeleted (a PermissionError swallowed by
+    # ignore_errors) instead of actually reclaiming the disposable temp
+    # tree. This never touches the real, non-redirected bot.log.
+    def _close_session_resources():
+        import rag.index
+        import utils.logging
+
+        try:
+            rag.index.close_vector_index()
+        except Exception:
+            pass
+        for handler in list(utils.logging.logger.handlers):
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+                utils.logging.logger.removeHandler(handler)
+
+    config.add_cleanup(_close_session_resources)

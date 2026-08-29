@@ -7,7 +7,7 @@ import asyncio
 import sys
 
 from bot import bot
-from utils.logging import logger
+from utils.logging import logger, configure_logging
 
 
 async def setup_bot():
@@ -26,23 +26,21 @@ async def setup_bot():
         raise
     
     try:
-        from rag.index import vector_index
-        from rag.loader import SUPPORTED_EXTENSIONS
-        from config import DOCUMENTS_DIR
+        from rag.index import get_vector_index
 
-        docs = list(DOCUMENTS_DIR.glob('*'))
-        docs = [d for d in docs if d.is_file() and d.suffix.lower() in SUPPORTED_EXTENSIONS]
-        # Count only: neither the filenames nor the absolute directory path
-        # (which reveals the deployment's filesystem layout/username) are
-        # needed for this diagnostic.
-        logger.debug("Setup: RAG documents dir scan | file_count=%s", len(docs))
-
-        if docs:
-            logger.info("Setup: RAG indexing started, document_count=%s", len(docs))
-            count = vector_index.index_documents_directory(force_reindex=False)
-            logger.info("Setup: RAG indexing done, chunks_indexed=%s", count)
-        else:
-            logger.info("Setup: RAG skipped, no documents in data/documents/")
+        # index_documents_directory() enumerates EXACTLY
+        # config.BUILTIN_REFERENCE_FILES by default (Stage 2B-C Blocker 5)
+        # and reconciles each one with zero embedding/Qdrant calls when
+        # already current (Blocker 2) — always safe/cheap to call
+        # unconditionally rather than pre-checking whether any files exist.
+        # A missing manifest file fails loudly (caught below, non-fatal to
+        # startup) rather than silently indexing fewer built-in documents.
+        # get_vector_index() constructs the shared Qdrant-backed singleton
+        # on this, its first real call (Stage 2B-D Blocker 4) — merely
+        # importing rag.index earlier never did this.
+        logger.info("Setup: RAG indexing started")
+        count = get_vector_index().index_documents_directory(force_reindex=False)
+        logger.info("Setup: RAG indexing done, chunks_indexed=%s", count)
     except Exception as e:
         # index_documents_directory() calls OpenAIEmbeddings (network) —
         # never log raw exception text.
@@ -65,6 +63,21 @@ async def shutdown_bot():
         logger.debug("Shutdown: session closed")
     except Exception as e:
         logger.debug("Shutdown: close_session exception (ignored) | error_type=%s", type(e).__name__)
+    try:
+        # Stage 2B-E Section N: deterministic release of the shared
+        # VectorIndex singleton's local-persistent Qdrant client/storage-
+        # path lock on every real shutdown, not merely relied on process
+        # exit to release it. A lazy import (mirrors setup_bot()'s own
+        # `from rag.index import get_vector_index` above) — close_vector_
+        # index() is already a safe no-op if setup_bot()'s RAG indexing
+        # never actually constructed the singleton (e.g. it failed and was
+        # caught there), so this never constructs a VectorIndex merely to
+        # close it.
+        from rag.index import close_vector_index
+        close_vector_index()
+        logger.debug("Shutdown: vector index closed")
+    except Exception as e:
+        logger.debug("Shutdown: close_vector_index exception (ignored) | error_type=%s", type(e).__name__)
     logger.info("Shutdown: complete")
 
 
@@ -94,6 +107,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Real application startup/composition root (Stage 2B-D Section G) —
+    # this is the one and only place configure_logging() is called. It
+    # installs the real console+file (bot.log) handlers; nothing before
+    # this point (including every module import above) creates bot.log.
+    configure_logging()
     try:
         logger.info("="*60)
         logger.info("Personal Python Tutor Bot - Starting")
