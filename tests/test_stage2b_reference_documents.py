@@ -122,7 +122,7 @@ def test_indexing_a_reference_document_attributes_source_by_filename_and_leaks_n
         # (see test_stage2c_reference_manifest.py for manifest-specific
         # coverage) — see index_documents_directory()'s own docstring.
         vi.index_documents_directory(directory=docs_dir, reference_filenames=None)
-        results = vi.similarity_search("Some reference content for attribution testing.", k=1)
+        results = vi.similarity_search("Some reference content for attribution testing.", requesting_user_id=1, k=1)
         assert len(results) == 1
         doc = results[0]
         assert doc.metadata["source"] == "sensitive_deploy_user_notes.md"
@@ -158,7 +158,7 @@ def test_unchanged_reference_document_costs_zero_embedding_calls_on_restart(tmp_
         second_run_chunks = vi.index_documents_directory(directory=docs_dir, reference_filenames=None)
         assert second_run_chunks == 0  # nothing new/changed to index
         assert fake.embed_documents_call_count == 1  # NOT incremented — zero new embedding calls
-        assert vi.get_stats()["total_documents"] == 1  # no duplication either
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1  # no duplication either
     finally:
         vi.close()
 
@@ -197,7 +197,7 @@ def test_changed_reference_document_reindexes_exactly_once_and_removes_stale_chu
         assert len(chunks_after) == 1
         # The stale trailing chunks from the longer version are genuinely gone.
         assert chunks_after.isdisjoint(chunks_before - chunks_after)
-        assert vi.get_stats()["total_documents"] == 1
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
     finally:
         vi.close()
 
@@ -286,7 +286,7 @@ def test_index_documents_directory_default_indexes_exactly_the_manifest_ignoring
         assert not vi._existing_point_ids(stray_id)
         assert not vi._existing_point_ids(extra_id)
 
-        results = vi.similarity_search("Alpha built-in reference content.", k=2)
+        results = vi.similarity_search("Alpha built-in reference content.", requesting_user_id=1, k=2)
         sources = {doc.metadata.get("source") for doc in results}
         assert "old_notes.txt" not in sources
         assert "unrelated_extra.md" not in sources
@@ -306,6 +306,6 @@ def test_index_documents_directory_missing_manifest_file_fails_loudly_not_partia
         # All-or-nothing: "alpha.md" (present, valid) must NOT have been
         # silently indexed on its own while "beta.md" was missing.
         assert fake.embed_documents_call_count == 0
-        assert vi.get_stats()["total_documents"] == 0
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 0
     finally:
         vi.close()

@@ -68,7 +68,7 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_store(file_bytes, extension, display_name):
+    def fake_store(file_bytes, extension, display_name, owner_user_id):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         path = tmp_path / f"owned_upload{extension}"
@@ -79,6 +79,7 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
             content_sha256="deadbeef",
+            owner_user_id=owner_user_id,
         )
 
     load_mock = Mock()
@@ -390,7 +391,7 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
 
     monkeypatch.setattr(document_upload, "MANAGED_UPLOADS_DIR", tmp_path)
 
-    def fake_store(file_bytes, extension, display_name):
+    def fake_store(file_bytes, extension, display_name, owner_user_id):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         path = tmp_path / f"owned_upload{extension}"
@@ -401,6 +402,7 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
             content_sha256="deadbeef",
+            owner_user_id=owner_user_id,
         )
 
     load_mock = Mock()

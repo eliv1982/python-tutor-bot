@@ -109,7 +109,11 @@ async def cmd_stats(message: types.Message):
         # similarity search — deliberately unshielded. It's a read-only
         # `collection.count()`, mutates nothing, and its result is simply
         # discarded if the caller is cancelled — no cleanup/ownership race.
-        stats = await asyncio.to_thread(get_knowledge_base_stats)
+        #
+        # Stage 3A: scoped to this user — reference corpus + this user's
+        # own private documents only, never a global count that would
+        # reveal another user's private upload activity.
+        stats = await asyncio.to_thread(get_knowledge_base_stats, user_id)
         logger.debug("Command /stats | stats=%s", stats)
         if "error" in stats:
             await bot.send_message(

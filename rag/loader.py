@@ -59,6 +59,7 @@ class DocumentLoader:
         document_id: Optional[str] = None,
         content_sha256: Optional[str] = None,
         stored_name: Optional[str] = None,
+        owner_user_id: Optional[int] = None,
     ) -> List[Dict]:
         """
         Load a single document and split into chunks.
@@ -82,6 +83,12 @@ class DocumentLoader:
             stored_name: Physical storage filename (e.g. the opaque UUID
                 name of a managed upload) — recorded in Qdrant payloads for
                 managed uploads only, never an absolute path.
+            owner_user_id: Telegram numeric id (`from_user.id`) of the
+                managed upload's owner (Stage 3A). `None` for reference
+                documents (and for any caller with no real owner to give) —
+                VectorIndex derives `scope="reference"` from that absence.
+                Never guessed/inferred here; the caller (VectorIndex.
+                reconcile_document()) is the sole source of this value.
 
         Returns:
             List of document chunks with metadata
@@ -110,6 +117,7 @@ class DocumentLoader:
                 document_id=document_id,
                 content_sha256=content_sha256,
                 stored_name=stored_name,
+                owner_user_id=owner_user_id,
             )
 
             # source_name can be a user-controlled Telegram display filename
@@ -132,6 +140,7 @@ class DocumentLoader:
         document_id: Optional[str] = None,
         content_sha256: Optional[str] = None,
         stored_name: Optional[str] = None,
+        owner_user_id: Optional[int] = None,
     ) -> List[Dict]:
         """
         Parse `source_bytes` directly in memory and split into chunks —
@@ -161,8 +170,9 @@ class DocumentLoader:
             suffix: File extension (e.g. ".pdf", leading dot, any case) —
                 selects the format the same way load_document()'s
                 `file_path.suffix` does.
-            display_name / document_id / content_sha256 / stored_name:
-                mirror load_document()'s own parameters — see there.
+            display_name / document_id / content_sha256 / stored_name /
+                owner_user_id: mirror load_document()'s own parameters —
+                see there.
 
         Returns:
             List of document chunks with metadata
@@ -188,6 +198,7 @@ class DocumentLoader:
                 document_id=document_id,
                 content_sha256=content_sha256,
                 stored_name=stored_name,
+                owner_user_id=owner_user_id,
             )
 
             logger.info("RAG loader load_document_bytes | extension=%s, chunks=%s", suffix, len(chunks))
@@ -208,6 +219,7 @@ class DocumentLoader:
         document_id: Optional[str],
         content_sha256: Optional[str],
         stored_name: Optional[str],
+        owner_user_id: Optional[int] = None,
     ) -> List[Document]:
         """
         Shared chunk-splitting + metadata tagging for both load_document()
@@ -216,6 +228,12 @@ class DocumentLoader:
         VectorIndex._safe_payload()) is omitted entirely when parsing was
         done from in-memory bytes (load_document_bytes() passes None) —
         there is no on-disk pathname to record in that case.
+
+        `owner_user_id` (Stage 3A): tagged onto every chunk's metadata only
+        when given, exactly like document_id/content_sha256/stored_name
+        above — VectorIndex._safe_payload() reads it from here to decide a
+        chunk's Qdrant `scope`. Omitted (never `None`-valued) for reference
+        documents, which have no owner.
         """
         chunks = self.text_splitter.split_documents(documents)
         for idx, chunk in enumerate(chunks):
@@ -229,6 +247,8 @@ class DocumentLoader:
                 chunk.metadata['content_sha256'] = content_sha256
             if stored_name is not None:
                 chunk.metadata['stored_name'] = stored_name
+            if owner_user_id is not None:
+                chunk.metadata['owner_user_id'] = owner_user_id
         return chunks
 
     def list_source_files(self, directory: Path = DOCUMENTS_DIR) -> List[Path]:

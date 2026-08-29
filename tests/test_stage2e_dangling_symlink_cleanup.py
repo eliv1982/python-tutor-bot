@@ -137,7 +137,7 @@ def test_write_sidecar_atomic_cleanup_removes_a_dangling_symlink_at_the_temp_pat
 
     monkeypatch.setattr(sidecar_module.os, "replace", replace_races_to_dangling_symlink_then_fails)
 
-    data = build_sidecar("upload:" + "a" * 32, "n.txt", "a" * 32 + ".txt", "b" * 64)
+    data = build_sidecar("upload:" + "a" * 32, "n.txt", "a" * 32 + ".txt", "b" * 64, owner_user_id=1)
     with pytest.raises(OSError):
         write_sidecar_atomic(sidecar_path, data)
 
@@ -169,7 +169,7 @@ def test_write_sidecar_atomic_cleanup_unlinks_symlink_without_touching_a_live_ta
 
     monkeypatch.setattr(sidecar_module.os, "replace", replace_races_to_live_symlink_then_fails)
 
-    data = build_sidecar("upload:" + "c" * 32, "n.txt", "c" * 32 + ".txt", "d" * 64)
+    data = build_sidecar("upload:" + "c" * 32, "n.txt", "c" * 32 + ".txt", "d" * 64, owner_user_id=1)
     with pytest.raises(OSError):
         write_sidecar_atomic(sidecar_path, data)
 
@@ -192,6 +192,7 @@ def _make_stored_upload(physical_path: Path, sidecar_path: Path):
         sidecar_path=sidecar_path,
         document_id="upload:" + "a" * 32,
         content_sha256="b" * 64,
+        owner_user_id=1,
     )
 
 

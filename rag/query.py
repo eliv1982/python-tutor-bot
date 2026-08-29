@@ -14,15 +14,21 @@ from config import RAG_TOP_K
 
 async def query_knowledge_base(
     query: str,
+    requesting_user_id: int,
     conversation_history: Optional[List[Dict]] = None
 ) -> str:
     """
     Query the knowledge base and generate response.
-    
+
     Args:
         query: User's query
+        requesting_user_id: Telegram numeric id of the user asking (Stage
+            3A). Required — there is no "search everything" mode. Threaded
+            straight into VectorIndex.similarity_search_with_score(), whose
+            own required requesting_user_id keeps this function from ever
+            calling it with an implicit/omitted identity.
         conversation_history: Previous conversation messages
-    
+
     Returns:
         Generated response based on retrieved context
     """
@@ -39,7 +45,12 @@ async def query_knowledge_base(
         # Qdrant store, or any file) and its result is simply discarded —
         # there is no cleanup/ownership race to resolve, unlike the
         # document-upload storage/indexing writes.
-        results = await asyncio.to_thread(get_vector_index().similarity_search_with_score, query, k=RAG_TOP_K)
+        results = await asyncio.to_thread(
+            get_vector_index().similarity_search_with_score,
+            query,
+            requesting_user_id=requesting_user_id,
+            k=RAG_TOP_K,
+        )
         logger.debug("RAG similarity_search | results_count=%s", len(results))
         if not results:
             logger.warning("RAG: no results, using fallback")
@@ -226,12 +237,15 @@ async def add_document_to_knowledge_base(file_path: str) -> dict:
         }
 
 
-def get_knowledge_base_stats() -> dict:
+def get_knowledge_base_stats(requesting_user_id: int) -> dict:
     """
-    Get statistics about the knowledge base.
-    
+    Get statistics about the knowledge base, scoped to what
+    `requesting_user_id` may see (Stage 3A) — the shared reference corpus
+    plus that user's own private documents, never a global count that
+    would reveal another user's private upload activity.
+
     Returns:
         Dictionary with statistics
     """
-    return get_vector_index().get_stats()
+    return get_vector_index().get_stats(requesting_user_id=requesting_user_id)
 

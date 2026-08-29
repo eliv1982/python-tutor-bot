@@ -54,15 +54,25 @@ from typing import Any, Callable, Dict, Optional
 from rag.loader import SUPPORTED_EXTENSIONS
 from rag.safe_files import SecureReadError, read_regular_file_secure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-REQUIRED_FIELDS = frozenset({
+# v1 sidecars (written before Stage 3A) carry no ownership field at all —
+# they predate per-user Qdrant isolation entirely. Still readable (never
+# silently discarded), but `parse_sidecar_bytes()` below always returns an
+# explicit `owner_user_id: None` for them, and every caller that reconciles
+# a managed upload into Qdrant must treat that `None` as "unowned, unknown,
+# fail closed" — never as an implicit reference/shared document, and never
+# guessed from any other source. Every sidecar written from this point on
+# is schema_version=2 — see `build_sidecar()`.
+REQUIRED_FIELDS_V1 = frozenset({
     "schema_version",
     "document_id",
     "display_name",
     "stored_name",
     "content_sha256",
 })
+REQUIRED_FIELDS_V2 = REQUIRED_FIELDS_V1 | {"owner_user_id"}
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 
 # `upload:<32 lowercase hex UUID stem>` — the exact shape
 # rag.identity.upload_document_id() produces from a storage UUID's
@@ -92,13 +102,24 @@ def sidecar_path_for(physical_path: Path) -> Path:
     return physical_path.with_suffix(".meta.json")
 
 
-def build_sidecar(document_id: str, display_name: str, stored_name: str, content_sha256: str) -> Dict[str, Any]:
+def build_sidecar(document_id: str, display_name: str, stored_name: str, content_sha256: str, owner_user_id: int) -> Dict[str, Any]:
+    """
+    Build a fresh (always schema_version=2) sidecar record.
+
+    `owner_user_id` is the immutable numeric Telegram user id (`from_user.id`
+    — see utils/access_control.py) of the uploader, captured once at upload
+    time and never re-derived later (Stage 3A). Required, never optional:
+    every NEW managed upload has a real, known uploader — there is no such
+    thing as a fresh upload with no owner. A caller with no real id to give
+    has no business calling this function at all.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "document_id": document_id,
         "display_name": display_name,
         "stored_name": stored_name,
         "content_sha256": content_sha256,
+        "owner_user_id": owner_user_id,
     }
 
 
@@ -213,20 +234,28 @@ def parse_sidecar_bytes(raw_bytes: bytes) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise SidecarError("sidecar content is not a JSON object")
 
-    missing = REQUIRED_FIELDS - data.keys()
+    # bool must NOT be accepted as a valid schema_version: `True == 1` and
+    # `isinstance(True, int)` are both true in Python, so this must be an
+    # explicit `type(...) is int` check, not `isinstance()`/`==` alone.
+    # Checked BEFORE the required/extra field check below, since which
+    # fields are required depends on which (supported) version this is.
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int or schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise SidecarError(f"unsupported sidecar schema_version: {schema_version!r}")
+
+    # v1 (pre-Stage-3A) sidecars carry no `owner_user_id` at all — required
+    # fields differ by version so a v1 sidecar is never rejected merely for
+    # lacking a field it was never written with, and a v2 sidecar missing
+    # `owner_user_id` is never silently treated as "no owner" (see below).
+    required_fields = REQUIRED_FIELDS_V2 if schema_version == 2 else REQUIRED_FIELDS_V1
+
+    missing = required_fields - data.keys()
     if missing:
         raise SidecarError(f"sidecar missing required fields: {sorted(missing)}")
 
-    extra = data.keys() - REQUIRED_FIELDS
+    extra = data.keys() - required_fields
     if extra:
         raise SidecarError(f"sidecar contains unknown fields: {sorted(extra)}")
-
-    # bool must NOT be accepted as schema_version==1: `True == 1` and
-    # `isinstance(True, int)` are both true in Python, so this must be an
-    # explicit `type(...) is int` check, not `isinstance()`/`==` alone.
-    schema_version = data.get("schema_version")
-    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
-        raise SidecarError(f"unsupported sidecar schema_version: {schema_version!r}")
 
     for field in ("document_id", "display_name", "stored_name", "content_sha256"):
         if not isinstance(data[field], str) or not data[field]:
@@ -259,6 +288,25 @@ def parse_sidecar_bytes(raw_bytes: bytes) -> Dict[str, Any]:
 
     if not _CONTENT_SHA256_RE.match(data["content_sha256"]):
         raise SidecarError("sidecar content_sha256 must be exactly 64 lowercase hex characters")
+
+    if schema_version == 2:
+        owner_user_id = data["owner_user_id"]
+        # Same bool-exclusion rationale as schema_version above. Telegram
+        # numeric user ids (`from_user.id`) are always positive — a zero or
+        # negative value can never be a genuine Telegram user id and must
+        # be rejected rather than silently accepted as one.
+        if type(owner_user_id) is not int or owner_user_id <= 0:
+            raise SidecarError("sidecar field 'owner_user_id' must be a positive integer")
+    else:
+        # v1 legacy sidecar: no ownership was ever recorded. Represent that
+        # explicitly and safely as `owner_user_id: None` — every caller
+        # that reconciles a managed upload into Qdrant must treat `None`
+        # here as "unowned, fail closed" (never guessed, never silently
+        # promoted to a shared/reference document, never exposed to every
+        # authorized user) — see scripts/rebuild_qdrant.py's
+        # `_plan_upload_documents()`.
+        data = dict(data)
+        data["owner_user_id"] = None
 
     return data
 

@@ -51,7 +51,19 @@ from utils.logging import logger
 # `file_path` (an absolute filesystem path attached by rag/loader.py for
 # internal use only) and any other non-listed metadata — see Stage 2B-B
 # Section L ("no absolute path leak").
-_SAFE_PAYLOAD_FIELDS = ("source", "document_id", "chunk_index", "content_sha256", "stored_name", "page")
+#
+# `owner_user_id`/`scope` (Stage 3A): the multi-user isolation payload.
+# `owner_user_id` is copied straight from chunk metadata like every other
+# field here (present only for managed uploads — rag/loader.py never sets
+# it for reference documents). `scope` is NOT read from metadata at all —
+# _safe_payload() below always computes and writes it itself, purely from
+# whether `owner_user_id` ended up present, so the two fields can never
+# disagree with each other in a stored payload.
+_SAFE_PAYLOAD_FIELDS = ("source", "document_id", "chunk_index", "content_sha256", "stored_name", "page", "owner_user_id", "scope")
+
+# Qdrant payload `scope` values (Stage 3A).
+SCOPE_REFERENCE = "reference"
+SCOPE_PRIVATE = "private"
 
 
 class SourceMutatedError(RuntimeError):
@@ -203,12 +215,18 @@ class VectorIndex:
     def _safe_payload(document: Document) -> dict:
         """Only retrieval/rebuild/attribution-safe fields ever reach a
         Qdrant payload — see _SAFE_PAYLOAD_FIELDS. In particular, the
-        loader's internal `file_path` (an absolute path) never does."""
+        loader's internal `file_path` (an absolute path) never does.
+
+        `scope` (Stage 3A) is never read from `document.metadata` — it is
+        always derived here, from whether `owner_user_id` ended up present
+        in the payload, so a stored point can never carry a `scope` that
+        disagrees with its own `owner_user_id`."""
         meta = document.metadata
         payload = {"text": document.page_content}
         for field in _SAFE_PAYLOAD_FIELDS:
             if field in meta and meta[field] is not None:
                 payload[field] = meta[field]
+        payload["scope"] = SCOPE_PRIVATE if payload.get("owner_user_id") is not None else SCOPE_REFERENCE
         return payload
 
     @staticmethod
@@ -219,17 +237,76 @@ class VectorIndex:
         return Document(page_content=text, metadata=metadata)
 
     # ------------------------------------------------------------------
+    # Multi-user visibility (Stage 3A)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _visibility_filter(requesting_user_id: int) -> Filter:
+        """
+        The one and only Qdrant filter every normal retrieval/count call
+        below is built with. A requesting user may see exactly:
+          - every point with `scope="reference"` (shared, everyone);
+          - a point with `scope="private"` ONLY where its own
+            `owner_user_id` equals `requesting_user_id`.
+
+        No other private point is ever returned. There is no parameter or
+        code path in this class that skips this filter for a normal
+        similarity_search()/similarity_search_with_score()/get_stats()
+        call — see those methods below; the only thing that ever touches
+        the full, unfiltered collection is index-time bookkeeping
+        (list_document_ids(), _existing_points_detail()), which returns
+        identifiers/hashes only, never document content, and is never
+        reachable from a Telegram request.
+
+        Raises ValueError (never silently substitutes a default, and never
+        proceeds with a "search everything" fallback) if
+        `requesting_user_id` is not a genuine positive Telegram user id —
+        `None`, a bool (`True`/`False` are `int` subclasses in Python but
+        are never a valid Telegram id), a non-int, or a non-positive value
+        are all rejected the same way `rag.sidecar.parse_sidecar_bytes()`
+        already rejects a malformed `owner_user_id`.
+        """
+        if (
+            requesting_user_id is None
+            or isinstance(requesting_user_id, bool)
+            or not isinstance(requesting_user_id, int)
+            or requesting_user_id <= 0
+        ):
+            raise ValueError(
+                "requesting_user_id must be a real, positive Telegram user id — "
+                "retrieval must never run without one"
+            )
+        return Filter(
+            should=[
+                FieldCondition(key="scope", match=MatchValue(value=SCOPE_REFERENCE)),
+                Filter(
+                    must=[
+                        FieldCondition(key="scope", match=MatchValue(value=SCOPE_PRIVATE)),
+                        FieldCondition(key="owner_user_id", match=MatchValue(value=requesting_user_id)),
+                    ]
+                ),
+            ]
+        )
+
+    # ------------------------------------------------------------------
     # Internal Qdrant helpers — every caller already holds self._lock
     # ------------------------------------------------------------------
 
-    def _existing_points_detail(self, document_id: str) -> Dict[str, Optional[str]]:
+    def _existing_points_detail(self, document_id: str) -> Dict[str, dict]:
         """Local-only lookup: every existing point id for `document_id`,
-        mapped to its stored content_sha256 payload value (or None if that
-        point somehow has no such field). Never makes a provider call
-        itself (Stage 2B Section N) — this is what
+        mapped to a dict of its stored content_sha256/scope/owner_user_id
+        payload values (each None if that point has no such field). Never
+        makes a provider call itself (Stage 2B Section N) — this is what
         reconcile_document() below uses to classify EXACT CURRENT / EXTRA
-        STALE POINTS ONLY / MISSING-OUTDATED without embedding anything."""
-        detail: Dict[str, Optional[str]] = {}
+        STALE POINTS ONLY / MISSING-OUTDATED without embedding anything.
+
+        `scope`/`owner_user_id` are included (Stage 3A pre-upgrade
+        compatibility fix) so a point that matches on content_sha256 alone
+        but carries stale or missing Stage 3A visibility metadata — e.g. a
+        pre-Stage-3A reference point indexed before `scope` existed at all
+        — is never misclassified as current. See reconcile_document()'s
+        `expected_all_current` check, the sole reader of this data."""
+        detail: Dict[str, dict] = {}
         offset = None
         doc_filter = Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
         while True:
@@ -238,11 +315,16 @@ class VectorIndex:
                 scroll_filter=doc_filter,
                 limit=256,
                 offset=offset,
-                with_payload=["content_sha256"],
+                with_payload=["content_sha256", "scope", "owner_user_id"],
                 with_vectors=False,
             )
             for record in records:
-                detail[str(record.id)] = (record.payload or {}).get("content_sha256")
+                payload = record.payload or {}
+                detail[str(record.id)] = {
+                    "content_sha256": payload.get("content_sha256"),
+                    "scope": payload.get("scope"),
+                    "owner_user_id": payload.get("owner_user_id"),
+                }
             if offset is None:
                 break
         return detail
@@ -331,6 +413,7 @@ class VectorIndex:
         stored_name: Optional[str] = None,
         expected_content_sha256: Optional[str] = None,
         source_bytes: Optional[bytes] = None,
+        owner_user_id: Optional[int] = None,
     ) -> Tuple[str, int]:
         """
         Make Qdrant exactly reflect `file_path`'s CURRENT content under
@@ -345,19 +428,35 @@ class VectorIndex:
         (document_id, chunk_index) without embedding anything, is compared
         against what's actually in Qdrant for this document_id.
 
+        Stage 3A pre-upgrade compatibility: content_sha256 identity alone
+        is likewise never sufficient — a point is "current" only if its
+        stored `scope`/`owner_user_id` payload fields ALSO already match
+        what this call expects (`scope="reference"`+no owner when
+        `owner_user_id` is None, else `scope="private"`+that exact owner).
+        This is what makes a pre-Stage-3A point — indexed before `scope`
+        existed, so it has matching id/hash but no visibility metadata at
+        all — ineligible for "unchanged": it is instead treated exactly
+        like outdated content below and safely re-embedded/upserted with
+        correct Stage 3A metadata, rather than being silently accepted as
+        current and permanently excluded from the Stage 3A visibility
+        filter (_visibility_filter()).
+
         Classifies into exactly one of three outcomes:
           - "unchanged": every expected point already exists with the
-            current content_sha256, and no extra stale points remain.
-            Zero embedding, upsert, or delete calls.
+            current content_sha256 AND the expected scope/owner_user_id,
+            and no extra stale points remain. Zero embedding, upsert, or
+            delete calls.
           - "stale_pruned": every expected point already exists with the
-            current content_sha256, but extra (stale) points also remain
-            — e.g. left over from a previous stale-delete failure. Only
-            those extras are deleted; zero embedding calls (this is what
-            makes a deterministic retry converge for free).
-          - "reindexed": one or more expected points are missing or
-            outdated — full safe replacement via _replace_document_points()
-            (embed the complete new set, upsert, delete stale extras only
-            after a successful upsert).
+            current content_sha256 AND the expected scope/owner_user_id,
+            but extra (stale) points also remain — e.g. left over from a
+            previous stale-delete failure. Only those extras are deleted;
+            zero embedding calls (this is what makes a deterministic retry
+            converge for free).
+          - "reindexed": one or more expected points are missing, outdated,
+            or carry stale/missing visibility metadata — full safe
+            replacement via _replace_document_points() (embed the complete
+            new set, upsert, delete stale extras only after a successful
+            upsert).
 
         Section I hash/read consistency: `file_path`'s content is hashed
         once before loading and re-verified immediately before any
@@ -395,6 +494,17 @@ class VectorIndex:
         not overengineered) keep the previous file_path-based behavior,
         including its second, pre-embed re-verification read below.
 
+        owner_user_id (Stage 3A): Telegram numeric id of a managed upload's
+        owner, threaded straight to the loader (see rag/loader.py's
+        _chunk_and_tag()) so every resulting chunk's Qdrant payload carries
+        `scope="private", owner_user_id=<this value>`. `None` (the default)
+        for reference documents — index_documents_directory() never passes
+        it, so reference chunks always get `scope="reference"`. Never
+        inferred/guessed here; callers (handlers/document_upload.py,
+        scripts/rebuild_qdrant.py) are the sole source of this value, and
+        each derives it from a durable record (the sidecar) rather than
+        from any Telegram session state.
+
         Returns (status, chunk_count) where chunk_count is the number of
         chunks `file_path` currently splits into (the size of the expected
         set) regardless of status.
@@ -416,6 +526,7 @@ class VectorIndex:
                     document_id=document_id,
                     content_sha256=content_sha256,
                     stored_name=stored_name,
+                    owner_user_id=owner_user_id,
                 )
             else:
                 chunks = document_loader.load_document(
@@ -424,6 +535,7 @@ class VectorIndex:
                     document_id=document_id,
                     content_sha256=content_sha256,
                     stored_name=stored_name,
+                    owner_user_id=owner_user_id,
                 )
 
             if not chunks:
@@ -436,8 +548,22 @@ class VectorIndex:
             existing_detail = self._existing_points_detail(document_id)
             existing_ids = set(existing_detail)
 
+            # Stage 3A pre-upgrade compatibility: a point is only "current"
+            # if its content_sha256 matches AND its stored visibility
+            # metadata already matches what this call expects — `scope`
+            # equal to the scope this owner_user_id implies, and
+            # `owner_user_id` equal to this call's owner_user_id exactly
+            # (None for a reference document, meaning "no owner field").
+            # This is what stops a pre-Stage-3A reference point (matching
+            # id/hash, but no `scope` field at all) from being accepted as
+            # unchanged and permanently excluded from the Stage 3A
+            # visibility filter — see _existing_points_detail()'s docstring.
+            expected_scope = SCOPE_PRIVATE if owner_user_id is not None else SCOPE_REFERENCE
             expected_all_current = expected_ids <= existing_ids and all(
-                existing_detail.get(pid) == content_sha256 for pid in expected_ids
+                existing_detail[pid]["content_sha256"] == content_sha256
+                and existing_detail[pid]["scope"] == expected_scope
+                and existing_detail[pid]["owner_user_id"] == owner_user_id
+                for pid in expected_ids
             )
             if expected_all_current:
                 stale_ids = existing_ids - expected_ids
@@ -509,25 +635,36 @@ class VectorIndex:
             logger.error("RAG index delete_document failed | error_type=%s", type(e).__name__)
             raise
 
-    def similarity_search(self, query: str, k: int = 3) -> List[Document]:
+    def similarity_search(self, query: str, *, requesting_user_id: int, k: int = 3) -> List[Document]:
         """
         Search for similar documents.
 
         Args:
             query: Search query
+            requesting_user_id: Telegram numeric id of the user this search
+                is being performed for (Stage 3A). Required, keyword-only,
+                no default — there is deliberately no way to call this
+                method and search "everything". See _visibility_filter().
             k: Number of results to return
 
         Returns:
             List of relevant document chunks
         """
-        return [doc for doc, _ in self.similarity_search_with_score(query, k=k)]
+        return [doc for doc, _ in self.similarity_search_with_score(query, requesting_user_id=requesting_user_id, k=k)]
 
-    def similarity_search_with_score(self, query: str, k: int = 3) -> List[Tuple[Document, float]]:
+    def similarity_search_with_score(self, query: str, *, requesting_user_id: int, k: int = 3) -> List[Tuple[Document, float]]:
         """
         Search for similar documents with relevance scores.
 
         Args:
             query: Search query
+            requesting_user_id: Telegram numeric id of the user this search
+                is being performed for (Stage 3A). Required, keyword-only,
+                no default. Every result is either `scope="reference"`
+                (visible to everyone) or a `scope="private"` point owned by
+                exactly this user — see _visibility_filter(), which also
+                raises ValueError if this is missing/invalid rather than
+                letting the call silently proceed unfiltered.
             k: Number of results to return
 
         Returns:
@@ -535,6 +672,7 @@ class VectorIndex:
             query_points() already returns points ordered by descending
             similarity score for COSINE distance).
         """
+        query_filter = self._visibility_filter(requesting_user_id)
         try:
             with self._lock:
                 # Network call (embeds `query`) — happens before the Qdrant
@@ -543,6 +681,7 @@ class VectorIndex:
                 response = self.client.query_points(
                     collection_name=self.collection_name,
                     query=vector,
+                    query_filter=query_filter,
                     limit=k,
                     with_payload=True,
                 )
@@ -666,16 +805,31 @@ class VectorIndex:
             logger.error("RAG clear_index failed | error_type=%s", type(e).__name__)
             raise
 
-    def get_stats(self) -> dict:
+    def get_stats(self, *, requesting_user_id: int) -> dict:
         """
-        Get statistics about the vector store.
+        Get statistics about the vector store, scoped to what
+        `requesting_user_id` may actually see (Stage 3A): the shared
+        reference corpus plus that user's own private documents — never a
+        global count that would otherwise reveal how much private data
+        OTHER users have stored. Required, keyword-only, no default — same
+        rationale as similarity_search_with_score(); see
+        _visibility_filter(), which raises ValueError for a
+        missing/invalid id rather than silently counting everything.
 
         Returns:
             Dictionary with statistics
         """
+        # Validated/built before the try block below, same as
+        # similarity_search_with_score() — an invalid requesting_user_id is
+        # a caller bug (never a Qdrant/provider failure) and must raise
+        # ValueError loudly, not be swallowed into the generic
+        # {"error": ...} fallback below.
+        count_filter = self._visibility_filter(requesting_user_id)
         try:
             with self._lock:
-                count = self.client.count(collection_name=self.collection_name, exact=True).count
+                count = self.client.count(
+                    collection_name=self.collection_name, count_filter=count_filter, exact=True
+                ).count
 
             # No absolute filesystem path here: this dict is displayed
             # verbatim to the user by handlers/start.py's /stats command,

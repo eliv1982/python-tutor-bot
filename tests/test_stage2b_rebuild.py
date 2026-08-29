@@ -24,14 +24,14 @@ from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
 from rag_fakes import DeterministicFakeEmbeddings
 
 
-def _write_upload(uploads_dir: Path, uuid_hex: str, extension: str, content: bytes, display_name: str) -> Path:
+def _write_upload(uploads_dir: Path, uuid_hex: str, extension: str, content: bytes, display_name: str, owner_user_id: int = 1) -> Path:
     uploads_dir.mkdir(parents=True, exist_ok=True)
     physical = uploads_dir / f"{uuid_hex}{extension}"
     physical.write_bytes(content)
     document_id = upload_document_id(uuid_hex)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(document_id, display_name, physical.name, sha256_hex(content)),
+        build_sidecar(document_id, display_name, physical.name, sha256_hex(content), owner_user_id=owner_user_id),
     )
     return physical
 
@@ -276,11 +276,11 @@ def test_apply_plan_indexes_reference_and_upload_documents(source_tree, tmp_path
         assert report.documents_reindexed == 4  # everything is new on a fresh collection
         assert report.chunks_reindexed == 4  # all short single-chunk documents
         assert report.documents_removed == 0
-        assert vi.get_stats()["total_documents"] == 4
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 4
         assert fake.embed_documents_call_count == 4  # one batch per document
 
         # Reference document is retrievable and correctly attributed.
-        results = vi.similarity_search("First reference guide content.", k=1)
+        results = vi.similarity_search("First reference guide content.", requesting_user_id=1, k=1)
         assert results[0].metadata["source"] == "guide-one.md"
 
         # Both duplicate-display-name uploads are present as separate documents.
@@ -328,7 +328,7 @@ def test_sidecar_identity_mismatch_is_skipped_safely(source_tree):
     # UUID than the physical file it's actually paired with ("e" * 32).
     write_sidecar_atomic(
         sidecar_path_for(mismatched_physical),
-        build_sidecar(upload_document_id("f" * 32), "spoofed.txt", "f" * 32 + ".txt", sha256_hex(b"mismatched content")),
+        build_sidecar(upload_document_id("f" * 32), "spoofed.txt", "f" * 32 + ".txt", sha256_hex(b"mismatched content"), owner_user_id=1),
     )
 
     plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
@@ -355,7 +355,7 @@ def test_rebuild_plan_skips_upload_whose_physical_entry_is_a_symlink_escaping_up
 
     write_sidecar_atomic(
         sidecar_path_for(link_path),
-        build_sidecar(upload_document_id(stem), "escape.txt", link_path.name, sha256_hex(b"top secret content outside uploads root")),
+        build_sidecar(upload_document_id(stem), "escape.txt", link_path.name, sha256_hex(b"top secret content outside uploads root"), owner_user_id=1),
     )
 
     plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
@@ -382,7 +382,7 @@ def test_rebuild_plan_skips_upload_whose_sidecar_is_a_symlink_escaping_uploads_r
 
     outside_json = uploads_dir.parent / "outside_sidecar.meta.json"
     outside_json.write_text(json.dumps(build_sidecar(
-        upload_document_id(stem), "escape.txt", physical.name, sha256_hex(physical_content),
+        upload_document_id(stem), "escape.txt", physical.name, sha256_hex(physical_content), owner_user_id=1,
     )), encoding="utf-8")
 
     sidecar_link = sidecar_path_for(physical)
@@ -406,7 +406,7 @@ def test_sidecar_content_hash_mismatch_is_skipped_safely(source_tree):
     tampered_physical.write_bytes(b"original content")
     write_sidecar_atomic(
         sidecar_path_for(tampered_physical),
-        build_sidecar(upload_document_id("1" * 32), "tampered.txt", tampered_physical.name, sha256_hex(b"original content")),
+        build_sidecar(upload_document_id("1" * 32), "tampered.txt", tampered_physical.name, sha256_hex(b"original content"), owner_user_id=1),
     )
     # File contents changed after the sidecar was written (stale/tampered).
     tampered_physical.write_bytes(b"different content now")
@@ -432,7 +432,7 @@ def test_rebuild_is_idempotent_and_deterministic(source_tree, tmp_path):
             (d.document_id, point_id(d.document_id, 0))
             for d in plan.all_documents
         }
-        count_after_first = vi.get_stats()["total_documents"]
+        count_after_first = vi.get_stats(requesting_user_id=1)["total_documents"]
 
         # Re-run the exact same plan a second time — Stage 2B-C Blocker 3:
         # NON-DESTRUCTIVE reconciliation, never a clear-then-rebuild.
@@ -440,7 +440,7 @@ def test_rebuild_is_idempotent_and_deterministic(source_tree, tmp_path):
         # re-embedding), which is what proves idempotency/convergence
         # rather than merely "re-embeds everything identically twice".
         report2 = rebuild.apply_plan(plan, vi)
-        count_after_second = vi.get_stats()["total_documents"]
+        count_after_second = vi.get_stats(requesting_user_id=1)["total_documents"]
 
         assert report1.documents_reconciled == report2.documents_reconciled == 4
         assert report1.documents_reindexed == 4       # first run: all new
@@ -520,7 +520,7 @@ def test_apply_plan_first_document_embedding_failure_preserves_prior_valid_index
     try:
         from langchain_core.documents import Document
         vi.add_documents([Document(page_content="pre-existing valid content", metadata={"document_id": "docPreexisting", "chunk_index": 0, "source": "old.md"})])
-        assert vi.get_stats()["total_documents"] == 1
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
 
         def failing_embed_documents(texts):
             raise RuntimeError("simulated provider failure on first document")
@@ -534,7 +534,7 @@ def test_apply_plan_first_document_embedding_failure_preserves_prior_valid_index
         # plan was ever indexed, and the pre-existing document was never
         # removed (no clear-first, and orphan pruning never ran because
         # the plan failed).
-        assert vi.get_stats()["total_documents"] == 1
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
         assert vi._existing_point_ids("docPreexisting")
     finally:
         vi.close()
@@ -596,7 +596,7 @@ def test_apply_plan_upsert_failure_does_not_destroy_the_whole_index(source_tree,
         with pytest.raises(RuntimeError):
             rebuild.apply_plan(plan, vi)
 
-        assert vi.get_stats()["total_documents"] == 1
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
         assert vi._existing_point_ids("docPreexisting")
     finally:
         vi.close()

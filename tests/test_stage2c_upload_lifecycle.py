@@ -137,7 +137,7 @@ async def test_cancel_during_status_message_after_storage_leaves_no_orphan(real_
     assert list(uploads_dir.iterdir()) == []
     load_mock.assert_not_called()
     add_mock.assert_not_called()
-    assert vi.get_stats()["total_documents"] == 0
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ async def test_cancel_while_indexing_worker_runs_leaves_no_orphan(real_upload_en
         await task
 
     assert list(uploads_dir.iterdir()) == []
-    assert vi.get_stats()["total_documents"] == 0
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ async def test_repeated_cancellation_while_indexing_worker_runs_leaves_no_orphan
         await task
 
     assert list(uploads_dir.iterdir()) == []
-    assert vi.get_stats()["total_documents"] == 0
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ async def test_cancel_after_worker_succeeds_before_observed_retains_everything(r
     sidecar_files = [p for p in uploads_dir.iterdir() if p.name.endswith(".meta.json")]
     assert len(physical_files) == 1
     assert len(sidecar_files) == 1
-    assert vi.get_stats()["total_documents"] >= 1  # successfully committed, never deleted
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] >= 1  # successfully committed, never deleted
 
     sent_texts = [c.args[1] for c in real_upload_env.send_message_mock.await_args_list]
     assert not any("успешно загружен" in t for t in sent_texts)  # cancelled: no success notification
@@ -281,7 +281,7 @@ async def test_ordinary_indexing_failure_leaves_no_orphan(real_upload_env, monke
     await document_upload.process_document_upload(message, document)
 
     assert list(uploads_dir.iterdir()) == []
-    assert vi.get_stats()["total_documents"] == 0
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
 
     sent_texts = [c.args[1] for c in real_upload_env.send_message_mock.await_args_list]
     assert any("ошибка" in t.lower() for t in sent_texts)
@@ -307,7 +307,7 @@ async def test_successful_upload_preserves_source_sidecar_and_qdrant_document(re
     assert len(physical_files) == 1
     assert len(sidecar_files) == 1
 
-    results = vi.similarity_search("Real content for the upload lifecycle test.", k=1)
+    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_id=42, k=1)
     assert len(results) == 1
     assert results[0].metadata["source"] == "notes.txt"
 
@@ -329,7 +329,7 @@ async def test_cleanup_targets_document_id_not_display_filename(real_upload_env,
     # First upload succeeds normally.
     message1, document1 = _make_message(42, "shared_name.txt")
     await document_upload.process_document_upload(message1, document1)
-    assert vi.get_stats()["total_documents"] >= 1
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] >= 1
     first_physical = [p for p in uploads_dir.iterdir() if not p.name.endswith(".meta.json")]
     assert len(first_physical) == 1
 
@@ -349,7 +349,7 @@ async def test_cleanup_targets_document_id_not_display_filename(real_upload_env,
     assert remaining_physical == first_physical
     assert len(remaining_sidecars) == 1
 
-    results = vi.similarity_search("Real content for the upload lifecycle test.", k=1)
+    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_id=42, k=1)
     assert len(results) == 1
     assert results[0].metadata["source"] == "shared_name.txt"
 
@@ -404,8 +404,8 @@ async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(re
 
     # Indexing succeeded using the ORIGINAL, already-captured bytes — the
     # post-capture mutation never reached Qdrant.
-    assert vi.get_stats()["total_documents"] == 1
-    results = vi.similarity_search("Real content for the upload lifecycle test.", k=1)
+    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 1
+    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_id=42, k=1)
     assert len(results) == 1
     assert "MUTATED CONTENT" not in results[0].page_content
 
@@ -430,7 +430,7 @@ def test_cleanup_new_upload_returns_false_when_qdrant_cleanup_fails(monkeypatch,
     sidecar.write_text("{}", encoding="utf-8")
     stored = document_upload.StoredUpload(
         physical_path=physical, sidecar_path=sidecar,
-        document_id="upload:" + "a" * 32, content_sha256="b" * 64,
+        document_id="upload:" + "a" * 32, content_sha256="b" * 64, owner_user_id=1,
     )
 
     monkeypatch.setattr(
@@ -455,7 +455,7 @@ def test_cleanup_new_upload_returns_true_on_full_success(monkeypatch, tmp_path):
     sidecar.write_text("{}", encoding="utf-8")
     stored = document_upload.StoredUpload(
         physical_path=physical, sidecar_path=sidecar,
-        document_id="upload:" + "a" * 32, content_sha256="b" * 64,
+        document_id="upload:" + "a" * 32, content_sha256="b" * 64, owner_user_id=1,
     )
 
     monkeypatch.setattr(document_upload.get_vector_index(), "delete_document", Mock())

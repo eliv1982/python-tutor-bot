@@ -52,7 +52,7 @@ async def route_text_request(
         if mode == BotMode.RAG:
             logger.info("route_text_request: RAG | user_id=%s, query_len=%s", user_id, len(text))
             from rag.query import query_knowledge_base
-            response_text = await query_knowledge_base(text, history)
+            response_text = await query_knowledge_base(text, user_id, history)
         else:
             logger.debug("route_text_request: GPT | user_id=%s, model=default", user_id)
             system_prompt = (
@@ -204,7 +204,7 @@ async def route_rag_request(
         
         # Query knowledge base
         logger.debug(f"Querying knowledge base for user {user_id}")
-        response = await query_knowledge_base(query, history)
+        response = await query_knowledge_base(query, user_id, history)
         
         # Add to history
         user_sessions.add_message(user_id, "user", query)

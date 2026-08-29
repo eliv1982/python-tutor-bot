@@ -37,17 +37,17 @@ from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
 from rag_fakes import DeterministicFakeEmbeddings
 
 
-def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: bytes, display_name: str) -> "document_upload.StoredUpload":
+def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: bytes, display_name: str, owner_user_id: int = 1) -> "document_upload.StoredUpload":
     uploads_dir.mkdir(parents=True, exist_ok=True)
     physical = uploads_dir / f"{stem}{extension}"
     physical.write_bytes(content)
     document_id = upload_document_id(stem)
     content_sha256 = sha256_hex(content)
     sidecar_path = sidecar_path_for(physical)
-    write_sidecar_atomic(sidecar_path, build_sidecar(document_id, display_name, physical.name, content_sha256))
+    write_sidecar_atomic(sidecar_path, build_sidecar(document_id, display_name, physical.name, content_sha256, owner_user_id=owner_user_id))
     return document_upload.StoredUpload(
         physical_path=physical, sidecar_path=sidecar_path,
-        document_id=document_id, content_sha256=content_sha256,
+        document_id=document_id, content_sha256=content_sha256, owner_user_id=owner_user_id,
     )
 
 
@@ -78,7 +78,7 @@ def test_normal_managed_upload_secure_read_succeeds_and_indexes_correct_bytes(mo
         chunk_count = document_upload._load_and_index_document(stored, "notes.txt")
         assert chunk_count == 1
 
-        results = vi.similarity_search("Ordinary managed upload content.", k=1)
+        results = vi.similarity_search("Ordinary managed upload content.", requesting_user_id=1, k=1)
         assert len(results) == 1
         assert results[0].metadata["source"] == "notes.txt"
 
@@ -112,11 +112,11 @@ def test_stable_source_symlink_rejected_by_secure_read_directly(tmp_path):
     document_id = upload_document_id(stem)
     write_sidecar_atomic(
         sidecar_path_for(link_path),
-        build_sidecar(document_id, "escape.txt", link_path.name, sha256_hex(b"EXTERNAL ATTACKER CONTENT")),
+        build_sidecar(document_id, "escape.txt", link_path.name, sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=1),
     )
     stored = document_upload.StoredUpload(
         physical_path=link_path, sidecar_path=sidecar_path_for(link_path),
-        document_id=document_id, content_sha256=sha256_hex(b"EXTERNAL ATTACKER CONTENT"),
+        document_id=document_id, content_sha256=sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=1,
     )
 
     with pytest.raises(SecureReadError):
@@ -145,8 +145,8 @@ async def test_stable_source_symlink_end_to_end_cleanup_runs(monkeypatch, tmp_pa
 
     real_store = document_upload._store_document_exclusively
 
-    def storing_then_swapping_for_symlink(file_bytes, extension, display_name, attempts=5):
-        stored = real_store(file_bytes, extension, display_name, attempts=attempts)
+    def storing_then_swapping_for_symlink(file_bytes, extension, display_name, owner_user_id, attempts=5):
+        stored = real_store(file_bytes, extension, display_name, owner_user_id, attempts=attempts)
         stored.physical_path.unlink()
         try:
             os.symlink(external, stored.physical_path)
@@ -231,7 +231,7 @@ def test_hash_mismatch_fails_before_qdrant_mutation(monkeypatch, tmp_path):
         with pytest.raises(Exception) as exc_info:
             document_upload._load_and_index_document(stored, "notes.txt")
         assert type(exc_info.value).__name__ == "SourceMutatedError"
-        assert vi.get_stats()["total_documents"] == 0  # no Qdrant mutation occurred
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 0  # no Qdrant mutation occurred
     finally:
         vi.close()
 
@@ -319,8 +319,8 @@ async def test_original_pathname_replaced_after_secure_read_has_no_effect_on_ind
     try:
         await document_upload.process_document_upload(message, document)
 
-        assert vi.get_stats()["total_documents"] == 1
-        results = vi.similarity_search("Content captured before any replacement occurs.", k=1)
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
+        results = vi.similarity_search("Content captured before any replacement occurs.", requesting_user_id=1, k=1)
         assert len(results) == 1
         assert "REPLACEMENT CONTENT" not in results[0].page_content
     finally:
@@ -341,7 +341,7 @@ def test_indexed_payload_carries_no_temp_or_absolute_path(monkeypatch, tmp_path)
     try:
         document_upload._load_and_index_document(stored, "My Report.txt")
 
-        results = vi.similarity_search("Payload privacy check content.", k=1)
+        results = vi.similarity_search("Payload privacy check content.", requesting_user_id=1, k=1)
         assert len(results) == 1
         metadata = results[0].metadata
 

@@ -243,7 +243,7 @@ async def test_rag_source_filename_not_logged_but_attribution_preserved(monkeypa
     monkeypatch.setattr(openai_client.client.chat.completions, "create", create_mock)
 
     with caplog.at_level(logging.DEBUG):
-        response = await rag_query.query_knowledge_base("What does my document say?")
+        response = await rag_query.query_knowledge_base("What does my document say?", 1)
 
     # Source attribution is preserved for the user.
     assert confidential_source in response
@@ -360,7 +360,7 @@ def test_get_stats_never_returns_absolute_path(monkeypatch, tmp_path):
     fake_count_result = SimpleNamespace(count=3)
     monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(return_value=fake_count_result))
 
-    stats = rag_index.get_vector_index().get_stats()
+    stats = rag_index.get_vector_index().get_stats(requesting_user_id=1)
 
     assert "persist_directory" not in stats
     assert str(sensitive_dir) not in str(stats)

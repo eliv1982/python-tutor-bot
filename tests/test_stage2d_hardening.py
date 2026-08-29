@@ -114,6 +114,7 @@ def _make_stored_upload(physical_path: Path, sidecar_path: Path):
         sidecar_path=sidecar_path,
         document_id="upload:" + "a" * 32,
         content_sha256="b" * 64,
+        owner_user_id=1,
     )
 
 
@@ -500,7 +501,7 @@ def test_rebuild_dry_run_finds_managed_uploads_when_present(isolated_tree):
     physical.write_bytes(b"isolated managed upload content")
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "notes.txt", physical.name, sha256_hex(b"isolated managed upload content")),
+        build_sidecar(upload_document_id(stem), "notes.txt", physical.name, sha256_hex(b"isolated managed upload content"), owner_user_id=1),
     )
 
     env = _clean_subprocess_env()

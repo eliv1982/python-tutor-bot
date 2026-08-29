@@ -45,7 +45,7 @@ async def test_rag_similarity_search_runs_off_event_loop_thread(monkeypatch):
 
     fake_doc = SimpleNamespace(metadata={"source": "notes.txt"}, page_content="Some content.")
 
-    def synthetic_blocking_search(query, k=3):
+    def synthetic_blocking_search(query, requesting_user_id=None, k=3):
         recorded_thread_id["id"] = threading.get_ident()
         return [(fake_doc, 0.1)]
 
@@ -58,7 +58,7 @@ async def test_rag_similarity_search_runs_off_event_loop_thread(monkeypatch):
         )),
     )
 
-    response = await rag_query.query_knowledge_base("What is a list comprehension?")
+    response = await rag_query.query_knowledge_base("What is a list comprehension?", 1)
 
     assert "id" in recorded_thread_id, "synthetic_blocking_search was never called"
     assert recorded_thread_id["id"] != caller_thread_id
@@ -104,9 +104,9 @@ async def test_document_upload_pipeline_runs_off_event_loop_thread(monkeypatch, 
 
     real_store = document_upload._store_document_exclusively
 
-    def spy_store(file_bytes, extension, display_name, attempts=5):
+    def spy_store(file_bytes, extension, display_name, owner_user_id, attempts=5):
         store_thread_id["id"] = threading.get_ident()
-        return real_store(file_bytes, extension, display_name, attempts=attempts)
+        return real_store(file_bytes, extension, display_name, owner_user_id, attempts=attempts)
 
     def fake_reconcile_document(document_id, file_path, **kwargs):
         reconcile_call_count["n"] += 1
@@ -261,7 +261,7 @@ async def test_event_loop_stays_responsive_during_offloaded_rag_query(monkeypatc
     release = threading.Event()
     fake_doc = SimpleNamespace(metadata={"source": "notes.txt"}, page_content="Some content.")
 
-    def blocking_search(query, k=3):
+    def blocking_search(query, requesting_user_id=None, k=3):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         return [(fake_doc, 0.1)]
@@ -275,7 +275,7 @@ async def test_event_loop_stays_responsive_during_offloaded_rag_query(monkeypatc
         )),
     )
 
-    task = asyncio.create_task(rag_query.query_knowledge_base("question"))
+    task = asyncio.create_task(rag_query.query_knowledge_base("question", 1))
 
     # Poll (cheaply) for the worker thread to signal it has actually entered
     # the blocking call — bounded, not an arbitrary fixed sleep used as the
@@ -327,7 +327,7 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
     search_thread_id = {}
     fake_doc = SimpleNamespace(metadata={"source": "notes.txt"}, page_content="Some content.")
 
-    def blocking_search(query, k=3):
+    def blocking_search(query, requesting_user_id=None, k=3):
         search_thread_id["id"] = threading.get_ident()
         return [(fake_doc, 0.1)]
 

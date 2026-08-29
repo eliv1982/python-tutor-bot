@@ -263,7 +263,7 @@ async def test_original_filename_preserved_as_rag_source_not_uuid(monkeypatch, t
         physical_files = [p for p in uploads_dir.iterdir() if not p.name.endswith(".meta.json")]
         assert len(physical_files) == 1
 
-        results = vi.similarity_search("Python is a great language for tutoring.", k=1)
+        results = vi.similarity_search("Python is a great language for tutoring.", requesting_user_id=1, k=1)
         assert len(results) == 1
         metadata = results[0].metadata
         assert metadata["source"] == "My Study Notes.txt"
@@ -318,7 +318,7 @@ async def test_managed_upload_not_reloaded_with_opaque_source_on_startup_scan(mo
     await document_upload.process_document_upload(message, document)
 
     # Step 2: initial ingest used the original filename as source.
-    results = vi.similarity_search("Python functions are defined with the def keyword.", k=1)
+    results = vi.similarity_search("Python functions are defined with the def keyword.", requesting_user_id=1, k=1)
     assert len(results) == 1
     assert results[0].metadata["source"] == "python_notes.txt"
 
@@ -477,7 +477,7 @@ async def test_notification_failure_after_successful_ingestion_does_not_rollback
             await document_upload.process_document_upload(message, document)
 
         # Ingestion happened exactly once and was never treated as failed.
-        assert vi.get_stats()["total_documents"] >= 1
+        assert vi.get_stats(requesting_user_id=1)["total_documents"] >= 1
         created = list(uploads_dir.iterdir())
         assert len(created) == 2, "successfully ingested file + its sidecar must not be deleted"
 
@@ -585,7 +585,7 @@ def test_store_document_exclusively_cleans_up_after_write_failure(monkeypatch, t
     monkeypatch.setattr(document_upload, "open", fake_open, raising=False)
 
     with pytest.raises(OSError, match="simulated disk write failure"):
-        document_upload._store_document_exclusively(b"payload bytes", ".txt", "notes.txt")
+        document_upload._store_document_exclusively(b"payload bytes", ".txt", "notes.txt", 1)
 
     assert len(created_paths) == 1, "exactly one candidate should have been exclusively created"
     assert not created_paths[0].exists(), "the partially-written file must be cleaned up"

@@ -189,12 +189,12 @@ def test_build_plan_rejects_sidecar_swapped_to_external_symlink_at_secure_read_b
     physical.write_bytes(physical_content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content)),
+        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_id=1),
     )
 
     external_json = uploads_dir.parent / "external.meta.json"
     external_json.write_text(json.dumps(build_sidecar(
-        upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content),
+        upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_id=1,
     )), encoding="utf-8")
 
     real_secure_read = rebuild.secure_read_sidecar_bytes
@@ -228,7 +228,7 @@ def test_build_plan_rejects_source_swapped_to_external_symlink_at_secure_read_bo
     physical.write_bytes(physical_content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content)),
+        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_id=1),
     )
 
     external_source = uploads_dir.parent / "external_source.txt"
@@ -266,7 +266,7 @@ def test_build_plan_accepts_regular_upload_with_no_race(uploads_tree):
     physical.write_bytes(content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "ordinary.txt", physical.name, sha256_hex(content)),
+        build_sidecar(upload_document_id(stem), "ordinary.txt", physical.name, sha256_hex(content), owner_user_id=1),
     )
 
     plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
@@ -291,7 +291,7 @@ def test_apply_plan_does_not_embed_source_swapped_after_plan_built(uploads_tree,
     physical.write_bytes(original_content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "doc.txt", physical.name, sha256_hex(original_content)),
+        build_sidecar(upload_document_id(stem), "doc.txt", physical.name, sha256_hex(original_content), owner_user_id=1),
     )
 
     plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
@@ -316,7 +316,7 @@ def test_apply_plan_does_not_embed_source_swapped_after_plan_built(uploads_tree,
         assert report.documents_reconciled == 1
         assert report.documents_reindexed == 1
 
-        results = vi.similarity_search("ORIGINAL PLAN-TIME CONTENT", k=1)
+        results = vi.similarity_search("ORIGINAL PLAN-TIME CONTENT", requesting_user_id=1, k=1)
         assert results
         assert "ORIGINAL PLAN-TIME CONTENT" in results[0].page_content
         assert "SWAPPED" not in results[0].page_content
@@ -354,7 +354,7 @@ def test_reconcile_document_with_source_bytes_never_reopens_file_path(tmp_path):
         assert status == "reindexed"
         assert chunk_count >= 1
         assert not nonexistent_path.exists()  # never created/touched
-        results = vi.similarity_search("content that only ever exists in memory", k=1)
+        results = vi.similarity_search("content that only ever exists in memory", requesting_user_id=1, k=1)
         assert results
     finally:
         vi.close()

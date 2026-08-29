@@ -100,6 +100,13 @@ class SourceDocument:
     content_sha256: str
     stored_name: Optional[str] = None
     content_bytes: Optional[bytes] = None
+    # Stage 3A: the sidecar's `owner_user_id` for an "upload" document,
+    # sourced from the sidecar itself (never guessed) — always None for a
+    # "reference" document (no owner). apply_plan() passes this straight to
+    # VectorIndex.reconcile_document(), which derives scope="private" (with
+    # this owner) vs. scope="reference" from it exactly the same way the
+    # live upload path does.
+    owner_user_id: Optional[int] = None
 
 
 @dataclass
@@ -220,6 +227,21 @@ def _plan_upload_documents(uploads_dir: Path, skipped_reasons: List[str]) -> Lis
             logger.warning("Rebuild plan: skipping upload with invalid sidecar | error_type=%s", type(e).__name__)
             continue
 
+        # Stage 3A: a legacy (pre-Stage-3A, schema_version=1) sidecar has
+        # no recorded owner — parse_sidecar_bytes() represents that as an
+        # explicit `owner_user_id: None` rather than raising. Fail closed
+        # here rather than guessing: never reconcile it as a private
+        # document owned by nobody-in-particular, and never silently
+        # promote it to scope="reference" (which would make it visible to
+        # every authorized user). Full operator-facing handling of legacy
+        # uploads (e.g. an explicit reassignment/migration path) is Stage
+        # 3B; this pass only needs to make sure one is never silently
+        # exposed.
+        if sidecar["owner_user_id"] is None:
+            skipped_reasons.append("missing_owner")
+            logger.warning("Rebuild plan: skipping upload with no recorded owner (legacy sidecar)")
+            continue
+
         # Stage 2B-C Section H: re-resolve the sidecar's declared
         # stored_name through the containment-checked resolver — never
         # trust the directory-listing entry alone. This rejects a
@@ -272,6 +294,7 @@ def _plan_upload_documents(uploads_dir: Path, skipped_reasons: List[str]) -> Lis
             content_sha256=actual_content_sha256,
             stored_name=sidecar["stored_name"],
             content_bytes=source_bytes,
+            owner_user_id=sidecar["owner_user_id"],
         ))
     return planned
 
@@ -339,6 +362,7 @@ def apply_plan(plan: RebuildPlan, vector_index) -> RebuildReport:
             stored_name=doc.stored_name,
             expected_content_sha256=doc.content_sha256,
             source_bytes=doc.content_bytes,
+            owner_user_id=doc.owner_user_id,
         )
         report.documents_reconciled += 1
         if status == "reindexed":

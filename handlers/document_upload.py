@@ -43,11 +43,19 @@ class StoredUpload:
     """Result of a successfully completed storage step: the physical file,
     its durable sidecar, and the identity/fingerprint values derived while
     creating them — everything the later load/index step and any cleanup
-    path need, without re-deriving or re-reading anything."""
+    path need, without re-deriving or re-reading anything.
+
+    owner_user_id (Stage 3A): the immutable Telegram numeric id
+    (`from_user.id`) captured once, at storage time, by
+    `_store_document_exclusively()` — already durably persisted in the
+    sidecar by that point. Carried here so `_load_and_index_document()`
+    can pass it straight to `VectorIndex.reconcile_document()` without
+    re-deriving or re-reading it from anywhere."""
     physical_path: Path
     sidecar_path: Path
     document_id: str
     content_sha256: str
+    owner_user_id: int
 
 
 @bot.message_handler(content_types=['document'])
@@ -81,7 +89,9 @@ async def handle_document_message(message: types.Message):
     )
 
 
-def _store_document_exclusively(file_bytes: bytes, extension: str, display_name: str, attempts: int = 5) -> StoredUpload:
+def _store_document_exclusively(
+    file_bytes: bytes, extension: str, display_name: str, owner_user_id: int, attempts: int = 5
+) -> StoredUpload:
     """
     Atomically claim a fresh, opaque, application-generated storage path,
     write the document bytes into it in the same exclusive-create
@@ -89,6 +99,11 @@ def _store_document_exclusively(file_bytes: bytes, extension: str, display_name:
     the physical file and its sidecar together are the durable source of
     truth for this upload, independent of whatever is or isn't currently
     in Qdrant.
+
+    `owner_user_id` (Stage 3A): the uploader's immutable Telegram numeric
+    id, persisted into the sidecar via `build_sidecar()` so ownership
+    survives a process restart and is available independently of any
+    Telegram session state — see rag/sidecar.py.
 
     Each candidate is opened with 'xb' (O_CREAT | O_EXCL). Ownership
     boundary: a FileExistsError from that open call means nothing was
@@ -136,6 +151,7 @@ def _store_document_exclusively(file_bytes: bytes, extension: str, display_name:
                     display_name=display_name,
                     stored_name=candidate.name,
                     content_sha256=content_sha256,
+                    owner_user_id=owner_user_id,
                 ),
             )
         except Exception:
@@ -147,6 +163,7 @@ def _store_document_exclusively(file_bytes: bytes, extension: str, display_name:
             sidecar_path=sidecar_path,
             document_id=document_id,
             content_sha256=content_sha256,
+            owner_user_id=owner_user_id,
         )
 
     raise RuntimeError("Could not allocate a unique document storage path") from last_collision_error
@@ -198,6 +215,7 @@ def _load_and_index_document(stored: StoredUpload, display_name: str) -> int:
         stored_name=stored.physical_path.name,
         expected_content_sha256=stored.content_sha256,
         source_bytes=secure_bytes,
+        owner_user_id=stored.owner_user_id,
     )
     return chunk_count
 
@@ -425,7 +443,7 @@ async def process_document_upload(message: types.Message, document: types.Docume
         # await_worker(): if this coroutine is cancelled (even repeatedly)
         # while they're in flight, the worker thread is never abandoned
         # (see _resolve_cancelled_storage()).
-        storage_future = submit_worker(_store_document_exclusively, file_bytes, extension, original_filename)
+        storage_future = submit_worker(_store_document_exclusively, file_bytes, extension, original_filename, user_id)
         try:
             stored = await await_worker(storage_future)
         except asyncio.CancelledError:

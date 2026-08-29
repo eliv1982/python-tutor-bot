@@ -119,8 +119,8 @@ async def test_real_repo_state_unchanged_around_a_representative_stage2b_workloa
     )
     try:
         vi.add_documents([Document(page_content="isolation proof", metadata={"document_id": "d1", "chunk_index": 0, "source": "x.md"})])
-        vi.similarity_search("isolation proof", k=1)
-        vi.get_stats()
+        vi.similarity_search("isolation proof", requesting_user_id=1, k=1)
+        vi.get_stats(requesting_user_id=1)
     finally:
         vi.close()
 

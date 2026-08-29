@@ -72,7 +72,7 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
     bystander = tmp_path / "bystander.txt"
     bystander.write_bytes(b"UNRELATED PRE-EXISTING CONTENT")
 
-    def fake_store(file_bytes, extension, display_name):
+    def fake_store(file_bytes, extension, display_name, owner_user_id):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         path = tmp_path / f"owned_upload{extension}"
@@ -83,6 +83,7 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
             content_sha256="deadbeef",
+            owner_user_id=owner_user_id,
         )
 
     load_mock = Mock()

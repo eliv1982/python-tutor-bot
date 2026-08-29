@@ -1065,12 +1065,12 @@ async def test_rag_response_path_uses_text_llm_facade(monkeypatch):
     )
     monkeypatch.setattr(
         rag_query.get_vector_index(), "similarity_search_with_score",
-        lambda query, k=3: [(fake_doc, 0.1)],
+        lambda query, requesting_user_id=None, k=3: [(fake_doc, 0.1)],
     )
     facade_mock = AsyncMock(return_value="RAG-grounded answer.")
     monkeypatch.setattr(rag_query.text_llm, "generate_text_response", facade_mock)
 
-    response = await rag_query.query_knowledge_base("What is PEP 8?")
+    response = await rag_query.query_knowledge_base("What is PEP 8?", 1)
 
     assert "RAG-grounded answer." in response
     assert "python_basics.txt" in response
@@ -1082,12 +1082,12 @@ async def test_rag_fallback_path_uses_text_llm_facade(monkeypatch):
 
     monkeypatch.setattr(
         rag_query.get_vector_index(), "similarity_search_with_score",
-        lambda query, k=3: [],
+        lambda query, requesting_user_id=None, k=3: [],
     )
     facade_mock = AsyncMock(return_value="General-knowledge answer.")
     monkeypatch.setattr(rag_query.text_llm, "generate_text_response", facade_mock)
 
-    response = await rag_query.query_knowledge_base("What is a metaclass?")
+    response = await rag_query.query_knowledge_base("What is a metaclass?", 1)
 
     assert "General-knowledge answer." in response
     assert "База знаний не содержит информации" in response
