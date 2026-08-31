@@ -71,6 +71,40 @@ def _mock_bot_send(monkeypatch):
     monkeypatch.setattr(shared_bot, "send_chat_action", AsyncMock())
 
 
+@pytest.fixture
+def resolved_telegram_ids(_default_fake_preferences, monkeypatch):
+    """
+    Stage 5C: "no protected work happened for this Telegram id" used to be
+    provable by checking `f"{user_id}_mode" not in user_sessions.sessions`
+    — mode now lives in PostgreSQL (db.preferences), not that in-memory
+    dict, so that key is never created for ANY user any more and the old
+    assertion would be vacuously true regardless of authorization. The
+    CORRECT Stage 5C analog of "no session was created" is "no internal
+    user identity was ever resolved/created" — db.identity.
+    resolve_or_create_user_by_telegram_id_sync() is called by
+    app.identity.resolve_user_uuid() ONLY AFTER require_authorized() lets a
+    request through (see app/identity.py's own docstring), so an
+    unauthorized Telegram id must never appear in the list this fixture
+    returns.
+
+    Explicitly depends on conftest.py's _default_fake_preferences (already
+    autouse) so this always wraps that in-memory fake, never attempts a
+    real PostgreSQL call, and captures calls regardless of fixture
+    ordering between this file's own autouse fixtures and conftest's.
+    """
+    import db.identity as db_identity
+
+    resolved = []
+    real_resolve = db_identity.resolve_or_create_user_by_telegram_id_sync
+
+    def spy_resolve(telegram_id):
+        resolved.append(telegram_id)
+        return real_resolve(telegram_id)
+
+    monkeypatch.setattr(db_identity, "resolve_or_create_user_by_telegram_id_sync", spy_resolve)
+    return resolved
+
+
 def _new_message() -> types.Message:
     """
     Bare `telebot.types.Message` instance, built via `__new__` to skip
@@ -142,7 +176,7 @@ def _make_callback(user_id: int, data: str = "mode_voice", callback_id: str = "c
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fail_closed_with_empty_allowlist_denies_any_user(monkeypatch):
+async def test_fail_closed_with_empty_allowlist_denies_any_user(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
 
     message = _make_text_message(UNAUTHORIZED_ID, "/start")
@@ -152,12 +186,13 @@ async def test_fail_closed_with_empty_allowlist_denies_any_user(monkeypatch):
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
 
-    # No protected work happened: no session was created for this user.
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    # No protected work happened: no internal user was ever resolved/
+    # created for this Telegram id (Stage 5C — see resolved_telegram_ids).
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio
-async def test_fail_closed_denies_even_when_caller_happens_to_be_authorized_elsewhere(monkeypatch):
+async def test_fail_closed_denies_even_when_caller_happens_to_be_authorized_elsewhere(monkeypatch, resolved_telegram_ids):
     """A non-empty but unrelated allowlist still denies a user not on it —
     fail closed is per-user, not merely "allowlist is non-empty"."""
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset({AUTHORIZED_ID}))
@@ -167,7 +202,7 @@ async def test_fail_closed_denies_even_when_caller_happens_to_be_authorized_else
 
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +218,9 @@ async def test_authorized_user_reaches_handler_behavior(monkeypatch):
 
     # Existing /start behavior: session mode initialized, welcome text sent.
     from config import DEFAULT_MODE
-    assert user_sessions.get_mode(AUTHORIZED_ID) == DEFAULT_MODE
+    import db.identity as db_identity
+    user_uuid = db_identity.resolve_or_create_user_by_telegram_id_sync(AUTHORIZED_ID)
+    assert await user_sessions.get_mode(user_uuid) == DEFAULT_MODE
     shared_bot.send_message.assert_awaited_once()
     sent_text = shared_bot.send_message.await_args.args[1]
     assert "Привет" in sent_text
@@ -195,7 +232,7 @@ async def test_authorized_user_reaches_handler_behavior(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_unauthorized_text_message_does_not_call_router_or_mutate_session(monkeypatch):
+async def test_unauthorized_text_message_does_not_call_router_or_mutate_session(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
     route_mock = AsyncMock()
     monkeypatch.setattr(text, "route_text_request", route_mock)
@@ -204,8 +241,7 @@ async def test_unauthorized_text_message_does_not_call_router_or_mutate_session(
     await text.handle_text_message(message)
 
     route_mock.assert_not_called()
-    assert user_sessions.get_history(UNAUTHORIZED_ID) == []
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
 
@@ -215,7 +251,7 @@ async def test_unauthorized_text_message_does_not_call_router_or_mutate_session(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_unauthorized_photo_does_not_download_or_call_vision(monkeypatch):
+async def test_unauthorized_photo_does_not_download_or_call_vision(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
     download_mock = AsyncMock()
     route_mock = AsyncMock()
@@ -227,20 +263,20 @@ async def test_unauthorized_photo_does_not_download_or_call_vision(monkeypatch):
 
     download_mock.assert_not_called()
     route_mock.assert_not_called()
-    assert user_sessions.get_pending_image(UNAUTHORIZED_ID) is None
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_photo_without_caption_does_not_store_pending_image(monkeypatch):
+async def test_unauthorized_photo_without_caption_does_not_store_pending_image(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
     monkeypatch.setattr(image, "download_telegram_file", AsyncMock())
 
     message = _make_photo_message(UNAUTHORIZED_ID, caption="")
     await image.handle_photo_message(message)
 
-    assert user_sessions.get_pending_image(UNAUTHORIZED_ID) is None
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
 
 # ---------------------------------------------------------------------------
@@ -291,13 +327,13 @@ async def test_unauthorized_document_does_not_download_store_or_index(monkeypatc
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_unauthorized_mode_command_does_not_mutate_session(monkeypatch):
+async def test_unauthorized_mode_command_does_not_mutate_session(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
 
     message = _make_text_message(UNAUTHORIZED_ID, "/mode voice")
     await text.cmd_mode(message)
 
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
     assert "Режим изменён" not in sent_text
@@ -320,14 +356,14 @@ async def test_unauthorized_reset_does_not_clear_or_touch_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_mode_callback_does_not_mutate_session(monkeypatch):
+async def test_unauthorized_mode_callback_does_not_mutate_session(monkeypatch, resolved_telegram_ids):
     """Bonus coverage: the inline-keyboard callback entry point is gated too."""
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
 
     callback = _make_callback(UNAUTHORIZED_ID, data="mode_voice")
     await text.callback_mode(callback)
 
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
     shared_bot.answer_callback_query.assert_awaited_once()
     assert shared_bot.answer_callback_query.await_args.args[1] == access_control.ACCESS_DENIED_MESSAGE
     shared_bot.send_message.assert_not_called()
@@ -389,7 +425,7 @@ def test_is_authorized_uses_only_numeric_id(monkeypatch):
 # must never trigger any protected side effect.
 
 @pytest.mark.asyncio
-async def test_message_with_from_user_none_denies_and_does_not_call_handler(monkeypatch):
+async def test_message_with_from_user_none_denies_and_does_not_call_handler(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset({AUTHORIZED_ID}))
 
     message = _new_message()
@@ -402,11 +438,11 @@ async def test_message_with_from_user_none_denies_and_does_not_call_handler(monk
     shared_bot.send_message.assert_awaited_once()
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
-    assert "999_mode" not in user_sessions.sessions
+    assert 999 not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio
-async def test_callback_with_from_user_none_denies_and_does_not_call_handler(monkeypatch):
+async def test_callback_with_from_user_none_denies_and_does_not_call_handler(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset({AUTHORIZED_ID}))
 
     callback = _new_callback()
@@ -418,11 +454,11 @@ async def test_callback_with_from_user_none_denies_and_does_not_call_handler(mon
 
     shared_bot.answer_callback_query.assert_awaited_once()
     assert shared_bot.answer_callback_query.await_args.args[1] == access_control.ACCESS_DENIED_MESSAGE
-    assert "999_mode" not in user_sessions.sessions
+    assert 999 not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio
-async def test_from_user_missing_id_denies_and_does_not_call_handler(monkeypatch):
+async def test_from_user_missing_id_denies_and_does_not_call_handler(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset({AUTHORIZED_ID}))
 
     message = _new_message()
@@ -434,11 +470,11 @@ async def test_from_user_missing_id_denies_and_does_not_call_handler(monkeypatch
 
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
-    assert "999_mode" not in user_sessions.sessions
+    assert 999 not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio
-async def test_non_integer_id_denies_and_does_not_call_handler(monkeypatch):
+async def test_non_integer_id_denies_and_does_not_call_handler(monkeypatch, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset({AUTHORIZED_ID}))
 
     message = _make_text_message(AUTHORIZED_ID, "/start")
@@ -447,7 +483,7 @@ async def test_non_integer_id_denies_and_does_not_call_handler(monkeypatch):
 
     sent_text = shared_bot.send_message.await_args.args[1]
     assert sent_text == access_control.ACCESS_DENIED_MESSAGE
-    assert f"{AUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert AUTHORIZED_ID not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio
@@ -508,7 +544,7 @@ _FAKE_TELEGRAM_EXCEPTION_TEXT = (
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_message_denial_send_failure_does_not_leak_token(monkeypatch, caplog):
+async def test_unauthorized_message_denial_send_failure_does_not_leak_token(monkeypatch, caplog, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
     shared_bot.send_message.side_effect = RuntimeError(_FAKE_TELEGRAM_EXCEPTION_TEXT)
     route_mock = AsyncMock()
@@ -519,7 +555,7 @@ async def test_unauthorized_message_denial_send_failure_does_not_leak_token(monk
         await text.handle_text_message(message)  # must not raise
 
     route_mock.assert_not_called()
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
     log_text = caplog.text
     assert _FAKE_TOKEN not in log_text
@@ -529,7 +565,7 @@ async def test_unauthorized_message_denial_send_failure_does_not_leak_token(monk
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_callback_denial_answer_failure_does_not_leak_token(monkeypatch, caplog):
+async def test_unauthorized_callback_denial_answer_failure_does_not_leak_token(monkeypatch, caplog, resolved_telegram_ids):
     monkeypatch.setattr(access_control, "TELEGRAM_ALLOWED_USER_IDS", frozenset())
     shared_bot.answer_callback_query.side_effect = RuntimeError(_FAKE_TELEGRAM_EXCEPTION_TEXT)
 
@@ -537,7 +573,7 @@ async def test_unauthorized_callback_denial_answer_failure_does_not_leak_token(m
     with caplog.at_level("WARNING"):
         await text.callback_mode(callback)  # must not raise
 
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
     log_text = caplog.text
     assert _FAKE_TOKEN not in log_text
@@ -596,7 +632,7 @@ def test_handler_registration_is_fully_authorization_wrapped():
 # from whichever attributes happen to be present.
 
 @pytest.mark.asyncio
-async def test_malformed_message_with_misleading_top_level_id_never_routed_as_callback(monkeypatch):
+async def test_malformed_message_with_misleading_top_level_id_never_routed_as_callback(monkeypatch, resolved_telegram_ids):
     """
     A real types.Message with no usable chat.id but a top-level `.id`
     (the message_id alias every real Message carries) must never have that
@@ -616,11 +652,11 @@ async def test_malformed_message_with_misleading_top_level_id_never_routed_as_ca
 
     shared_bot.answer_callback_query.assert_not_called()
     shared_bot.send_message.assert_not_called()
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio
-async def test_malformed_callback_with_misleading_chat_never_routed_as_message(monkeypatch):
+async def test_malformed_callback_with_misleading_chat_never_routed_as_message(monkeypatch, resolved_telegram_ids):
     """
     A real types.CallbackQuery carrying an unexpected top-level `.chat`
     attribute must still be denied purely as a callback: only
@@ -642,7 +678,7 @@ async def test_malformed_callback_with_misleading_chat_never_routed_as_message(m
     assert shared_bot.answer_callback_query.await_args.args[0] == "cb-1"
     assert shared_bot.answer_callback_query.await_args.args[1] == access_control.ACCESS_DENIED_MESSAGE
     shared_bot.send_message.assert_not_called()
-    assert f"{UNAUTHORIZED_ID}_mode" not in user_sessions.sessions
+    assert UNAUTHORIZED_ID not in resolved_telegram_ids
 
 
 @pytest.mark.asyncio

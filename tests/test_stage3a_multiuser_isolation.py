@@ -1,9 +1,10 @@
 """
 Stage 3A regression tests: multi-user Qdrant isolation + sidecar ownership
-persistence.
+persistence (identity migrated from Telegram int to canonical internal
+UUID — Stage 5C).
 
-Security invariant under test: for every RAG request from Telegram user U,
-the retrievable corpus is exactly (1) shared reference documents and (2)
+Security invariant under test: for every RAG request from user U, the
+retrievable corpus is exactly (1) shared reference documents and (2)
 private managed documents owned by U — never any other user's private
 documents, and never via a silent/default "search everything" path.
 
@@ -11,9 +12,21 @@ All VectorIndex instances here are real local-persistent Qdrant (not
 mocked) against tmp_path, with a deterministic local fake embeddings double
 (tests/rag_fakes.py) — no real OpenAI/Qdrant network calls anywhere in this
 module, matching the established Stage 2B test convention.
+
+`_uid(n)` derives a stable, distinct canonical UUID string from a small
+int (uuid5 off a fixed namespace) — the SAME relational structure the
+original Telegram-int-keyed tests used (same n -> same identity, different
+n -> different identity), just producing a valid Stage 5C owner value
+instead of a raw int. Direct VectorIndex-level tests use this freely.
+`test_end_to_end_telegram_upload_and_rag_query_isolates_between_users`
+below is the one exception: it drives a REAL Telegram handler, so it
+resolves identity through db.identity's fixture-faked resolver (same
+mechanism the production code path uses via app.identity.resolve_user_uuid()),
+never `_uid()`.
 """
 
 import json
+import uuid
 
 import pytest
 from langchain_core.documents import Document
@@ -23,6 +36,12 @@ from rag.identity import point_id, sha256_hex, upload_document_id
 from rag.index import VectorIndex
 from rag.sidecar import parse_sidecar_bytes, sidecar_path_for
 from rag_fakes import DeterministicFakeEmbeddings
+
+_TEST_NAMESPACE = uuid.uuid4()
+
+
+def _uid(n: int) -> str:
+    return str(uuid.uuid5(_TEST_NAMESPACE, str(n)))
 
 
 @pytest.fixture
@@ -56,7 +75,7 @@ def _doc(text, document_id, chunk_index, source="test.md", **extra):
 
 
 # ===========================================================================
-# A. Qdrant payload: scope + owner_user_id
+# A. Qdrant payload: scope + owner_user_uuid
 # ===========================================================================
 
 def test_reference_chunk_has_scope_reference_and_no_owner(index_factory):
@@ -66,59 +85,62 @@ def test_reference_chunk_has_scope_reference_and_no_owner(index_factory):
     records, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert len(records) == 1
     assert records[0].payload["scope"] == "reference"
-    assert "owner_user_id" not in records[0].payload
+    assert "owner_user_uuid" not in records[0].payload
 
 
 def test_private_chunk_has_scope_private_and_correct_owner(index_factory):
     vi = index_factory()
-    vi.add_documents([_doc("my private notes", "upload:aaa", 0, owner_user_id=555)])
+    owner = _uid(555)
+    vi.add_documents([_doc("my private notes", "upload:aaa", 0, owner_user_uuid=owner)])
 
     records, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert len(records) == 1
     assert records[0].payload["scope"] == "private"
-    assert records[0].payload["owner_user_id"] == 555
+    assert records[0].payload["owner_user_uuid"] == owner
 
 
 def test_owner_and_scope_survive_reconciliation_reindex(index_factory, tmp_path):
     vi = index_factory()
+    owner = _uid(777)
     file_path = tmp_path / "doc.txt"
     file_path.write_text("version one content", encoding="utf-8")
 
-    status, count = vi.reconcile_document("upload:reconcile_owner", file_path, owner_user_id=777)
+    status, count = vi.reconcile_document("upload:reconcile_owner", file_path, owner_user_uuid=owner)
     assert status == "reindexed"
     assert count == 1
     records, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert records[0].payload["scope"] == "private"
-    assert records[0].payload["owner_user_id"] == 777
+    assert records[0].payload["owner_user_uuid"] == owner
 
     # Reconciling the SAME (unchanged) content must not disturb ownership.
-    status2, _ = vi.reconcile_document("upload:reconcile_owner", file_path, owner_user_id=777)
+    status2, _ = vi.reconcile_document("upload:reconcile_owner", file_path, owner_user_uuid=owner)
     assert status2 == "unchanged"
     records2, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
-    assert records2[0].payload["owner_user_id"] == 777
+    assert records2[0].payload["owner_user_uuid"] == owner
 
     # A genuine content change (full re-embed) must also preserve ownership.
     file_path.write_text("version two, completely different content", encoding="utf-8")
-    status3, _ = vi.reconcile_document("upload:reconcile_owner", file_path, owner_user_id=777)
+    status3, _ = vi.reconcile_document("upload:reconcile_owner", file_path, owner_user_uuid=owner)
     assert status3 == "reindexed"
     records3, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert records3[0].payload["scope"] == "private"
-    assert records3[0].payload["owner_user_id"] == 777
+    assert records3[0].payload["owner_user_uuid"] == owner
 
 
 def test_two_users_uploading_identical_content_remain_independently_attributed(index_factory):
     vi = index_factory()
+    owner_a, owner_b = _uid(1001), _uid(2002)
     shared_text = "identical shared wording across two independent uploads"
-    vi.add_documents([_doc(shared_text, "upload:userA_doc", 0, owner_user_id=1001)])
-    vi.add_documents([_doc(shared_text, "upload:userB_doc", 0, owner_user_id=2002)])
+    vi.add_documents([_doc(shared_text, "upload:userA_doc", 0, owner_user_uuid=owner_a)])
+    vi.add_documents([_doc(shared_text, "upload:userB_doc", 0, owner_user_uuid=owner_b)])
 
-    results_a = vi.similarity_search_with_score(shared_text, requesting_user_id=1001, k=5)
-    results_b = vi.similarity_search_with_score(shared_text, requesting_user_id=2002, k=5)
+    results_a = vi.similarity_search_with_score(shared_text, requesting_user_uuid=owner_a, k=5)
+    results_b = vi.similarity_search_with_score(shared_text, requesting_user_uuid=owner_b, k=5)
 
     assert len(results_a) == 1
-    assert results_a[0][0].metadata["owner_user_id"] == 1001
+    assert results_a[0][0].metadata["owner_user_uuid"] == owner_a
     assert len(results_b) == 1
-    assert results_b[0][0].metadata["owner_user_id"] == 2002
+    assert results_b[0][0].metadata["owner_user_uuid"] == owner_b
 
 
 # ===========================================================================
@@ -131,23 +153,24 @@ def test_two_users_uploading_identical_content_remain_independently_attributed(i
 
 def test_no_cross_user_retrieval_even_at_perfect_similarity(index_factory):
     vi = index_factory()
+    owner_a, owner_b = _uid(1001), _uid(2002)
     secret_content = "Confidential quarterly revenue figures for Project Falcon are stored here."
-    vi.add_documents([_doc(secret_content, "upload:userA_secret", 0, owner_user_id=1001, source="A_private.txt")])
+    vi.add_documents([_doc(secret_content, "upload:userA_secret", 0, owner_user_uuid=owner_a, source="A_private.txt")])
     vi.add_documents([_doc("Public onboarding guide for new hires.", "ref:onboarding", 0, source="onboarding.md")])
 
     # User B queries with the EXACT text of user A's private document —
     # the hardest possible case to leak.
-    results_b = vi.similarity_search_with_score(secret_content, requesting_user_id=2002, k=5)
-    assert all(doc.metadata.get("owner_user_id") != 1001 for doc, _ in results_b)
+    results_b = vi.similarity_search_with_score(secret_content, requesting_user_uuid=owner_b, k=5)
+    assert all(doc.metadata.get("owner_user_uuid") != owner_a for doc, _ in results_b)
     assert all(doc.metadata.get("source") != "A_private.txt" for doc, _ in results_b)
 
     # User A can retrieve their own document with the same query.
-    results_a = vi.similarity_search_with_score(secret_content, requesting_user_id=1001, k=5)
+    results_a = vi.similarity_search_with_score(secret_content, requesting_user_uuid=owner_a, k=5)
     assert any(doc.metadata.get("source") == "A_private.txt" for doc, _ in results_a)
 
     # Both users can retrieve the shared reference content.
-    results_a_ref = vi.similarity_search_with_score("Public onboarding guide for new hires.", requesting_user_id=1001, k=5)
-    results_b_ref = vi.similarity_search_with_score("Public onboarding guide for new hires.", requesting_user_id=2002, k=5)
+    results_a_ref = vi.similarity_search_with_score("Public onboarding guide for new hires.", requesting_user_uuid=owner_a, k=5)
+    results_b_ref = vi.similarity_search_with_score("Public onboarding guide for new hires.", requesting_user_uuid=owner_b, k=5)
     assert any(doc.metadata.get("source") == "onboarding.md" for doc, _ in results_a_ref)
     assert any(doc.metadata.get("source") == "onboarding.md" for doc, _ in results_b_ref)
 
@@ -155,13 +178,17 @@ def test_no_cross_user_retrieval_even_at_perfect_similarity(index_factory):
 @pytest.mark.asyncio
 async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(monkeypatch, tmp_path):
     """Full-stack proof: Telegram document upload (handlers/document_upload.py)
-    -> router (app/tutor.py) -> rag.query.query_knowledge_base() ->
-    VectorIndex, for two DIFFERENT Telegram users, never leaks one user's
-    private upload into the other's RAG answer — proven through the real
-    production call chain, not just VectorIndex directly."""
+    -> app.identity.resolve_user_uuid() -> app/documents.py ->
+    rag.query.query_knowledge_base() -> VectorIndex, for two DIFFERENT
+    Telegram users, never leaks one user's private upload into the other's
+    RAG answer — proven through the real production call chain (including
+    real canonical-identity resolution, via conftest.py's fixture-faked
+    db.identity resolver — see its own docstring), not just VectorIndex
+    directly."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
+    import db.identity as db_identity
     import handlers.document_upload as document_upload
     import app.documents as app_documents
     import rag.query as rag_query
@@ -191,7 +218,8 @@ async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(m
 
     try:
         await document_upload.process_document_upload(message_a, message_a.document)
-        assert vi.get_stats(requesting_user_id=11111)["total_documents"] == 1
+        user_a_uuid = str(db_identity.resolve_or_create_user_by_telegram_id_sync(11111))
+        assert vi.get_stats(requesting_user_uuid=user_a_uuid)["total_documents"] == 1
 
         monkeypatch.setattr(
             openai_client.client.chat.completions, "create",
@@ -201,15 +229,17 @@ async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(m
             )),
         )
 
-        # A different Telegram user queries with the exact text of A's
-        # private document — must never see it (and, since the collection
-        # holds nothing else, must fall back to the no-results path).
-        answer_for_b = await rag_query.query_knowledge_base(secret_text, 22222)
+        # A different Telegram user (resolved to their OWN internal UUID)
+        # queries with the exact text of A's private document — must never
+        # see it (and, since the collection holds nothing else for B, must
+        # fall back to the no-results path).
+        user_b_uuid = str(db_identity.resolve_or_create_user_by_telegram_id_sync(22222))
+        answer_for_b = await rag_query.query_knowledge_base(secret_text, user_b_uuid)
         assert "secret.txt" not in answer_for_b
-        assert vi.get_stats(requesting_user_id=22222)["total_documents"] == 0
+        assert vi.get_stats(requesting_user_uuid=user_b_uuid)["total_documents"] == 0
 
         # The owner retrieves their own upload successfully.
-        answer_for_a = await rag_query.query_knowledge_base(secret_text, 11111)
+        answer_for_a = await rag_query.query_knowledge_base(secret_text, user_a_uuid)
         assert "secret.txt" in answer_for_a
     finally:
         vi.close()
@@ -220,35 +250,35 @@ async def test_end_to_end_telegram_upload_and_rag_query_isolates_between_users(m
 # VectorIndex/Qdrant access layer.
 # ===========================================================================
 
-def test_similarity_search_omitted_requesting_user_id_raises(index_factory):
+def test_similarity_search_omitted_requesting_user_uuid_raises(index_factory):
     vi = index_factory()
     with pytest.raises(TypeError):
         vi.similarity_search_with_score("query")  # missing required keyword-only arg
 
 
-@pytest.mark.parametrize("bad_value", [None, True, False, "1001", 0, -5, 3.5])
-def test_similarity_search_rejects_invalid_requesting_user_id(index_factory, bad_value):
+@pytest.mark.parametrize("bad_value", [None, True, False, 1001, "", "1001", "not-a-uuid", str(uuid.uuid4()).upper()])
+def test_similarity_search_rejects_invalid_requesting_user_uuid(index_factory, bad_value):
     vi = index_factory()
     with pytest.raises(ValueError):
-        vi.similarity_search_with_score("query", requesting_user_id=bad_value, k=1)
+        vi.similarity_search_with_score("query", requesting_user_uuid=bad_value, k=1)
 
 
-@pytest.mark.parametrize("bad_value", [None, True, False, "1001", 0, -5, 3.5])
-def test_get_stats_rejects_invalid_requesting_user_id(index_factory, bad_value):
+@pytest.mark.parametrize("bad_value", [None, True, False, 1001, "", "1001", "not-a-uuid", str(uuid.uuid4()).upper()])
+def test_get_stats_rejects_invalid_requesting_user_uuid(index_factory, bad_value):
     vi = index_factory()
     with pytest.raises(ValueError):
-        vi.get_stats(requesting_user_id=bad_value)
+        vi.get_stats(requesting_user_uuid=bad_value)
 
 
 @pytest.mark.asyncio
-async def test_query_knowledge_base_requires_requesting_user_id():
+async def test_query_knowledge_base_requires_requesting_user_uuid():
     import inspect
 
     import rag.query as rag_query
 
     sig = inspect.signature(rag_query.query_knowledge_base)
-    assert "requesting_user_id" in sig.parameters
-    assert sig.parameters["requesting_user_id"].default is inspect.Parameter.empty
+    assert "requesting_user_uuid" in sig.parameters
+    assert sig.parameters["requesting_user_uuid"].default is inspect.Parameter.empty
 
 
 # ===========================================================================
@@ -258,13 +288,14 @@ async def test_query_knowledge_base_requires_requesting_user_id():
 
 def test_stats_excludes_other_users_private_documents(index_factory):
     vi = index_factory()
+    owner_a, owner_b = _uid(1001), _uid(2002)
     vi.add_documents([_doc("shared ref content", "ref:doc1", 0)])
-    vi.add_documents([_doc("user A private content", "upload:a1", 0, owner_user_id=1001)])
-    vi.add_documents([_doc("user B private content one", "upload:b1", 0, owner_user_id=2002)])
-    vi.add_documents([_doc("user B private content two", "upload:b2", 0, owner_user_id=2002)])
+    vi.add_documents([_doc("user A private content", "upload:a1", 0, owner_user_uuid=owner_a)])
+    vi.add_documents([_doc("user B private content one", "upload:b1", 0, owner_user_uuid=owner_b)])
+    vi.add_documents([_doc("user B private content two", "upload:b2", 0, owner_user_uuid=owner_b)])
 
-    stats_a = vi.get_stats(requesting_user_id=1001)
-    stats_b = vi.get_stats(requesting_user_id=2002)
+    stats_a = vi.get_stats(requesting_user_uuid=owner_a)
+    stats_b = vi.get_stats(requesting_user_uuid=owner_b)
 
     # User A sees: 1 reference + 1 own private = 2 — never B's 2 private docs.
     assert stats_a["total_documents"] == 2
@@ -287,6 +318,7 @@ def test_parse_sidecar_bytes_represents_legacy_v1_sidecar_as_unowned():
     }
     parsed = parse_sidecar_bytes(json.dumps(legacy).encode("utf-8"))
     assert parsed["owner_user_id"] is None
+    assert parsed["owner_user_uuid"] is None
 
 
 def test_rebuild_plan_skips_legacy_sidecar_with_no_owner(tmp_path, monkeypatch):
@@ -305,8 +337,10 @@ def test_rebuild_plan_skips_legacy_sidecar_with_no_owner(tmp_path, monkeypatch):
     content = b"legacy upload content with no recorded owner"
     physical.write_bytes(content)
     # Hand-crafted v1 (pre-Stage-3A) sidecar: structurally valid, but no
-    # owner_user_id field at all — exactly what a real pre-Stage-3A upload
-    # left on disk.
+    # owner field at all — exactly what a real pre-Stage-3A upload left on
+    # disk. Still skipped with reason "missing_owner" under Stage 5C's
+    # rebuild planning (v1 has never been safe to reconcile as anyone's
+    # private document — see scripts/rebuild_qdrant.py).
     legacy_sidecar = {
         "schema_version": 1,
         "document_id": upload_document_id(stem),
@@ -325,24 +359,29 @@ def test_rebuild_plan_skips_legacy_sidecar_with_no_owner(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# F. Pre-Stage-3A Qdrant payload compatibility — acceptance-blocker
-# regression tests.
+# F. Pre-Stage-3A / pre-Stage-5C Qdrant payload compatibility —
+# acceptance-blocker regression tests.
 #
 # Existing Stage 2 Qdrant points were created before `scope`/`owner_user_id`
-# existed at all. reconcile_document()'s "unchanged" classification used to
-# key off content_sha256 identity alone, so a pre-Stage-3A reference point
-# with matching id/hash but no `scope` field would be accepted as current
-# forever and stay permanently excluded from the Stage 3A visibility filter
-# (_visibility_filter() requires `scope` to match). This section proves the
-# fix: currency now also requires matching Stage 3A visibility metadata.
+# existed at all; Stage 3A-5B points carry the legacy integer
+# `owner_user_id` field instead of the current `owner_user_uuid`.
+# reconcile_document()'s "unchanged" classification used to key off
+# content_sha256 identity alone, so a stale point with matching id/hash but
+# missing/legacy-shaped visibility metadata would be accepted as current
+# forever and stay permanently excluded from the current visibility filter
+# (_visibility_filter() requires `scope`+`owner_user_uuid` to match). This
+# section proves the fix: currency now also requires matching CURRENT
+# visibility metadata — a legacy `owner_user_id` field is never recognized
+# as a match for any `owner_user_uuid`, by construction (no mixed
+# integer/string owner contract — see rag/index.py's _SAFE_PAYLOAD_FIELDS).
 # ===========================================================================
 
 def _seed_legacy_point(vi, document_id, content, extra_payload):
     """Directly upserts one hand-built Qdrant point bypassing
     VectorIndex._safe_payload() entirely — simulates a point exactly as a
-    pre-Stage-3A (or otherwise stale/malformed) reconciliation left it,
-    with whatever `extra_payload` visibility fields (or lack thereof) a
-    real legacy point would have."""
+    pre-Stage-3A/pre-Stage-5C (or otherwise stale/malformed) reconciliation
+    left it, with whatever `extra_payload` visibility fields (or lack
+    thereof) a real legacy point would have."""
     pid = point_id(document_id, 0)
     payload = {
         "text": content,
@@ -368,7 +407,7 @@ def test_scopeless_reference_point_not_accepted_as_unchanged_and_converges(index
     file_path.write_text(content, encoding="utf-8")
     doc_id = "ref:legacy_guide"
 
-    _seed_legacy_point(vi, doc_id, content, extra_payload={})  # no scope, no owner_user_id
+    _seed_legacy_point(vi, doc_id, content, extra_payload={})  # no scope, no owner
     before, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert "scope" not in before[0].payload
 
@@ -380,7 +419,7 @@ def test_scopeless_reference_point_not_accepted_as_unchanged_and_converges(index
     records, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert len(records) == 1
     assert records[0].payload["scope"] == "reference"
-    assert "owner_user_id" not in records[0].payload
+    assert "owner_user_uuid" not in records[0].payload
 
     # A subsequent call against the now-current, correctly-scoped point IS
     # a genuine no-op — this is not a permanent forced-reindex loop.
@@ -403,20 +442,20 @@ def test_upgraded_reference_document_visible_after_convergence(index_factory, tm
     status, _ = vi.reconcile_document(doc_id, file_path)
     assert status == "reindexed"
 
-    some_user = 424242
-    results = vi.similarity_search_with_score(content, requesting_user_id=some_user, k=5)
+    some_user = _uid(424242)
+    results = vi.similarity_search_with_score(content, requesting_user_uuid=some_user, k=5)
     assert any(doc.metadata.get("document_id") == doc_id for doc, _ in results)
-    assert vi.get_stats(requesting_user_id=some_user)["total_documents"] == 1
+    assert vi.get_stats(requesting_user_uuid=some_user)["total_documents"] == 1
 
 
 def test_already_current_reference_document_keeps_unchanged_fast_path(index_factory, tmp_path):
-    """Property 3: a reference document already correctly Stage-3A-scoped
-    (matching id/hash/scope) keeps the existing zero-unnecessary-work
-    contract — reconciling it again performs zero re-embedding/replacement."""
+    """Property 3: a reference document already correctly scoped (matching
+    id/hash/scope) keeps the existing zero-unnecessary-work contract —
+    reconciling it again performs zero re-embedding/replacement."""
     fake = DeterministicFakeEmbeddings()
     vi = index_factory(embeddings=fake)
     file_path = tmp_path / "current_guide.md"
-    file_path.write_text("Already-current Stage 3A reference content.", encoding="utf-8")
+    file_path.write_text("Already-current reference content.", encoding="utf-8")
     doc_id = "ref:current_guide"
 
     status, count = vi.reconcile_document(doc_id, file_path)
@@ -434,40 +473,47 @@ def test_already_current_reference_document_keeps_unchanged_fast_path(index_fact
 
 
 @pytest.mark.parametrize(
-    "stale_extra_payload",
+    "stale_extra_payload_factory",
     [
-        {},
-        {"scope": "private", "owner_user_id": 999},
-        {"scope": "reference"},
+        lambda: {},
+        # Deliberately the OLD Stage 3A-5B shape (legacy int-typed
+        # owner_user_id field, never owner_user_uuid) — proves a legacy
+        # payload is never recognized as matching ANY current
+        # owner_user_uuid, by construction (no mixed integer/string owner
+        # contract).
+        lambda: {"scope": "private", "owner_user_id": 999},
+        lambda: {"scope": "reference"},
     ],
-    ids=["missing_metadata", "wrong_owner", "wrong_scope"],
+    ids=["missing_metadata", "legacy_int_owner_field", "wrong_scope"],
 )
 def test_private_document_with_stale_visibility_metadata_converges_to_trusted_owner(
-    index_factory, tmp_path, stale_extra_payload
+    index_factory, tmp_path, stale_extra_payload_factory
 ):
     """Property 4: a private document whose existing points carry
-    missing/wrong/inconsistent scope or owner_user_id must not be accepted
-    as current, and must converge to the TRUSTED expected owner supplied by
-    the caller — never inferred/guessed from the stale payload itself (the
-    'wrong_owner' case seeds owner_user_id=999 but must converge to 555)."""
+    missing/legacy/inconsistent scope or owner metadata must not be
+    accepted as current, and must converge to the TRUSTED expected owner
+    supplied by the caller — never inferred/guessed from the stale payload
+    itself (the 'legacy_int_owner_field' case seeds the old integer field
+    entirely, which is structurally unrelated to the new owner_user_uuid,
+    so it can never accidentally satisfy the new comparison)."""
     vi = index_factory()
     file_path = tmp_path / "private_doc.txt"
-    content = "Private managed upload content pending Stage 3A convergence."
+    content = "Private managed upload content pending convergence."
     file_path.write_text(content, encoding="utf-8")
     doc_id = "upload:legacy_private"
-    trusted_owner = 555
+    trusted_owner = _uid(555)
 
-    _seed_legacy_point(vi, doc_id, content, extra_payload=stale_extra_payload)
+    _seed_legacy_point(vi, doc_id, content, extra_payload=stale_extra_payload_factory())
 
-    status, count = vi.reconcile_document(doc_id, file_path, owner_user_id=trusted_owner)
+    status, count = vi.reconcile_document(doc_id, file_path, owner_user_uuid=trusted_owner)
     assert status == "reindexed"
     assert count == 1
 
     records, _ = vi.client.scroll(collection_name=vi.collection_name, limit=10, with_payload=True)
     assert len(records) == 1
     assert records[0].payload["scope"] == "private"
-    assert records[0].payload["owner_user_id"] == trusted_owner
+    assert records[0].payload["owner_user_uuid"] == trusted_owner
 
     # A subsequent call with the SAME trusted owner is now a genuine no-op.
-    status2, _ = vi.reconcile_document(doc_id, file_path, owner_user_id=trusted_owner)
+    status2, _ = vi.reconcile_document(doc_id, file_path, owner_user_uuid=trusted_owner)
     assert status2 == "unchanged"

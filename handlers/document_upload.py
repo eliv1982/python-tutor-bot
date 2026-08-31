@@ -24,6 +24,7 @@ from utils.logging import logger
 from utils.helpers import download_telegram_file
 from utils.access_control import require_authorized
 from app import documents as document_pipeline
+from app.identity import resolve_user_uuid
 
 
 # Supported MIME types for RAG (early routing only — the authoritative
@@ -41,12 +42,12 @@ SUPPORTED_DOC_MIMES = [
 async def handle_document_message(message: types.Message):
     """Route document messages: RAG upload for PDF/TXT/MD/DOCX, info for images."""
     document = message.document
-    user_id = message.from_user.id
+    telegram_user_id = message.from_user.id
     # document.file_name is a user-controlled Telegram display filename and
     # may carry personal/confidential information — never logged raw.
-    logger.info("Document received | user_id=%s, mime=%s, size=%s", user_id, document.mime_type, getattr(document, "file_size", None))
+    logger.info("Document received | telegram_user_id=%s, mime=%s, size=%s", telegram_user_id, document.mime_type, getattr(document, "file_size", None))
     if not document.mime_type:
-        logger.warning("Document: unknown mime_type | user_id=%s", user_id)
+        logger.warning("Document: unknown mime_type | telegram_user_id=%s", telegram_user_id)
         await bot.send_message(message.chat.id, "❌ Не удалось определить тип файла.")
         return
     if document.mime_type.startswith("image/"):
@@ -56,10 +57,10 @@ async def handle_document_message(message: types.Message):
         )
         return
     if document.mime_type in SUPPORTED_DOC_MIMES:
-        logger.debug("Document: supported type, processing upload | user_id=%s", user_id)
+        logger.debug("Document: supported type, processing upload | telegram_user_id=%s", telegram_user_id)
         await process_document_upload(message, document)
         return
-    logger.debug("Document: unsupported mime | user_id=%s, mime=%s", user_id, document.mime_type)
+    logger.debug("Document: unsupported mime | telegram_user_id=%s, mime=%s", telegram_user_id, document.mime_type)
     await bot.send_message(
         message.chat.id,
         f"ℹ️ Формат не поддерживается: {document.mime_type}\n\n"
@@ -96,12 +97,12 @@ async def process_document_upload(message: types.Message, document: types.Docume
     cancellation during the download step above has nothing durable to
     clean up yet, so it simply propagates.
     """
-    user_id = message.from_user.id
+    telegram_user_id = message.from_user.id
     original_filename = document.file_name or "document"
     extension = Path(original_filename).suffix.lower()
 
     if extension not in SUPPORTED_EXTENSIONS:
-        logger.debug("Document upload: unsupported extension | user_id=%s, extension=%s", user_id, extension)
+        logger.debug("Document upload: unsupported extension | telegram_user_id=%s, extension=%s", telegram_user_id, extension)
         await bot.send_message(
             message.chat.id,
             f"❌ Неподдерживаемое расширение файла: {extension or '(нет расширения)'}\n\n"
@@ -110,13 +111,18 @@ async def process_document_upload(message: types.Message, document: types.Docume
         return
 
     try:
+        # Stage 5C: resolve canonical identity BEFORE download — the
+        # existing require_authorized gate on handle_document_message()
+        # already ran; this is identity resolution, never itself an
+        # authorization decision (see app/identity.py).
+        user_uuid = await resolve_user_uuid(telegram_user_id)
         await bot.send_message(message.chat.id, "⏳ Загружаю документ...")
         file_bytes, _ = await download_telegram_file(bot, document.file_id, operation="document_download")
     except Exception as e:
         # Wraps Stage 1A's download_telegram_file() (already privacy-safe
-        # on its own) and this handler's own Telegram sends — never log
-        # raw exception text.
-        logger.error("Document upload failed | user_id=%s, extension=%s, error_type=%s", user_id, extension, type(e).__name__)
+        # on its own), identity resolution, and this handler's own
+        # Telegram sends — never log raw exception text.
+        logger.error("Document upload failed | telegram_user_id=%s, extension=%s, error_type=%s", telegram_user_id, extension, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Ошибка при загрузке документа. Попробуйте ещё раз позже."
@@ -130,15 +136,15 @@ async def process_document_upload(message: types.Message, document: types.Docume
         file_bytes=file_bytes,
         extension=extension,
         display_name=original_filename,
-        owner_user_id=user_id,
+        owner_user_id=user_uuid,
         before_indexing=_notify_indexing_started,
     )
 
     if not result.success:
         if result.rejected_reason == "oversized":
             logger.warning(
-                "Document upload rejected: oversized | user_id=%s, extension=%s, size_bytes=%s",
-                user_id, extension, result.file_size_bytes
+                "Document upload rejected: oversized | telegram_user_id=%s, extension=%s, size_bytes=%s",
+                telegram_user_id, extension, result.file_size_bytes
             )
             await bot.send_message(
                 message.chat.id,
@@ -169,9 +175,9 @@ async def process_document_upload(message: types.Message, document: types.Docume
         # pyTelegramBotAPI HTTP exceptions can carry request metadata that
         # includes the token-bearing Telegram API URL, so — like Stage 1A's
         # download_telegram_file() — only a fixed operation name, the
-        # user_id, and the exception's type are ever logged here: never
-        # str(e), never exc_info=True.
+        # telegram_user_id, and the exception's type are ever logged here:
+        # never str(e), never exc_info=True.
         logger.error(
-            "Document upload: success notification failed (ingestion already committed) | user_id=%s, error_type=%s",
-            user_id, type(e).__name__
+            "Document upload: success notification failed (ingestion already committed) | telegram_user_id=%s, error_type=%s",
+            telegram_user_id, type(e).__name__
         )

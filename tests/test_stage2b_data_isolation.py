@@ -8,6 +8,7 @@ listings (names only), and mtime/size, exactly like the Stage 1F proof
 this extends.
 """
 
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -119,8 +120,8 @@ async def test_real_repo_state_unchanged_around_a_representative_stage2b_workloa
     )
     try:
         vi.add_documents([Document(page_content="isolation proof", metadata={"document_id": "d1", "chunk_index": 0, "source": "x.md"})])
-        vi.similarity_search("isolation proof", requesting_user_id=1, k=1)
-        vi.get_stats(requesting_user_id=1)
+        vi.similarity_search("isolation proof", requesting_user_uuid=str(uuid.uuid4()), k=1)
+        vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))
     finally:
         vi.close()
 

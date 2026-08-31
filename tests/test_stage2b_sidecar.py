@@ -12,6 +12,7 @@ embeddings double used for the handler-level tests.
 import asyncio
 import json
 import os
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -31,6 +32,7 @@ from rag.sidecar import (
 )
 
 _VALID_STEM = "ab" * 16  # 32 lowercase hex chars
+_TEST_OWNER_UUID = str(uuid.uuid4())  # canonical internal user UUID (Stage 5C)
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +52,7 @@ def test_write_sidecar_atomic_produces_valid_readable_json(tmp_path):
         display_name="My Notes.txt",
         stored_name=f"{stem}.txt",
         content_sha256="a" * 64,
-        owner_user_id=1,
+        owner_user_uuid=_TEST_OWNER_UUID,
     )
     write_sidecar_atomic(sidecar_path, data)
 
@@ -78,7 +80,7 @@ def test_write_sidecar_atomic_never_leaves_a_partial_file_visible(tmp_path, monk
     monkeypatch.setattr(sidecar_module.os, "replace", failing_replace)
 
     with pytest.raises(OSError):
-        write_sidecar_atomic(sidecar_path, build_sidecar("upload:x", "n.txt", "x.txt", "b" * 64, owner_user_id=1))
+        write_sidecar_atomic(sidecar_path, build_sidecar("upload:x", "n.txt", "x.txt", "b" * 64, owner_user_uuid=_TEST_OWNER_UUID))
 
     assert not sidecar_path.exists()
     # The temp file was cleaned up too — no orphaned .tmp-* artifact.
@@ -97,9 +99,9 @@ def test_load_sidecar_rejects_malformed_json(tmp_path):
         load_sidecar(path)
 
 
-@pytest.mark.parametrize("missing_field", ["schema_version", "document_id", "display_name", "stored_name", "content_sha256", "owner_user_id"])
+@pytest.mark.parametrize("missing_field", ["schema_version", "document_id", "display_name", "stored_name", "content_sha256", "owner_user_uuid"])
 def test_load_sidecar_rejects_missing_required_field(tmp_path, missing_field):
-    data = build_sidecar("upload:x", "n.txt", "x.txt", "c" * 64, owner_user_id=1)
+    data = build_sidecar("upload:x", "n.txt", "x.txt", "c" * 64, owner_user_uuid=_TEST_OWNER_UUID)
     del data[missing_field]
     path = tmp_path / "incomplete.meta.json"
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -108,7 +110,7 @@ def test_load_sidecar_rejects_missing_required_field(tmp_path, missing_field):
 
 
 def test_load_sidecar_rejects_unsupported_schema_version(tmp_path):
-    data = build_sidecar("upload:x", "n.txt", "x.txt", "d" * 64, owner_user_id=1)
+    data = build_sidecar("upload:x", "n.txt", "x.txt", "d" * 64, owner_user_uuid=_TEST_OWNER_UUID)
     data["schema_version"] = 999
     path = tmp_path / "future.meta.json"
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -128,7 +130,7 @@ def test_sidecar_document_id_and_stored_name_correspond_to_physical_upload(tmp_p
     document_id = upload_document_id(physical.stem)
     content_sha256 = sha256_hex(content)
     sidecar_path = sidecar_path_for(physical)
-    write_sidecar_atomic(sidecar_path, build_sidecar(document_id, "Report.pdf", physical.name, content_sha256, owner_user_id=1))
+    write_sidecar_atomic(sidecar_path, build_sidecar(document_id, "Report.pdf", physical.name, content_sha256, owner_user_uuid=_TEST_OWNER_UUID))
 
     loaded = load_sidecar(sidecar_path)
     assert loaded["document_id"] == document_id == f"upload:{physical.stem}"
@@ -150,7 +152,7 @@ def test_duplicate_display_names_get_distinct_document_ids(tmp_path):
         document_id = upload_document_id(physical.stem)
         write_sidecar_atomic(
             sidecar_path_for(physical),
-            build_sidecar(document_id, "same_name.txt", physical.name, sha256_hex(content), owner_user_id=1),
+            build_sidecar(document_id, "same_name.txt", physical.name, sha256_hex(content), owner_user_uuid=_TEST_OWNER_UUID),
         )
 
     sidecar_a = load_sidecar(sidecar_path_for(physical_a))
@@ -161,40 +163,43 @@ def test_duplicate_display_names_get_distinct_document_ids(tmp_path):
 
 # ---------------------------------------------------------------------------
 # 10: sidecars never contain absolute paths. They DO now intentionally
-# contain the owner's Telegram id (Stage 3A: `owner_user_id` is the durable
-# ownership record — see rag/sidecar.py's module docstring) — that is a
-# deliberate, structured field, not an incidental leak, so it is asserted
-# present by name rather than being something this test guards against.
+# contain the owner's canonical internal user UUID (Stage 5C:
+# `owner_user_uuid` is the durable ownership record — see rag/sidecar.py's
+# module docstring) — that is a deliberate, structured field, not an
+# incidental leak, so it is asserted present by name rather than being
+# something this test guards against.
 # ---------------------------------------------------------------------------
 
 def test_sidecar_never_contains_absolute_path(tmp_path):
     physical = tmp_path / "33333333333333333333333333333333.txt"
     physical.write_bytes(b"content")
     data = build_sidecar(
-        upload_document_id(physical.stem), "notes.txt", physical.name, sha256_hex(b"content"), owner_user_id=42,
+        upload_document_id(physical.stem), "notes.txt", physical.name, sha256_hex(b"content"), owner_user_uuid=_TEST_OWNER_UUID,
     )
     write_sidecar_atomic(sidecar_path_for(physical), data)
 
     raw_text = sidecar_path_for(physical).read_text(encoding="utf-8")
     assert str(tmp_path) not in raw_text
     assert str(physical) not in raw_text
-    assert set(json.loads(raw_text).keys()) == {"schema_version", "document_id", "display_name", "stored_name", "content_sha256", "owner_user_id"}
+    assert set(json.loads(raw_text).keys()) == {"schema_version", "document_id", "display_name", "stored_name", "content_sha256", "owner_user_uuid"}
 
 
-def test_sidecar_owner_user_id_round_trips_and_survives_reload(tmp_path):
-    """Stage 3A requirement: ownership must be recoverable independently of
-    Telegram session state — i.e. purely by reading the durable sidecar
-    back off disk, with no other input."""
+def test_sidecar_owner_user_uuid_round_trips_and_survives_reload(tmp_path):
+    """Stage 3A requirement (identity migrated to canonical UUID Stage 5C):
+    ownership must be recoverable independently of Telegram session state —
+    i.e. purely by reading the durable sidecar back off disk, with no other
+    input."""
     physical = tmp_path / "44444444444444444444444444444444.txt"
     physical.write_bytes(b"owned content")
+    owner_uuid = str(uuid.uuid4())
     data = build_sidecar(
-        upload_document_id(physical.stem), "notes.txt", physical.name, sha256_hex(b"owned content"), owner_user_id=987654321,
+        upload_document_id(physical.stem), "notes.txt", physical.name, sha256_hex(b"owned content"), owner_user_uuid=owner_uuid,
     )
     write_sidecar_atomic(sidecar_path_for(physical), data)
 
     reloaded = load_sidecar(sidecar_path_for(physical))
-    assert reloaded["owner_user_id"] == 987654321
-    assert type(reloaded["owner_user_id"]) is int
+    assert reloaded["owner_user_uuid"] == owner_uuid
+    assert type(reloaded["owner_user_uuid"]) is str
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +354,7 @@ def _valid_sidecar_data(**overrides):
         display_name="notes.txt",
         stored_name=f"{_VALID_STEM}.txt",
         content_sha256="c" * 64,
-        owner_user_id=1,
+        owner_user_uuid=_TEST_OWNER_UUID,
     )
     data.update(overrides)
     return data

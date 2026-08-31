@@ -18,9 +18,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 import config
+import db.identity as db_identity
+import telegram_config
 from app.session import user_sessions
 
-TEST_TOKEN = config.TELEGRAM_BOT_TOKEN  # dummy token from tests/conftest.py
+TEST_TOKEN = telegram_config.TELEGRAM_BOT_TOKEN  # dummy token from tests/conftest.py
 FAKE_TELEGRAM_TOKEN = "987654321:FAKE-TOKEN-FOR-LOG-LEAK-TEST"
 
 
@@ -339,7 +341,12 @@ async def test_pending_image_flow_outbound_sdk_payload_has_no_secret(monkeypatch
     photo_message = _make_photo_message(user_id, caption="")
     await image_handler.handle_photo_message(photo_message)
 
-    pending = user_sessions.get_pending_image(user_id)
+    # The real handler resolves canonical identity (app.identity.resolve_user_uuid())
+    # before storing the pending image — retrieve under that SAME resolved
+    # UUID (fixture-faked, stable per telegram id — see conftest.py's
+    # _default_fake_preferences), never the raw Telegram id directly.
+    user_uuid = db_identity.resolve_or_create_user_by_telegram_id_sync(user_id)
+    pending = user_sessions.get_pending_image(user_uuid)
     assert pending is not None
     assert pending.startswith("data:image/")
     assert TEST_TOKEN not in pending
@@ -363,7 +370,7 @@ async def test_pending_image_flow_outbound_sdk_payload_has_no_secret(monkeypatch
     assert "Find the bug in this code" in prompt_text
 
     # Pending image must be cleared after being consumed.
-    assert user_sessions.get_pending_image(user_id) is None
+    assert user_sessions.get_pending_image(user_uuid) is None
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +461,11 @@ async def test_oversized_photo_is_rejected_before_storage(monkeypatch):
     message = _make_photo_message(user_id, caption="")
     await image_handler.handle_photo_message(message)
 
-    # Nothing must have been stored for a follow-up question.
-    assert user_sessions.get_pending_image(user_id) is None
+    # Nothing must have been stored for a follow-up question — checked
+    # under the SAME resolved UUID the handler would have used had it
+    # (incorrectly) stored anything, not the raw Telegram id.
+    user_uuid = db_identity.resolve_or_create_user_by_telegram_id_sync(user_id)
+    assert user_sessions.get_pending_image(user_uuid) is None
     send_message_mock.assert_awaited_once()
     assert "слишком" in send_message_mock.await_args.args[1].lower()
 
@@ -465,12 +475,17 @@ async def test_reset_clears_pending_image(monkeypatch):
     import handlers.start as start_handler
 
     user_id = 666
-    user_sessions.set_pending_image(user_id, "data:image/jpeg;base64,QUJD")
-    assert user_sessions.get_pending_image(user_id) is not None
+    # Pre-seed the pending image under the SAME internal UUID the handler
+    # will resolve `user_id` to (fixture-faked, stable per telegram id —
+    # see conftest.py's _default_fake_preferences) — cmd_reset() clears by
+    # resolved UUID, never by the raw Telegram id directly.
+    user_uuid = db_identity.resolve_or_create_user_by_telegram_id_sync(user_id)
+    user_sessions.set_pending_image(user_uuid, "data:image/jpeg;base64,QUJD")
+    assert user_sessions.get_pending_image(user_uuid) is not None
 
     monkeypatch.setattr(start_handler.bot, "send_message", AsyncMock())
 
     message = SimpleNamespace(from_user=SimpleNamespace(id=user_id), chat=SimpleNamespace(id=user_id))
     await start_handler.cmd_reset(message)
 
-    assert user_sessions.get_pending_image(user_id) is None
+    assert user_sessions.get_pending_image(user_uuid) is None

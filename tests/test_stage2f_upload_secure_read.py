@@ -23,12 +23,16 @@ tests/test_stage2b_rebuild.py, and tests/test_stage2e_toctou_hardening.py.
 """
 
 import os
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from langchain_core.documents import Document
 
+import db.documents as db_documents
+import db.identity as db_identity
 import handlers.document_upload as document_upload
 import app.documents as app_documents
 from rag.identity import sha256_hex, upload_document_id
@@ -37,18 +41,34 @@ from rag.safe_files import SecureReadError, read_regular_file_secure
 from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
 from rag_fakes import DeterministicFakeEmbeddings
 
+_TEST_OWNER_UUID = str(uuid.uuid4())
 
-def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: bytes, display_name: str, owner_user_id: int = 1) -> "app_documents.StoredUpload":
+
+def _make_stored_upload(uploads_dir: Path, stem: str, extension: str, content: bytes, display_name: str, owner_user_uuid: str = _TEST_OWNER_UUID) -> "app_documents.StoredUpload":
+    """Builds the physical file + sidecar directly (bypassing
+    _store_document_exclusively(), which several of this module's tests
+    call app_documents._load_and_index_document() on its own to isolate
+    the indexing step) — and, Stage 5C corrective pass, also registers the
+    matching PostgreSQL 'pending' catalog row create_pending_sync() would
+    normally create at storage time. Without it, _load_and_index_document()'s
+    own mark_active_sync() call (now non-best-effort — see app/documents.py)
+    would raise "no pending document row found to update" for every one of
+    these directly-constructed StoredUpload fixtures."""
     uploads_dir.mkdir(parents=True, exist_ok=True)
     physical = uploads_dir / f"{stem}{extension}"
     physical.write_bytes(content)
     document_id = upload_document_id(stem)
+    document_uuid = uuid.UUID(stem)
     content_sha256 = sha256_hex(content)
     sidecar_path = sidecar_path_for(physical)
-    write_sidecar_atomic(sidecar_path, build_sidecar(document_id, display_name, physical.name, content_sha256, owner_user_id=owner_user_id))
+    write_sidecar_atomic(sidecar_path, build_sidecar(document_id, display_name, physical.name, content_sha256, owner_user_uuid=owner_user_uuid))
+    db_documents.create_pending_sync(
+        document_id=document_uuid, owner_user_id=uuid.UUID(owner_user_uuid),
+        stored_name=physical.name, display_name=display_name, content_sha256=content_sha256,
+    )
     return app_documents.StoredUpload(
         physical_path=physical, sidecar_path=sidecar_path,
-        document_id=document_id, content_sha256=content_sha256, owner_user_id=owner_user_id,
+        document_id=document_id, document_uuid=document_uuid, content_sha256=content_sha256, owner_user_id=uuid.UUID(owner_user_uuid),
     )
 
 
@@ -79,7 +99,7 @@ def test_normal_managed_upload_secure_read_succeeds_and_indexes_correct_bytes(mo
         chunk_count = app_documents._load_and_index_document(stored, "notes.txt")
         assert chunk_count == 1
 
-        results = vi.similarity_search("Ordinary managed upload content.", requesting_user_id=1, k=1)
+        results = vi.similarity_search("Ordinary managed upload content.", requesting_user_uuid=_TEST_OWNER_UUID, k=1)
         assert len(results) == 1
         assert results[0].metadata["source"] == "notes.txt"
 
@@ -111,13 +131,14 @@ def test_stable_source_symlink_rejected_by_secure_read_directly(tmp_path):
         pytest.skip("symlink creation not permitted on this platform/user")
 
     document_id = upload_document_id(stem)
+    document_uuid = uuid.UUID(stem)
     write_sidecar_atomic(
         sidecar_path_for(link_path),
-        build_sidecar(document_id, "escape.txt", link_path.name, sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=1),
+        build_sidecar(document_id, "escape.txt", link_path.name, sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_uuid=_TEST_OWNER_UUID),
     )
     stored = app_documents.StoredUpload(
         physical_path=link_path, sidecar_path=sidecar_path_for(link_path),
-        document_id=document_id, content_sha256=sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=1,
+        document_id=document_id, document_uuid=document_uuid, content_sha256=sha256_hex(b"EXTERNAL ATTACKER CONTENT"), owner_user_id=uuid.UUID(_TEST_OWNER_UUID),
     )
 
     with pytest.raises(SecureReadError):
@@ -232,7 +253,7 @@ def test_hash_mismatch_fails_before_qdrant_mutation(monkeypatch, tmp_path):
         with pytest.raises(Exception) as exc_info:
             app_documents._load_and_index_document(stored, "notes.txt")
         assert type(exc_info.value).__name__ == "SourceMutatedError"
-        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 0  # no Qdrant mutation occurred
+        assert vi.get_stats(requesting_user_uuid=_TEST_OWNER_UUID)["total_documents"] == 0  # no Qdrant mutation occurred
     finally:
         vi.close()
 
@@ -297,9 +318,19 @@ def test_reconcile_parses_bytes_directly_never_via_a_reopened_pathname(monkeypat
 @pytest.mark.asyncio
 async def test_original_pathname_replaced_after_secure_read_has_no_effect_on_indexed_content(monkeypatch, tmp_path):
     """Make the original managed pathname unusable/replaced immediately
-    AFTER secure read has already captured its bytes — indexing must not
-    consume the replacement/external content; the already-captured
-    original bytes are what get indexed."""
+    AFTER secure read has already captured its bytes.
+
+    Stage 5C corrective pass #4 (Blocker 5): a mutation landing here used
+    to be harmless-by-omission (the already-captured original bytes got
+    indexed, the replacement was simply never consumed) — but that still
+    left Qdrant/sidecar/catalog describing a snapshot the DURABLE FILE ON
+    DISK no longer matched, which Principle 1 forbids reporting as
+    success. `_load_and_index_document()`'s final pre-activation
+    revalidation (a SECOND secure read, added by Blocker 5) now re-detects
+    this exact mutation and fails ingestion closed instead: the
+    replacement content is still never indexed, but neither is the
+    original snapshot — no document becomes active while the file
+    disagrees with what was captured."""
     uploads_dir = tmp_path / "uploads"
     monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", uploads_dir)
 
@@ -320,10 +351,15 @@ async def test_original_pathname_replaced_after_secure_read_has_no_effect_on_ind
     try:
         await document_upload.process_document_upload(message, document)
 
-        assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
-        results = vi.similarity_search("Content captured before any replacement occurs.", requesting_user_id=1, k=1)
-        assert len(results) == 1
-        assert "REPLACEMENT CONTENT" not in results[0].page_content
+        # This upload went through the REAL Telegram handler (telegram_id=1),
+        # which resolves ownership via app.identity.resolve_user_uuid() ->
+        # db.identity's fixture-faked resolver — not the module-level
+        # _TEST_OWNER_UUID constant used by this file's direct
+        # _load_and_index_document() calls elsewhere.
+        owner_uuid = str(db_identity.resolve_or_create_user_by_telegram_id_sync(1))
+        assert vi.get_stats(requesting_user_uuid=owner_uuid)["total_documents"] == 0
+        results = vi.similarity_search("Content captured before any replacement occurs.", requesting_user_uuid=owner_uuid, k=5)
+        assert all("REPLACEMENT CONTENT" not in r.page_content for r in results)
     finally:
         vi.close()
 
@@ -342,7 +378,7 @@ def test_indexed_payload_carries_no_temp_or_absolute_path(monkeypatch, tmp_path)
     try:
         app_documents._load_and_index_document(stored, "My Report.txt")
 
-        results = vi.similarity_search("Payload privacy check content.", requesting_user_id=1, k=1)
+        results = vi.similarity_search("Payload privacy check content.", requesting_user_uuid=_TEST_OWNER_UUID, k=1)
         assert len(results) == 1
         metadata = results[0].metadata
 
@@ -383,7 +419,11 @@ def test_extension_selects_correct_format_for_in_memory_parsing(monkeypatch, tmp
     def spy_load_document_bytes(source_bytes, **kwargs):
         captured["source_bytes"] = source_bytes
         captured["suffix"] = kwargs.get("suffix")
-        return []
+        # A non-empty stub chunk (Stage 5C corrective pass #4, Blocker 10:
+        # a genuinely empty chunk list is no longer accepted as a
+        # successful ingest) — this test only proves suffix/byte dispatch,
+        # never real chunk content.
+        return [Document(page_content="stub chunk content", metadata={"chunk_index": 0})]
 
     monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", spy_load_document_bytes)
 

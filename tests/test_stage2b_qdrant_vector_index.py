@@ -16,6 +16,7 @@ itself evidence of.
 """
 
 import threading
+import uuid
 
 import pytest
 from langchain_core.documents import Document
@@ -73,7 +74,7 @@ def test_collection_initializes_with_explicit_schema_and_zero_embedding_calls(in
     # Collection creation must never probe embedding dimensions live.
     assert fake.embed_documents_call_count == 0
     assert fake.embed_query_call_count == 0
-    assert vi.get_stats(requesting_user_id=1) == {"total_documents": 0, "status": "ok"}
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4())) == {"total_documents": 0, "status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +85,12 @@ def test_local_persistence_survives_close_and_reopen(tmp_path):
     qdir = tmp_path / "qdrant"
     vi1 = VectorIndex(persist_directory=qdir, embeddings=DeterministicFakeEmbeddings(), collection_name="persist_test")
     vi1.add_documents([_doc("alpha content", "doc1", 0)])
-    assert vi1.get_stats(requesting_user_id=1)["total_documents"] == 1
+    assert vi1.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 1
     vi1.close()
 
     vi2 = VectorIndex(persist_directory=qdir, embeddings=DeterministicFakeEmbeddings(), collection_name="persist_test")
     try:
-        assert vi2.get_stats(requesting_user_id=1)["total_documents"] == 1
+        assert vi2.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 1
     finally:
         vi2.close()
 
@@ -127,7 +128,7 @@ def test_add_documents_upserts_and_count_reflects_chunks(index_factory):
     vi = index_factory()
     chunks = [_doc(f"chunk number {i}", "docA", i) for i in range(5)]
     vi.add_documents(chunks)
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 5
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +162,7 @@ def test_payload_round_trip_preserves_safe_metadata_only(index_factory):
     )
     vi.add_documents([chunk])
 
-    results = vi.similarity_search_with_score("round trip content", requesting_user_id=1, k=1)
+    results = vi.similarity_search_with_score("round trip content", requesting_user_uuid=str(uuid.uuid4()), k=1)
     assert len(results) == 1
     doc, score = results[0]
     assert doc.page_content == "round trip content"
@@ -200,7 +201,7 @@ def test_similarity_search_returns_nearest_first(index_factory):
     # deterministic fake vector that chunk was embedded with (same hash
     # function on both sides), so it must rank first — a fully
     # deterministic nearest-match proof, no manual vector math needed.
-    results = vi.similarity_search_with_score("quantum mechanics textbook", requesting_user_id=1, k=3)
+    results = vi.similarity_search_with_score("quantum mechanics textbook", requesting_user_uuid=str(uuid.uuid4()), k=3)
     assert len(results) == 3
     assert results[0][0].page_content == "quantum mechanics textbook"
     scores = [score for _, score in results]
@@ -216,7 +217,7 @@ def test_duplicate_display_filenames_coexist_as_separate_documents(index_factory
     vi.add_documents([_doc("first upload content", "upload:aaa", 0, source="notes.txt")])
     vi.add_documents([_doc("second upload content", "upload:bbb", 0, source="notes.txt")])
 
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 2
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 2
     assert len(vi._existing_point_ids("upload:aaa")) == 1
     assert len(vi._existing_point_ids("upload:bbb")) == 1
     assert vi._existing_point_ids("upload:aaa") != vi._existing_point_ids("upload:bbb")
@@ -231,7 +232,7 @@ def test_repeated_identical_indexing_is_idempotent(index_factory):
     vi.add_documents([_doc("stable content", "docE", 0)])
     vi.add_documents([_doc("stable content", "docE", 0)])
     vi.add_documents([_doc("stable content", "docE", 0)])
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -242,12 +243,12 @@ def test_replacing_document_with_fewer_chunks_removes_stale_points(index_factory
     vi = index_factory()
     original = [_doc(f"original chunk {i}", "docF", i) for i in range(10)]
     vi.add_documents(original)
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 10
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 10
 
     replacement = [_doc(f"replacement chunk {i}", "docF", i) for i in range(7)]
     vi.add_documents(replacement)
 
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 7
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 7
     remaining_ids = vi._existing_point_ids("docF")
     assert remaining_ids == {point_id("docF", i) for i in range(7)}
     stale_ids = {point_id("docF", i) for i in range(7, 10)}
@@ -260,7 +261,7 @@ def test_embedding_failure_leaves_previous_valid_index_untouched(index_factory, 
     successful upsert of the new set, never before."""
     vi = index_factory()
     vi.add_documents([_doc(f"chunk {i}", "docK", i) for i in range(3)])
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 3
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 3
 
     def failing_embed_documents(texts):
         raise RuntimeError("simulated provider failure")
@@ -271,7 +272,7 @@ def test_embedding_failure_leaves_previous_valid_index_untouched(index_factory, 
         vi.add_documents([_doc("new chunk", "docK", 0)])
 
     # Old points are still fully intact — nothing was deleted first.
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 3
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 3
     assert vi._existing_point_ids("docK") == {point_id("docK", i) for i in range(3)}
 
 
@@ -282,14 +283,14 @@ def test_embedding_failure_leaves_previous_valid_index_untouched(index_factory, 
 def test_clear_index_recreates_collection(index_factory):
     vi = index_factory()
     vi.add_documents([_doc("some content", "docG", 0)])
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 1
 
     vi.clear_index()
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 0
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 0
 
     # Collection is genuinely usable again afterward — not left absent.
     vi.add_documents([_doc("fresh content", "docH", 0)])
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 1
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +315,7 @@ def test_cross_thread_access_succeeds_under_rlock(index_factory):
         assert not t.is_alive()
 
     assert not errors
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 8
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 8
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +349,7 @@ def test_concurrent_search_cannot_bypass_lock_held_by_add_documents(index_factor
     search_done = threading.Event()
 
     def do_search():
-        vi.similarity_search("baseline content", requesting_user_id=1, k=1)
+        vi.similarity_search("baseline content", requesting_user_uuid=str(uuid.uuid4()), k=1)
         with events_lock:
             events.append("search_completed")
         search_done.set()
@@ -389,10 +390,10 @@ def _install_fake_loader(monkeypatch, chunk_count_ref, version_ref):
     this document currently has" across successive reconcile_document()
     calls without fighting the real RecursiveCharacterTextSplitter's exact
     chunk-boundary arithmetic."""
-    def fake_load_document(path, display_name=None, document_id=None, content_sha256=None, stored_name=None, owner_user_id=None):
+    def fake_load_document(path, display_name=None, document_id=None, content_sha256=None, stored_name=None, owner_user_uuid=None):
         extra = {"content_sha256": content_sha256}
-        if owner_user_id is not None:
-            extra["owner_user_id"] = owner_user_id
+        if owner_user_uuid is not None:
+            extra["owner_user_uuid"] = owner_user_uuid
         return [
             _doc(f"{version_ref['v']} chunk {i}", document_id, i, **extra)
             for i in range(chunk_count_ref["n"])
@@ -438,7 +439,7 @@ def test_reconcile_document_exact_current_makes_zero_calls(index_factory, monkey
     assert fake.embed_query_call_count == 0
     assert upsert_calls["n"] == 0
     assert delete_calls["n"] == 0
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 3
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 3
 
 
 def test_reconcile_document_converges_after_stale_delete_failure(index_factory, monkeypatch, tmp_path):
@@ -460,7 +461,7 @@ def test_reconcile_document_converges_after_stale_delete_failure(index_factory, 
 
     status, count = vi.reconcile_document(doc_id, file_path)
     assert status == "reindexed" and count == 10
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 10
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 10
     embed_calls_after_first = fake.embed_documents_call_count
 
     # "Change" the document to 7 chunks (new content -> new hash), but make
@@ -482,7 +483,7 @@ def test_reconcile_document_converges_after_stale_delete_failure(index_factory, 
     # Operation surfaced failure — but the new 7 were already upserted
     # (safe-replacement embeds+upserts BEFORE deleting stale points), so
     # 10 points temporarily remain: the new 7 plus the 3 stale leftovers.
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 10
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 10
     embed_calls_after_failed_replace = fake.embed_documents_call_count
     assert embed_calls_after_failed_replace == embed_calls_after_first + 1
 
@@ -494,7 +495,7 @@ def test_reconcile_document_converges_after_stale_delete_failure(index_factory, 
     assert count2 == 7
     # Zero re-embedding: the retry converges purely by deleting extras.
     assert fake.embed_documents_call_count == embed_calls_after_failed_replace
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 7
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 7
     assert vi._existing_point_ids(doc_id) == {point_id(doc_id, i) for i in range(7)}
 
     # Deterministic: a THIRD call is a complete no-op ("unchanged").
@@ -502,7 +503,7 @@ def test_reconcile_document_converges_after_stale_delete_failure(index_factory, 
     assert status3 == "unchanged"
     assert count3 == 7
     assert fake.embed_documents_call_count == embed_calls_after_failed_replace
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 7
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 7
 
 
 def test_reconcile_document_reindexes_when_an_expected_point_is_missing(index_factory, monkeypatch, tmp_path):
@@ -523,20 +524,20 @@ def test_reconcile_document_reindexes_when_an_expected_point_is_missing(index_fa
     file_path.write_text("v1", encoding="utf-8")
 
     vi.reconcile_document(doc_id, file_path)
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 5
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 5
     embed_calls_before = fake.embed_documents_call_count
 
     # Directly remove one expected point out from under the index (not
     # via reconcile_document — simulating an external partial loss).
     missing_pid = point_id(doc_id, 2)
     vi.client.delete(collection_name=vi.collection_name, points_selector=PointIdsList(points=[missing_pid]))
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 4
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 4
 
     status, count = vi.reconcile_document(doc_id, file_path)
     assert status == "reindexed"
     assert count == 5
     assert fake.embed_documents_call_count == embed_calls_before + 1
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 5
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 5
     assert vi._existing_point_ids(doc_id) == {point_id(doc_id, i) for i in range(5)}
 
 
@@ -553,4 +554,129 @@ def test_reconcile_document_verifies_hash_before_embedding_and_refuses_to_mutate
     with pytest.raises(SourceMutatedError):
         vi.reconcile_document("docMutated", file_path, expected_content_sha256="0" * 64)
 
-    assert vi.get_stats(requesting_user_id=1)["total_documents"] == 0
+    assert vi.get_stats(requesting_user_uuid=str(uuid.uuid4()))["total_documents"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 5C corrective pass #4, Blocker 8: reconcile_document() must never
+# trust a stored `content_sha256` payload FIELD to attest to what a point's
+# `text` payload actually contains — it is ordinary, mutable Qdrant
+# metadata, exactly like `document_id`/`scope`/`chunk_index` elsewhere in
+# this codebase. "unchanged" must mean the ACTUAL stored text still equals
+# the current chunk, verified directly — never inferred from a hash field
+# that could have been left stale by an out-of-band corruption.
+# ---------------------------------------------------------------------------
+
+def test_reconcile_document_repairs_corrupted_text_even_with_unchanged_hash_metadata(index_factory, monkeypatch, tmp_path):
+    """The exact Blocker 8 reproduction: Qdrant TEXT corrupted in place,
+    its content_sha256 metadata field left completely unchanged. Must be
+    repaired (re-embedded), never reported "unchanged"."""
+    fake = DeterministicFakeEmbeddings()
+    vi = index_factory(embeddings=fake)
+    file_path = tmp_path / "doc.txt"
+    doc_id = "docCorruptedText"
+
+    chunk_count_ref = {"n": 1}
+    version_ref = {"v": "v1"}
+    _install_fake_loader(monkeypatch, chunk_count_ref, version_ref)
+    file_path.write_text("v1", encoding="utf-8")
+
+    status, _count = vi.reconcile_document(doc_id, file_path)
+    assert status == "reindexed"
+    pid = point_id(doc_id, 0)
+    original_record = vi.client.retrieve(collection_name=vi.collection_name, ids=[pid], with_payload=True)[0]
+    original_text = original_record.payload["text"]
+    original_hash = original_record.payload.get("content_sha256")
+
+    # Corrupt ONLY the stored text — content_sha256 metadata is left byte-
+    # for-byte unchanged (Qdrant's set_payload() merges given keys, never
+    # touching fields not named here).
+    vi.client.set_payload(
+        collection_name=vi.collection_name,
+        payload={"text": "CORRUPTED TEXT — does not match the real chunk at all"},
+        points=[pid],
+    )
+    corrupted_record = vi.client.retrieve(collection_name=vi.collection_name, ids=[pid], with_payload=True)[0]
+    assert corrupted_record.payload.get("content_sha256") == original_hash  # unchanged, as the audit reproduced
+
+    embed_calls_before = fake.embed_documents_call_count
+    status2, _count2 = vi.reconcile_document(doc_id, file_path)
+
+    assert status2 == "reindexed", "corrupted text must be repaired even though its hash metadata still 'matches'"
+    assert fake.embed_documents_call_count == embed_calls_before + 1
+    repaired_record = vi.client.retrieve(collection_name=vi.collection_name, ids=[pid], with_payload=True)[0]
+    assert repaired_record.payload["text"] == original_text
+
+
+def test_reconcile_document_ignores_corrupted_hash_metadata_when_text_is_actually_correct(index_factory, monkeypatch, tmp_path):
+    """The other half of the same fix: a point whose content_sha256
+    metadata field has been corrupted/gone stale, but whose ACTUAL text is
+    still genuinely correct, must be classified "unchanged" — zero
+    embedding calls. The stored hash field is no longer read for this
+    decision at all, so its own corruption alone must never force an
+    unnecessary re-embed."""
+    fake = DeterministicFakeEmbeddings()
+    vi = index_factory(embeddings=fake)
+    file_path = tmp_path / "doc.txt"
+    doc_id = "docCorruptedHashOnly"
+
+    chunk_count_ref = {"n": 1}
+    version_ref = {"v": "v1"}
+    _install_fake_loader(monkeypatch, chunk_count_ref, version_ref)
+    file_path.write_text("v1", encoding="utf-8")
+
+    status, _count = vi.reconcile_document(doc_id, file_path)
+    assert status == "reindexed"
+    pid = point_id(doc_id, 0)
+
+    # Corrupt ONLY the content_sha256 metadata field — the actual text is
+    # left completely correct.
+    vi.client.set_payload(
+        collection_name=vi.collection_name,
+        payload={"content_sha256": "0" * 64},
+        points=[pid],
+    )
+
+    embed_calls_before = fake.embed_documents_call_count
+    status2, _count2 = vi.reconcile_document(doc_id, file_path)
+
+    assert status2 == "unchanged", "a stale/corrupted hash metadata field alone must never force a re-embed"
+    assert fake.embed_documents_call_count == embed_calls_before  # zero new embedding calls
+
+
+def test_reconcile_document_repairs_when_both_text_and_hash_metadata_are_corrupted(index_factory, monkeypatch, tmp_path):
+    """Both corrupted together — text no longer matches, AND the hash
+    metadata field has ALSO been (independently) tampered with, e.g. to
+    plausibly match the corrupted text. Must still be repaired: only the
+    actual stored text vs. the current real chunk decides."""
+    fake = DeterministicFakeEmbeddings()
+    vi = index_factory(embeddings=fake)
+    file_path = tmp_path / "doc.txt"
+    doc_id = "docBothCorrupted"
+
+    chunk_count_ref = {"n": 1}
+    version_ref = {"v": "v1"}
+    _install_fake_loader(monkeypatch, chunk_count_ref, version_ref)
+    file_path.write_text("v1", encoding="utf-8")
+
+    status, _count = vi.reconcile_document(doc_id, file_path)
+    assert status == "reindexed"
+    pid = point_id(doc_id, 0)
+    original_record = vi.client.retrieve(collection_name=vi.collection_name, ids=[pid], with_payload=True)[0]
+    original_text = original_record.payload["text"]
+
+    corrupted_text = "BOTH CORRUPTED — plausible-looking replacement content"
+    from rag.identity import sha256_hex
+    vi.client.set_payload(
+        collection_name=vi.collection_name,
+        payload={"text": corrupted_text, "content_sha256": sha256_hex(corrupted_text.encode("utf-8"))},
+        points=[pid],
+    )
+
+    embed_calls_before = fake.embed_documents_call_count
+    status2, _count2 = vi.reconcile_document(doc_id, file_path)
+
+    assert status2 == "reindexed"
+    assert fake.embed_documents_call_count == embed_calls_before + 1
+    repaired_record = vi.client.retrieve(collection_name=vi.collection_name, ids=[pid], with_payload=True)[0]
+    assert repaired_record.payload["text"] == original_text

@@ -107,14 +107,17 @@ def test_cleanup_file_returns_false_when_removal_genuinely_fails(tmp_path):
 
 
 def _make_stored_upload(physical_path: Path, sidecar_path: Path):
+    import uuid
     import handlers.document_upload as document_upload
     import app.documents as app_documents
+    document_uuid = uuid.UUID("a" * 32)
     return app_documents.StoredUpload(
         physical_path=physical_path,
         sidecar_path=sidecar_path,
-        document_id="upload:" + "a" * 32,
+        document_id=f"upload:{document_uuid.hex}",
+        document_uuid=document_uuid,
         content_sha256="b" * 64,
-        owner_user_id=1,
+        owner_user_id=uuid.uuid4(),
     )
 
 
@@ -489,8 +492,17 @@ def test_rebuild_help_succeeds_with_no_credentials_and_creates_no_state(isolated
 
 def test_rebuild_dry_run_finds_managed_uploads_when_present(isolated_tree):
     """Same credential-free contract, but with a real managed upload
-    present — proves the dry-run plan genuinely enumerates uploads.dir
-    too, not merely reference documents."""
+    present — proves the dry-run plan genuinely enumerates uploads_dir
+    too, not merely reference documents. This isolated tree deliberately
+    has no `db` package at all (see _copy_importable_tree()), so it also
+    doubles as the Stage 5C corrective pass proof that a syntactically
+    valid v3 sidecar is NEVER, by itself, sufficient to plan a private
+    document for indexing: with the PostgreSQL catalog entirely
+    unreachable (not even importable here), the upload is enumerated but
+    fails closed — reported as skipped, never as a planned document — and
+    the dry run still completes cleanly (exit 0), never crashing merely
+    because the catalog authority happens to be unavailable."""
+    import uuid
     from rag.identity import sha256_hex, upload_document_id
     from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
 
@@ -501,13 +513,17 @@ def test_rebuild_dry_run_finds_managed_uploads_when_present(isolated_tree):
     physical.write_bytes(b"isolated managed upload content")
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "notes.txt", physical.name, sha256_hex(b"isolated managed upload content"), owner_user_id=1),
+        build_sidecar(upload_document_id(stem), "notes.txt", physical.name, sha256_hex(b"isolated managed upload content"), owner_user_uuid=str(uuid.uuid4())),
     )
 
     env = _clean_subprocess_env()
     result = _run(["-m", "scripts.rebuild_qdrant"], cwd=isolated_tree, env=env)
 
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "Managed uploads with valid sidecars found: 1" in result.stdout
+    # A syntactically valid sidecar alone is never sufficient (Stage 5C
+    # corrective pass) — with no reachable/importable PostgreSQL catalog,
+    # this upload fails closed rather than being planned.
+    assert "Managed uploads with valid sidecars found: 0" in result.stdout
+    assert "Managed uploads skipped" in result.stdout
     assert not (isolated_tree / "data" / "qdrant").exists()
     assert not (isolated_tree / "bot.log").exists()

@@ -14,6 +14,7 @@ from langchain_core.document_loaders import Blob
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+import rag.constants as rag_constants
 from rag.constants import (
     BUILTIN_REFERENCE_FILES,
     DOCUMENTS_DIR,
@@ -22,6 +23,7 @@ from rag.constants import (
     RAG_CHUNK_OVERLAP,
     SUPPORTED_EXTENSIONS,
 )
+from rag.identity import point_id as make_point_id, reference_document_id, sha256_hex
 from utils.logging import logger
 
 # SUPPORTED_EXTENSIONS is re-exported here (from rag/constants.py, the
@@ -59,7 +61,7 @@ class DocumentLoader:
         document_id: Optional[str] = None,
         content_sha256: Optional[str] = None,
         stored_name: Optional[str] = None,
-        owner_user_id: Optional[int] = None,
+        owner_user_uuid: Optional[str] = None,
     ) -> List[Dict]:
         """
         Load a single document and split into chunks.
@@ -83,8 +85,8 @@ class DocumentLoader:
             stored_name: Physical storage filename (e.g. the opaque UUID
                 name of a managed upload) — recorded in Qdrant payloads for
                 managed uploads only, never an absolute path.
-            owner_user_id: Telegram numeric id (`from_user.id`) of the
-                managed upload's owner (Stage 3A). `None` for reference
+            owner_user_uuid: Canonical internal user UUID string (Stage 5C)
+                of the managed upload's owner. `None` for reference
                 documents (and for any caller with no real owner to give) —
                 VectorIndex derives `scope="reference"` from that absence.
                 Never guessed/inferred here; the caller (VectorIndex.
@@ -117,7 +119,7 @@ class DocumentLoader:
                 document_id=document_id,
                 content_sha256=content_sha256,
                 stored_name=stored_name,
-                owner_user_id=owner_user_id,
+                owner_user_uuid=owner_user_uuid,
             )
 
             # source_name can be a user-controlled Telegram display filename
@@ -140,7 +142,7 @@ class DocumentLoader:
         document_id: Optional[str] = None,
         content_sha256: Optional[str] = None,
         stored_name: Optional[str] = None,
-        owner_user_id: Optional[int] = None,
+        owner_user_uuid: Optional[str] = None,
     ) -> List[Dict]:
         """
         Parse `source_bytes` directly in memory and split into chunks —
@@ -171,7 +173,7 @@ class DocumentLoader:
                 selects the format the same way load_document()'s
                 `file_path.suffix` does.
             display_name / document_id / content_sha256 / stored_name /
-                owner_user_id: mirror load_document()'s own parameters —
+                owner_user_uuid: mirror load_document()'s own parameters —
                 see there.
 
         Returns:
@@ -198,7 +200,7 @@ class DocumentLoader:
                 document_id=document_id,
                 content_sha256=content_sha256,
                 stored_name=stored_name,
-                owner_user_id=owner_user_id,
+                owner_user_uuid=owner_user_uuid,
             )
 
             logger.info("RAG loader load_document_bytes | extension=%s, chunks=%s", suffix, len(chunks))
@@ -219,7 +221,7 @@ class DocumentLoader:
         document_id: Optional[str],
         content_sha256: Optional[str],
         stored_name: Optional[str],
-        owner_user_id: Optional[int] = None,
+        owner_user_uuid: Optional[str] = None,
     ) -> List[Document]:
         """
         Shared chunk-splitting + metadata tagging for both load_document()
@@ -229,10 +231,11 @@ class DocumentLoader:
         done from in-memory bytes (load_document_bytes() passes None) —
         there is no on-disk pathname to record in that case.
 
-        `owner_user_id` (Stage 3A): tagged onto every chunk's metadata only
-        when given, exactly like document_id/content_sha256/stored_name
-        above — VectorIndex._safe_payload() reads it from here to decide a
-        chunk's Qdrant `scope`. Omitted (never `None`-valued) for reference
+        `owner_user_uuid` (Stage 3A, migrated to canonical UUID Stage 5C):
+        tagged onto every chunk's metadata only when given, exactly like
+        document_id/content_sha256/stored_name above —
+        VectorIndex._safe_payload() reads it from here to decide a chunk's
+        Qdrant `scope`. Omitted (never `None`-valued) for reference
         documents, which have no owner.
         """
         chunks = self.text_splitter.split_documents(documents)
@@ -247,8 +250,8 @@ class DocumentLoader:
                 chunk.metadata['content_sha256'] = content_sha256
             if stored_name is not None:
                 chunk.metadata['stored_name'] = stored_name
-            if owner_user_id is not None:
-                chunk.metadata['owner_user_id'] = owner_user_id
+            if owner_user_uuid is not None:
+                chunk.metadata['owner_user_uuid'] = owner_user_uuid
         return chunks
 
     def list_source_files(self, directory: Path = DOCUMENTS_DIR) -> List[Path]:
@@ -312,6 +315,80 @@ class DocumentLoader:
                 f"missing built-in reference document(s): {sorted(missing)}"
             )
         return found
+
+    def expected_reference_point_hashes(
+        self,
+        directory: Optional[Path] = None,
+        manifest: Sequence[str] = BUILTIN_REFERENCE_FILES,
+    ) -> Dict[str, str]:
+        """
+        The authoritative, independently re-derivable trust anchor for
+        canonical reference provenance (Stage 5C corrective pass #3,
+        Blocker 1): `{expected_qdrant_point_id: expected_content_sha256}`
+        for every chunk the CURRENT version-controlled built-in reference
+        corpus genuinely produces.
+
+        Built by running the EXACT SAME pipeline real reference indexing
+        uses — list_builtin_reference_files() to enumerate the manifest,
+        load_document() (this class's own chunker) to split each file into
+        chunks, rag.identity.reference_document_id() to derive each file's
+        logical document id from its path relative to `directory` (byte-
+        for-byte the same computation VectorIndex.index_documents_
+        directory() performs), and rag.identity.point_id() to derive each
+        chunk's deterministic Qdrant point id — never a second, subtly
+        different chunking/identity implementation.
+
+        Why this closes the Stage 5C corrective-pass #2 gap: that pass
+        classified a Qdrant result as reference merely because its
+        `document_id` PAYLOAD FIELD matched a canonical id — but
+        `document_id` is ordinary, mutable Qdrant payload metadata an
+        adversarial/corrupt point can simply copy. This manifest is keyed
+        by point id (independent of anything a point's own payload
+        claims) and its value is the EXPECTED CONTENT HASH — so a caller
+        (rag/query.py, rag/index.py) must independently verify the
+        ACTUAL, ACTUALLY-RETURNED content hashes to this exact value
+        before ever trusting a result as reference. Copying `scope`,
+        `document_id`, source name, chunk index, or even guessing the
+        correct point id is never sufficient on its own: the returned
+        content itself must be byte-identical to the real canonical chunk.
+
+        Recomputed fresh on every call (no caching) — the built-in corpus
+        is a handful of small, version-controlled files; correctness (an
+        always-current trust anchor, even immediately after an operator
+        edits data/documents/) outweighs the trivial repeated-parse cost.
+        Raises MissingReferenceDocumentError (same as
+        list_builtin_reference_files()) if the manifest itself is
+        incomplete — never silently produces an incomplete trust anchor;
+        callers (rag/query.py) that need "no proven references available"
+        to degrade gracefully rather than fail retrieval/stats outright
+        catch this themselves.
+
+        `directory` defaults to None, read as `rag_constants.DOCUMENTS_DIR`
+        FRESH inside this call (module-attribute access, never a bound
+        top-level default) — mirrors VectorIndex.index_documents_
+        directory()'s own `if directory is None: directory = rag_constants.
+        DOCUMENTS_DIR` pattern (see its comment for the full rationale):
+        a bound default (`directory: Path = DOCUMENTS_DIR`) would capture
+        whatever `rag.constants.DOCUMENTS_DIR` happened to be at THIS
+        MODULE's own first-import time and never see a later redirect
+        (e.g. tests/conftest.py's pytest_configure(), which redirects it
+        to a disposable temp path for the whole session) — this function
+        must always resolve against whatever directory is CURRENT at call
+        time, exactly like every other reference-scan entry point in this
+        codebase.
+        """
+        if directory is None:
+            directory = rag_constants.DOCUMENTS_DIR
+        directory = Path(directory)
+        resolved_root = directory.resolve()
+        expected: Dict[str, str] = {}
+        for file_path in self.list_builtin_reference_files(directory, manifest):
+            relative = file_path.resolve().relative_to(resolved_root).as_posix()
+            document_id = reference_document_id(relative)
+            for chunk in self.load_document(file_path):
+                pid = make_point_id(document_id, chunk.metadata["chunk_index"])
+                expected[pid] = sha256_hex(chunk.page_content.encode("utf-8"))
+        return expected
 
     def load_directory(self, directory: Path = DOCUMENTS_DIR) -> List[Dict]:
         """

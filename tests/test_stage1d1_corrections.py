@@ -222,12 +222,35 @@ async def test_rag_source_filename_not_logged_but_attribution_preserved(monkeypa
     display_name) must reach the user (source attribution is a legitimate,
     intentional feature) but must never appear in operational logs.
     """
+    import uuid
+    import db.documents as db_documents
     import rag.query as rag_query
+    from rag.identity import upload_document_id
+    from rag.index import SCOPE_PRIVATE
 
     confidential_source = "Ivanov_passport_CONFIDENTIAL.pdf"
 
+    # Stage 5C corrective pass #3, Blocker 1: _validated_similarity_search()
+    # now requires independently PROVEN canonical reference provenance
+    # (content-hash-verified against the durable manifest), so a fake
+    # "reference" result would need a real, version-controlled corpus on
+    # disk to validate against. Simplest realistic stand-in here: a
+    # genuinely owned PRIVATE upload — matches this test's actual concern
+    # (source attribution logging), unaffected by provenance classification.
+    requesting_user_uuid = str(uuid.uuid4())
+    doc_uuid = uuid.uuid4()
+    document_id = upload_document_id(doc_uuid.hex)
+    db_documents.create_pending_sync(
+        document_id=doc_uuid, owner_user_id=uuid.UUID(requesting_user_uuid),
+        stored_name=f"{doc_uuid.hex}.pdf", display_name=confidential_source, content_sha256="a" * 64,
+    )
+    db_documents.mark_active_sync(document_id=doc_uuid)
+
     fake_doc = SimpleNamespace(
-        metadata={"source": confidential_source},
+        metadata={
+            "source": confidential_source, "document_id": document_id, "chunk_index": 0,
+            "scope": SCOPE_PRIVATE, "owner_user_uuid": requesting_user_uuid,
+        },
         page_content="Some retrieved passage.",
     )
     monkeypatch.setattr(
@@ -243,7 +266,7 @@ async def test_rag_source_filename_not_logged_but_attribution_preserved(monkeypa
     monkeypatch.setattr(openai_client.client.chat.completions, "create", create_mock)
 
     with caplog.at_level(logging.DEBUG):
-        response = await rag_query.query_knowledge_base("What does my document say?", 1)
+        response = await rag_query.query_knowledge_base("What does my document say?", requesting_user_uuid)
 
     # Source attribution is preserved for the user.
     assert confidential_source in response
@@ -360,7 +383,8 @@ def test_get_stats_never_returns_absolute_path(monkeypatch, tmp_path):
     fake_count_result = SimpleNamespace(count=3)
     monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(return_value=fake_count_result))
 
-    stats = rag_index.get_vector_index().get_stats(requesting_user_id=1)
+    import uuid
+    stats = rag_index.get_vector_index().get_stats(requesting_user_uuid=str(uuid.uuid4()))
 
     assert "persist_directory" not in stats
     assert str(sensitive_dir) not in str(stats)
@@ -370,26 +394,67 @@ def test_get_stats_never_returns_absolute_path(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_stats_command_output_never_contains_absolute_path(monkeypatch, tmp_path):
+    import uuid
+    import db.documents as db_documents
+    import db.identity as db_identity
     import handlers.start as start_handler
     import rag.index as rag_index
+    from rag.identity import upload_document_id
 
     sensitive_dir = tmp_path / "C_Users_confidential_deploy_user" / "qdrant"
     sensitive_dir.mkdir(parents=True)
     monkeypatch.setattr(rag_index.get_vector_index(), "persist_directory", sensitive_dir)
 
-    fake_count_result = SimpleNamespace(count=5)
-    monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(return_value=fake_count_result))
+    # Stage 5C corrective pass #3: /stats no longer derives its count from
+    # a raw client.count() call (see rag.query.get_knowledge_base_stats())
+    # — a genuine, catalog-backed private document is registered instead
+    # so a real nonzero count flows through the actual code path this
+    # command now uses, still proving the same property (no path leak).
+    owner_uuid = db_identity.resolve_or_create_user_by_telegram_id_sync(9103)
+    doc_uuid = uuid.uuid4()
+    db_documents.create_pending_sync(
+        document_id=doc_uuid, owner_user_id=owner_uuid,
+        stored_name=f"{doc_uuid.hex}.txt", display_name="notes.txt", content_sha256="a" * 64,
+    )
+    db_documents.mark_active_sync(document_id=doc_uuid)
+    document_id = upload_document_id(doc_uuid.hex)
+    # Upserted directly (never via add_documents(), which would call the
+    # real production OpenAIEmbeddings and hit the network — blocked by
+    # pytest-socket) — stats/count plumbing only reads payload fields, so
+    # the vector's actual values are irrelevant here.
+    from qdrant_client.http.models import PointStruct
+    from rag.identity import point_id as make_point_id
+    vi = rag_index.get_vector_index()
+    vi.client.upsert(
+        collection_name=vi.collection_name,
+        points=[PointStruct(
+            id=make_point_id(document_id, 0),
+            vector=[0.0] * 1536,
+            payload={
+                "text": "Private content for the path-leak proof.",
+                "document_id": document_id,
+                "chunk_index": 0,
+                "owner_user_uuid": str(owner_uuid),
+                "scope": "private",
+            },
+        )],
+    )
+    try:
+        send_message_mock = AsyncMock()
+        monkeypatch.setattr(start_handler.bot, "send_message", send_message_mock)
 
-    send_message_mock = AsyncMock()
-    monkeypatch.setattr(start_handler.bot, "send_message", send_message_mock)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=9103), chat=SimpleNamespace(id=9103))
+        await start_handler.cmd_stats(message)
 
-    message = SimpleNamespace(from_user=SimpleNamespace(id=9103), chat=SimpleNamespace(id=9103))
-    await start_handler.cmd_stats(message)
-
-    sent_text = send_message_mock.await_args.args[1]
-    assert str(sensitive_dir) not in sent_text
-    assert "confidential_deploy_user" not in sent_text
-    assert "5" in sent_text
+        sent_text = send_message_mock.await_args.args[1]
+        assert str(sensitive_dir) not in sent_text
+        assert "confidential_deploy_user" not in sent_text
+        assert "1" in sent_text
+    finally:
+        # get_vector_index() is a session-wide singleton shared across
+        # every test — this document must not leak into any other test's
+        # count.
+        rag_index.get_vector_index().delete_document(document_id)
 
 
 @pytest.mark.asyncio
@@ -453,12 +518,18 @@ async def test_tts_external_failure_leaks_nothing(monkeypatch, caplog):
 async def test_tts_external_failure_generic_telegram_response(monkeypatch, caplog):
     """End-to-end: a TTS failure inside the voice-mode text flow must reach
     the user only as a generic message."""
+    import db.identity as db_identity
     import handlers.text as text_handler
     from services.openai_client import openai_client
     from app.session import user_sessions as sessions
 
     user_id = 9104
-    sessions.set_mode(user_id, "voice")
+    # The real handler resolves canonical identity before reading mode —
+    # set it under that SAME resolved UUID (fixture-faked, stable per
+    # telegram id — see conftest.py's _default_fake_preferences), never
+    # the raw Telegram id directly.
+    user_uuid = db_identity.resolve_or_create_user_by_telegram_id_sync(user_id)
+    await sessions.set_mode(user_uuid, "voice")
 
     create_mock = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="A short Python tip."))],

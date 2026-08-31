@@ -61,7 +61,18 @@ SUPPORTED_EXTENSIONS = frozenset({'.pdf', '.txt', '.md', '.docx'})
 RAG_CHUNK_SIZE = 1000
 RAG_CHUNK_OVERLAP = 200
 
-QDRANT_COLLECTION_NAME = "python_tutor_knowledge_base"
+# Stage 5C: bumped from "python_tutor_knowledge_base" — private ownership
+# payload moved from a Telegram integer id to the canonical internal user
+# UUID (see rag/index.py), an incompatible contract change. Rather than a
+# mixed integer/string owner collection, this points production at a
+# FRESH, empty collection under a new name; the old collection stays
+# physically present, untouched, under its old name in the same local
+# Qdrant storage directory (never auto-deleted) — inspectable/rollback-able
+# by an operator. Reference documents repopulate the new collection
+# automatically via the normal startup index_documents_directory() path;
+# managed uploads need scripts/migrate_sidecars_v2_to_v3.py followed by
+# `python -m scripts.rebuild_qdrant --apply`.
+QDRANT_COLLECTION_NAME = "python_tutor_knowledge_base_uuid_v1"
 
 # Embedding model (Stage 2B): the current effective LangChain
 # OpenAIEmbeddings default, made explicit rather than left implicit, so

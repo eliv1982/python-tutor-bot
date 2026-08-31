@@ -32,12 +32,14 @@ so the real (gitignored) data/documents directory is never touched.
 
 import itertools
 import re
+import uuid as uuid_module
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import db.identity as db_identity
 import handlers.document_upload as document_upload
 import app.documents as app_documents
 import rag.loader as rag_loader
@@ -46,6 +48,19 @@ from rag.loader import SUPPORTED_EXTENSIONS, document_loader as real_document_lo
 from rag_fakes import DeterministicFakeEmbeddings
 
 UUID_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+
+def _requesting_uuid_for_telegram_id(telegram_id: int) -> str:
+    """The tests below drive uploads through the real Telegram handler
+    (document_upload.process_document_upload), which resolves ownership
+    via app.identity.resolve_user_uuid() -> db.identity's (fixture-faked,
+    see conftest.py's _default_fake_preferences) resolver — stable per
+    telegram_id within a test. Retrieving that same UUID here (rather than
+    a fresh/unrelated one) is what lets these tests query VectorIndex as
+    "the uploader themselves" without hardcoding a Telegram integer as if
+    it were still the canonical Qdrant owner identity."""
+    return str(db_identity.resolve_or_create_user_by_telegram_id_sync(telegram_id))
 
 
 def _make_document_message(
@@ -92,8 +107,12 @@ def _patch_telegram(monkeypatch, file_bytes: bytes, file_path: str = "documents/
 ])
 async def test_path_traversal_impossible_by_construction(monkeypatch, tmp_path, malicious_name):
     monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", Mock(return_value=[]))
-    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", Mock())
+    # reconcile_document() (Stage 2B-F: what _load_and_index_document()
+    # actually calls, superseding the old direct add_documents() call) is
+    # mocked directly rather than its loader/embeddings internals — this
+    # test is about storage mechanics, not indexed content, and must never
+    # reach the real OpenAIEmbeddings network call.
+    monkeypatch.setattr(app_documents.get_vector_index(), "reconcile_document", Mock(return_value=("reindexed", 1)))
 
     _patch_telegram(monkeypatch, b"hello world")
     message, document = _make_document_message(1, malicious_name)
@@ -123,8 +142,12 @@ async def test_path_traversal_impossible_by_construction(monkeypatch, tmp_path, 
 @pytest.mark.asyncio
 async def test_duplicate_original_filenames_do_not_overwrite(monkeypatch, tmp_path):
     monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", Mock(return_value=[]))
-    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", Mock())
+    # reconcile_document() (Stage 2B-F: what _load_and_index_document()
+    # actually calls, superseding the old direct add_documents() call) is
+    # mocked directly rather than its loader/embeddings internals — this
+    # test is about storage mechanics, not indexed content, and must never
+    # reach the real OpenAIEmbeddings network call.
+    monkeypatch.setattr(app_documents.get_vector_index(), "reconcile_document", Mock(return_value=("reindexed", 1)))
 
     _patch_telegram(monkeypatch, b"first content")
     message1, document1 = _make_document_message(1, "notes.txt", file_id="id-1")
@@ -264,7 +287,11 @@ async def test_original_filename_preserved_as_rag_source_not_uuid(monkeypatch, t
         physical_files = [p for p in uploads_dir.iterdir() if not p.name.endswith(".meta.json")]
         assert len(physical_files) == 1
 
-        results = vi.similarity_search("Python is a great language for tutoring.", requesting_user_id=1, k=1)
+        results = vi.similarity_search(
+            "Python is a great language for tutoring.",
+            requesting_user_uuid=_requesting_uuid_for_telegram_id(1),
+            k=1,
+        )
         assert len(results) == 1
         metadata = results[0].metadata
         assert metadata["source"] == "My Study Notes.txt"
@@ -319,7 +346,11 @@ async def test_managed_upload_not_reloaded_with_opaque_source_on_startup_scan(mo
     await document_upload.process_document_upload(message, document)
 
     # Step 2: initial ingest used the original filename as source.
-    results = vi.similarity_search("Python functions are defined with the def keyword.", requesting_user_id=1, k=1)
+    results = vi.similarity_search(
+        "Python functions are defined with the def keyword.",
+        requesting_user_uuid=_requesting_uuid_for_telegram_id(1),
+        k=1,
+    )
     assert len(results) == 1
     assert results[0].metadata["source"] == "python_notes.txt"
 
@@ -478,7 +509,7 @@ async def test_notification_failure_after_successful_ingestion_does_not_rollback
             await document_upload.process_document_upload(message, document)
 
         # Ingestion happened exactly once and was never treated as failed.
-        assert vi.get_stats(requesting_user_id=1)["total_documents"] >= 1
+        assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(1))["total_documents"] >= 1
         created = list(uploads_dir.iterdir())
         assert len(created) == 2, "successfully ingested file + its sidecar must not be deleted"
 
@@ -511,13 +542,29 @@ async def test_exclusive_creation_does_not_overwrite_existing_candidate(monkeypa
     already occupies that path.
     """
     monkeypatch.setattr(app_documents, "MANAGED_UPLOADS_DIR", tmp_path)
-    monkeypatch.setattr(app_documents.document_loader, "load_document_bytes", Mock(return_value=[]))
-    monkeypatch.setattr(app_documents.get_vector_index(), "add_documents", Mock())
+    # reconcile_document() (Stage 2B-F: what _load_and_index_document()
+    # actually calls, superseding the old direct add_documents() call) is
+    # mocked directly rather than its loader/embeddings internals — this
+    # test is about storage mechanics, not indexed content, and must never
+    # reach the real OpenAIEmbeddings network call.
+    monkeypatch.setattr(app_documents.get_vector_index(), "reconcile_document", Mock(return_value=("reindexed", 1)))
 
     colliding_hex = "a" * 32
     fresh_hex = "b" * 32
     existing_path = tmp_path / f"{colliding_hex}.txt"
     existing_path.write_bytes(b"PRECIOUS EXISTING CONTENT")
+
+    # Resolve (and thereby cache, in conftest.py's autouse fake resolver —
+    # see _default_fake_preferences) this test's real owner UUID BEFORE
+    # patching uuid.uuid4() below. Stage 5C corrective pass #5 (Blocker 1)
+    # now freshly re-reads and validates the durable sidecar before
+    # activation, including its owner_user_uuid field — without this
+    # priming call, the global uuid4() patch two lines down would also be
+    # hit by the fake resolver's own internal `uuid.uuid4()` call (the SAME
+    # `uuid` module object, same rationale as the comment below), producing
+    # a non-UUID-shaped SimpleNamespace as this upload's owner id and
+    # therefore a sidecar that fails that fresh validation.
+    _requesting_uuid_for_telegram_id(1)
 
     # First two calls drive the physical-file collision/retry under test;
     # `app_documents.uuid` and `rag.sidecar`'s own `uuid` import are the
@@ -586,7 +633,7 @@ def test_store_document_exclusively_cleans_up_after_write_failure(monkeypatch, t
     monkeypatch.setattr(app_documents, "open", fake_open, raising=False)
 
     with pytest.raises(OSError, match="simulated disk write failure"):
-        app_documents._store_document_exclusively(b"payload bytes", ".txt", "notes.txt", 1)
+        app_documents._store_document_exclusively(b"payload bytes", ".txt", "notes.txt", uuid_module.uuid4())
 
     assert len(created_paths) == 1, "exactly one candidate should have been exclusively created"
     assert not created_paths[0].exists(), "the partially-written file must be cleaned up"

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+import db.documents as db_documents
 from config import MANAGED_UPLOADS_DIR, MAX_DOCUMENT_SIZE_BYTES
 from rag.identity import sha256_hex, upload_document_id
 # document_loader itself is no longer called directly from this module
@@ -36,10 +37,59 @@ from rag.identity import sha256_hex, upload_document_id
 # via this module's own `documents.document_loader` reference.
 from rag.loader import document_loader, SUPPORTED_EXTENSIONS
 from rag.safe_files import read_regular_file_secure
-from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
-from rag.index import get_vector_index
+from rag.sidecar import (
+    PathContainmentError,
+    SidecarError,
+    build_sidecar,
+    parse_sidecar_bytes,
+    resolve_sidecar_path,
+    secure_read_sidecar_bytes,
+    sidecar_path_for,
+    write_sidecar_atomic,
+)
+from rag.index import SourceMutatedError, get_vector_index
 from utils.logging import logger
 from utils.helpers import cleanup_file, submit_worker, await_worker
+
+
+class EmptyDocumentError(ValueError):
+    """
+    Raised by _load_and_index_document() when a document parses/chunks into
+    ZERO meaningful chunks (Stage 5C corrective pass #4, Blocker 10). An
+    independent audit reproduced an empty (or effectively empty) upload
+    becoming a successful, ACTIVE catalog document with zero Qdrant points
+    — success must mean a useful, internally consistent document actually
+    exists (Principle 6). Treated exactly like any other indexing-region
+    failure by ingest_document()'s caller: full compensating cleanup
+    (Qdrant delete_document — a safe no-op here, since nothing was ever
+    written — plus the physical file, sidecar, and the still-'pending'
+    catalog row), reported as success=False. Deliberately a fixed, safe
+    message; never embeds the document content or path.
+    """
+
+
+class SidecarConsistencyError(ValueError):
+    """
+    Raised by _load_and_index_document() when the durable v3 sidecar's
+    CURRENT content — freshly re-read and validated immediately before
+    catalog activation — no longer matches the exact identity/state
+    contract this upload was stored with (Stage 5C corrective pass #5,
+    Blocker 1).
+
+    An independent audit reproduced live ingestion checking the physical
+    file and the PostgreSQL catalog at the final success boundary but
+    NEVER re-validating the durable sidecar itself: the sidecar was
+    mutated (a different owner/display_name/content_sha256, or replaced
+    with malformed content) after storage while the physical file was left
+    completely unchanged, and ingestion still reported success — leaving
+    an active catalog row + indexed Qdrant content + unchanged physical
+    file that all agreed with each other, but disagreed with the durable
+    sidecar. Treated exactly like any other indexing-region failure by
+    ingest_document()'s caller: full compensating cleanup (Qdrant
+    delete_document, physical file, sidecar, and the still-'pending'
+    catalog row), reported as success=False. Deliberately a fixed, safe
+    message; never embeds the sidecar's content or any path.
+    """
 
 
 @dataclass(frozen=True)
@@ -49,17 +99,27 @@ class StoredUpload:
     creating them — everything the later load/index step and any cleanup
     path need, without re-deriving or re-reading anything.
 
-    owner_user_id (Stage 3A): the immutable Telegram numeric id
-    (`from_user.id`) captured once, at storage time, by
+    owner_user_id (Stage 5C): the canonical internal user UUID, resolved
+    by the Telegram adapter via app/identity.py BEFORE this module is ever
+    called — captured once, at storage time, by
     `_store_document_exclusively()` — already durably persisted in the
-    sidecar by that point. Carried here so `_load_and_index_document()`
-    can pass it straight to `VectorIndex.reconcile_document()` without
-    re-deriving or re-reading it from anywhere."""
+    sidecar (as `owner_user_uuid`) and the PostgreSQL documents catalog by
+    that point. Carried here so `_load_and_index_document()` can pass it
+    straight to `VectorIndex.reconcile_document()` without re-deriving or
+    re-reading it from anywhere.
+
+    document_uuid (Stage 5C): the upload's own storage UUID (the physical
+    filename's stem, parsed as a uuid.UUID) — the SAME value used as the
+    PostgreSQL `documents.id` primary key and embedded in the RAG
+    document_id string (`upload_document_id()` just prefixes it with
+    "upload:"). Carried here so DB catalog calls never need to re-parse
+    `physical_path.stem` at each of their call sites."""
     physical_path: Path
     sidecar_path: Path
     document_id: str
+    document_uuid: uuid.UUID
     content_sha256: str
-    owner_user_id: int
+    owner_user_id: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -93,20 +153,24 @@ class DocumentIngestResult:
 
 
 def _store_document_exclusively(
-    file_bytes: bytes, extension: str, display_name: str, owner_user_id: int, attempts: int = 5
+    file_bytes: bytes, extension: str, display_name: str, owner_user_id: uuid.UUID, attempts: int = 5
 ) -> StoredUpload:
     """
     Atomically claim a fresh, opaque, application-generated storage path,
     write the document bytes into it in the same exclusive-create
-    operation, then write its durable `.meta.json` sidecar (Stage 2B) —
-    the physical file and its sidecar together are the durable source of
+    operation, then write its durable `.meta.json` sidecar (Stage 2B) and
+    its PostgreSQL catalog row (Stage 5C, status='pending') — the physical
+    file and its sidecar together remain the durable CONTENT source of
     truth for this upload, independent of whatever is or isn't currently
-    in Qdrant.
+    in Qdrant; the catalog row is the durable identity/ownership/lifecycle
+    record alongside them.
 
-    `owner_user_id` (Stage 3A): the uploader's immutable Telegram numeric
-    id, persisted into the sidecar via `build_sidecar()` so ownership
+    `owner_user_id` (Stage 5C): the canonical internal user UUID (resolved
+    by the Telegram adapter via app/identity.py before this module is ever
+    called), persisted into both the sidecar (`owner_user_uuid`, via
+    `build_sidecar()`) and the PostgreSQL `documents` row so ownership
     survives a process restart and is available independently of any
-    Telegram session state — see rag/sidecar.py.
+    Telegram session state — see rag/sidecar.py and db/documents.py.
 
     Each candidate is opened with 'xb' (O_CREAT | O_EXCL). Ownership
     boundary: a FileExistsError from that open call means nothing was
@@ -134,16 +198,29 @@ def _store_document_exclusively(
         try:
             with handle:
                 handle.write(file_bytes)
-        except Exception:
+        except Exception as e:
             # Ownership of `candidate` was established by the open() above,
             # so cleaning it up here can never remove another attempt's
             # file. cleanup_file() already swallows its own errors, so this
             # cannot mask the original write/close exception re-raised
             # below.
-            cleanup_file(candidate)
+            #
+            # Stage 5C corrective pass #2 (Section 4): the REAL outcome of
+            # this cleanup — not just "an attempt was made" — is attached
+            # to the exception itself. ingest_document()'s except-block has
+            # no StoredUpload to hand to _cleanup_new_upload() at this
+            # point (this function never got to construct/return one), so
+            # without this it would have no way to know cleanup actually
+            # failed and would default to reporting `cleanup_complete=True`
+            # even though the partially-written file is still on disk. The
+            # original exception type/message is preserved unchanged (a
+            # plain attribute, not a wrapper) — existing callers that match
+            # on the exact exception type/text are unaffected.
+            e.partial_storage_cleanup_complete = cleanup_file(candidate)
             raise
 
         document_id = upload_document_id(candidate.stem)
+        document_uuid = uuid.UUID(candidate.stem)
         content_sha256 = sha256_hex(file_bytes)
         sidecar_path = sidecar_path_for(candidate)
         try:
@@ -154,17 +231,59 @@ def _store_document_exclusively(
                     display_name=display_name,
                     stored_name=candidate.name,
                     content_sha256=content_sha256,
-                    owner_user_id=owner_user_id,
+                    owner_user_uuid=str(owner_user_id),
                 ),
             )
-        except Exception:
-            cleanup_file(candidate)
+        except Exception as e:
+            # Same rationale as the write-failure branch above: attach the
+            # real cleanup outcome, never let the caller default to
+            # cleanup_complete=True just because it has no StoredUpload.
+            e.partial_storage_cleanup_complete = cleanup_file(candidate)
+            raise
+
+        try:
+            db_documents.create_pending_sync(
+                document_id=document_uuid,
+                owner_user_id=owner_user_id,
+                stored_name=candidate.name,
+                display_name=display_name,
+                content_sha256=content_sha256,
+            )
+        except Exception as e:
+            # By this point the sidecar already exists durably (unlike the
+            # write-failure branches above, which run before it does) — a
+            # catalog-insert failure must clean up the physical file, the
+            # sidecar, AND (Stage 5C corrective pass #3, Blocker 3) the
+            # PostgreSQL catalog row itself: create_pending_sync()'s own
+            # session.commit() can, in principle, durably commit its
+            # INSERT and still raise back to this except-block (e.g. the
+            # acknowledgement is lost) — this call has no StoredUpload to
+            # hand to the normal cleanup path in that case, and must never
+            # assume "the insert failed, so nothing to clean up in the DB".
+            # reconcile_ambiguous_create_pending_sync() only ever removes a
+            # row that exactly matches what THIS call was attempting to
+            # insert (never a blind delete-by-id), so a genuinely
+            # pre-existing, unrelated/mismatching row is reported as an
+            # incomplete cleanup rather than silently destroyed. Complete
+            # only if every one of the three artifacts is actually gone
+            # afterward.
+            physical_removed = cleanup_file(candidate)
+            sidecar_removed = cleanup_file(sidecar_path)
+            db_removed = db_documents.reconcile_ambiguous_create_pending_sync(
+                document_id=document_uuid,
+                owner_user_id=owner_user_id,
+                stored_name=candidate.name,
+                display_name=display_name,
+                content_sha256=content_sha256,
+            )
+            e.partial_storage_cleanup_complete = physical_removed and sidecar_removed and db_removed
             raise
 
         return StoredUpload(
             physical_path=candidate,
             sidecar_path=sidecar_path,
             document_id=document_id,
+            document_uuid=document_uuid,
             content_sha256=content_sha256,
             owner_user_id=owner_user_id,
         )
@@ -172,7 +291,60 @@ def _store_document_exclusively(
     raise RuntimeError("Could not allocate a unique document storage path") from last_collision_error
 
 
-def _load_and_index_document(stored: StoredUpload, display_name: str) -> int:
+def _validate_current_sidecar_matches(stored: StoredUpload, display_name: str) -> None:
+    """
+    Freshly re-read and validate the durable v3 sidecar against the exact
+    identity/state contract `stored` was written with (Stage 5C corrective
+    pass #5, Blocker 1) — see SidecarConsistencyError's own docstring for
+    the defect this closes.
+
+    Reuses the SAME hardened containment/secure-read/schema-validation
+    primitives rebuild (scripts/rebuild_qdrant.py's
+    `_validate_upload_candidate()`) and migration
+    (scripts/migrate_sidecars_v2_to_v3.py's `_validate_candidate()`) already
+    use — `resolve_sidecar_path()` (containment, never a symlink),
+    `secure_read_sidecar_bytes()` (single secure open, no TOCTOU reopen),
+    and `parse_sidecar_bytes()` (full schema validation) — never a second,
+    weaker sidecar-parsing implementation of its own.
+
+    Checks the COMPLETE expected sidecar contract, not just the content
+    hash: schema_version (must still be the current v3 shape),
+    document_id, owner_user_uuid, stored_name, display_name, and
+    content_sha256 must all still agree with what `stored` (captured once,
+    at storage time — see `_store_document_exclusively()`) and this
+    ingestion's own `display_name` argument say they should be. Any
+    containment/secure-read/schema failure, or any single field
+    disagreeing, raises SidecarConsistencyError — the caller
+    (`_load_and_index_document()`) treats this exactly like any other
+    indexing-region failure: no success is ever reported, and the caller's
+    existing exception path rolls everything back (Qdrant points, the
+    still-'pending' catalog row, the physical file, and the sidecar) via
+    `_cleanup_new_upload()`.
+    """
+    try:
+        sidecar_path = resolve_sidecar_path(MANAGED_UPLOADS_DIR, stored.physical_path)
+        sidecar_bytes = secure_read_sidecar_bytes(MANAGED_UPLOADS_DIR, sidecar_path)
+        sidecar = parse_sidecar_bytes(sidecar_bytes)
+    except (PathContainmentError, SidecarError) as e:
+        raise SidecarConsistencyError(stored.document_id) from e
+
+    if (
+        sidecar.get("schema_version") != 3
+        or sidecar.get("document_id") != stored.document_id
+        or sidecar.get("owner_user_uuid") != str(stored.owner_user_id)
+        or sidecar.get("stored_name") != stored.physical_path.name
+        or sidecar.get("display_name") != display_name
+        or sidecar.get("content_sha256") != stored.content_sha256
+    ):
+        raise SidecarConsistencyError(stored.document_id)
+
+
+def _load_and_index_document(
+    stored: StoredUpload,
+    display_name: str,
+    *,
+    _test_post_index_hook: Optional[Callable[[], None]] = None,
+) -> int:
     """
     Runs document parsing (PyPDFLoader/TextLoader/Docx2txtLoader, CPU/disk
     bound) and Qdrant indexing (OpenAIEmbeddings network call + vector-store
@@ -218,8 +390,108 @@ def _load_and_index_document(stored: StoredUpload, display_name: str) -> int:
         stored_name=stored.physical_path.name,
         expected_content_sha256=stored.content_sha256,
         source_bytes=secure_bytes,
-        owner_user_id=stored.owner_user_id,
+        owner_user_uuid=str(stored.owner_user_id),
     )
+
+    # Stage 5C corrective pass #4 (Blocker 10): a document that parses/
+    # chunks into ZERO meaningful chunks must never become an active
+    # catalog document with nothing actually indexed for it. Checked BEFORE
+    # mark_active_sync() — the still-'pending' row and the (never-written)
+    # Qdrant points are then cleaned up exactly like any other indexing
+    # failure by ingest_document()'s caller.
+    if chunk_count == 0:
+        raise EmptyDocumentError(stored.document_id)
+
+    if _test_post_index_hook is not None:
+        # Test-only seam (mirrors rag.safe_files.read_regular_file_secure()'s
+        # own `_test_pre_open_hook` convention) — called ONLY so a test can
+        # deterministically mutate the physical file in the exact window
+        # this function's own final revalidation below exists to close.
+        # Every real caller leaves this None, making it a complete no-op in
+        # production.
+        _test_post_index_hook()
+
+    # Stage 5C corrective pass #4 (Blocker 5): `secure_bytes` above is a
+    # SINGLE secure snapshot of the physical file, taken once at the top of
+    # this function — reconcile_document() indexed exactly those bytes
+    # (never reopening the file), so Qdrant is now provably consistent with
+    # THAT snapshot. But a snapshot only proves the file's content as of
+    # the moment it was read; a concurrent rewrite of the physical file
+    # landing AFTER that read (and before this ingestion actually commits)
+    # would leave Qdrant/sidecar/catalog all self-consistently describing
+    # the OLD snapshot while the DURABLE FILE ON DISK silently disagrees
+    # with all three. Success must never be reported in that state
+    # (Principle 1: durable source state must be bound to the exact bytes
+    # that were indexed and committed). One more secure read, immediately
+    # before activation, re-verifies the physical file's CURRENT hash still
+    # matches the exact snapshot that was actually indexed; any
+    # disagreement raises SourceMutatedError here, BEFORE mark_active_sync()
+    # ever runs, so the catalog row is never activated on stale/
+    # inconsistent state — the caller's existing exception path then rolls
+    # everything back (Qdrant points, the still-'pending' row, the file,
+    # and the sidecar) via _cleanup_new_upload().
+    revalidation_bytes = read_regular_file_secure(stored.physical_path, root=MANAGED_UPLOADS_DIR)
+    if sha256_hex(revalidation_bytes) != stored.content_sha256:
+        raise SourceMutatedError(stored.document_id)
+
+    # Stage 5C corrective pass #5 (Blocker 1): the physical-file
+    # revalidation immediately above proves the FILE still matches what was
+    # indexed, but says nothing about the durable v3 SIDECAR — a separate
+    # durable artifact this application also treats as source-of-truth
+    # metadata (see rag/sidecar.py). An independent audit mutated the
+    # sidecar's owner_user_uuid/display_name/content_sha256 (or replaced it
+    # with malformed content) AFTER storage while leaving the physical file
+    # byte-for-byte unchanged — the physical-file check above saw no
+    # disagreement, and the catalog check further below never reads the
+    # sidecar at all, so ingestion still reported success with an active
+    # catalog row + indexed Qdrant content + unchanged file that all agreed
+    # with each other but disagreed with the durable sidecar. Freshly
+    # re-read and validated here, immediately before activation, reusing
+    # the exact same hardened secure-read/schema-validation primitives
+    # rebuild/migration already use (rag.sidecar.resolve_sidecar_path() /
+    # secure_read_sidecar_bytes() / parse_sidecar_bytes()) rather than a
+    # second, weaker check.
+    _validate_current_sidecar_matches(stored, display_name)
+
+    # Stage 5C corrective pass (Section 1): flip the catalog row to
+    # 'active' now that indexing has genuinely committed to Qdrant, then
+    # PROVE the resulting row actually matches what was just ingested.
+    # Deliberately NOT best-effort any more: an ingestion operation must
+    # never report success while its durable catalog state is missing,
+    # still 'pending', or inconsistent with the file/sidecar/Qdrant state
+    # it claims to describe. Any failure here (mark_active_sync() raising,
+    # or the verification below disagreeing) propagates straight out of
+    # this function — it runs inside the same executor-thread worker
+    # ingest_document() already treats as one indexing-region unit, so an
+    # exception here is handled exactly like a Qdrant/embedding failure by
+    # the caller: full compensating cleanup via _cleanup_new_upload()
+    # (Qdrant points, physical file, sidecar, and the catalog row itself),
+    # then reported as success=False. No open database transaction spans
+    # this call and the Qdrant mutation above — mark_active_sync() commits
+    # its own short transaction; a failure here triggers explicit
+    # compensating cleanup afterward, never a distributed transaction.
+    db_documents.mark_active_sync(document_id=stored.document_uuid)
+
+    # Stage 5C corrective pass #2 (Section 3): the verification below must
+    # cover EVERY catalog field that identifies the just-ingested durable
+    # document — id, owner, stored_name, display_name, content_sha256, and
+    # active status. A prior version of this check omitted display_name
+    # entirely, so a document could be reported as successfully ingested
+    # even with a mismatched PostgreSQL display name.
+    record = db_documents.get_sync(document_id=stored.document_uuid)
+    if (
+        record is None
+        or record.id != stored.document_uuid
+        or record.status not in db_documents.ACTIVE_STATUSES
+        or record.owner_user_id != stored.owner_user_id
+        or record.stored_name != stored.physical_path.name
+        or record.display_name != display_name
+        or record.content_sha256 != stored.content_sha256
+    ):
+        raise db_documents.CatalogConsistencyError(
+            "catalog row does not correspond to the durable document just ingested"
+        )
+
     return chunk_count
 
 
@@ -234,13 +506,14 @@ def _cleanup_new_upload(stored: StoredUpload) -> bool:
     some/all of these were never created.
 
     Stage 2B-C Section J / Stage 2B-D Section C: returns True ONLY if every
-    cleanup component — Qdrant delete, physical-file unlink, AND sidecar
-    unlink — actually completed. Before Stage 2B-D, a filesystem unlink
-    failure was invisible here: `utils.helpers.cleanup_file()` swallowed
-    unlink errors and returned nothing, so this function could return True
-    even though a durable artifact physically remained on disk. It now
-    aggregates `cleanup_file()`'s own real per-file outcome (Stage 2B-D
-    Blocker 2) alongside the Qdrant outcome. This function never raises, so
+    cleanup component — Qdrant delete, physical-file unlink, sidecar
+    unlink, AND (Stage 5C) DB catalog row delete — actually completed.
+    Before Stage 2B-D, a filesystem unlink failure was invisible here:
+    `utils.helpers.cleanup_file()` swallowed unlink errors and returned
+    nothing, so this function could return True even though a durable
+    artifact physically remained on disk. It now aggregates
+    `cleanup_file()`'s own real per-file outcome (Stage 2B-D Blocker 2)
+    alongside the Qdrant and DB outcomes. This function never raises, so
     callers already resolving a failure/cancellation can still safely call
     it unconditionally.
     """
@@ -251,13 +524,20 @@ def _cleanup_new_upload(stored: StoredUpload) -> bool:
         logger.warning("Document upload cleanup: Qdrant delete_document failed (filesystem cleanup still attempted) | error_type=%s", type(e).__name__)
         qdrant_removed = False
 
+    db_row_removed = True
+    try:
+        db_documents.delete_sync(document_id=stored.document_uuid)
+    except Exception as e:
+        logger.warning("Document upload cleanup: catalog row delete failed | error_type=%s", type(e).__name__)
+        db_row_removed = False
+
     physical_removed = cleanup_file(stored.physical_path)
     sidecar_removed = cleanup_file(stored.sidecar_path)
 
-    return qdrant_removed and physical_removed and sidecar_removed
+    return qdrant_removed and db_row_removed and physical_removed and sidecar_removed
 
 
-def _resolve_cancelled_storage(storage_future: "asyncio.Future", user_id: int) -> None:
+def _resolve_cancelled_storage(storage_future: "asyncio.Future", user_id: uuid.UUID) -> None:
     """
     Called from `ingest_document()`'s `except asyncio.CancelledError:`
     handler around the storage step, after `await_worker(storage_future)`
@@ -289,12 +569,20 @@ def _resolve_cancelled_storage(storage_future: "asyncio.Future", user_id: int) -
         "Document upload: cancelled during storage, removing orphaned file | user_id=%s",
         user_id
     )
+    # By the time storage_future reached this terminal state, the DB
+    # catalog row was already created (create_pending_sync() runs inside
+    # the same worker call, before _store_document_exclusively() returns)
+    # — clean it up alongside the physical file and sidecar.
+    try:
+        db_documents.delete_sync(document_id=stored.document_uuid)
+    except Exception as e:
+        logger.warning("Document upload: cancelled-storage cleanup, catalog row delete failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
     cleanup_file(stored.physical_path)
     cleanup_file(stored.sidecar_path)
 
 
 def _resolve_cancelled_after_storage(
-    index_future: "Optional[asyncio.Future]", stored: StoredUpload, user_id: int
+    index_future: "Optional[asyncio.Future]", stored: StoredUpload, user_id: uuid.UUID
 ) -> None:
     """
     Called from `ingest_document()`'s `except asyncio.CancelledError:`
@@ -368,12 +656,14 @@ async def ingest_document(
     file_bytes: bytes,
     extension: str,
     display_name: str,
-    owner_user_id: int,
+    owner_user_id: uuid.UUID,
     *,
     before_indexing: Optional[Callable[[], Awaitable[None]]] = None,
+    _test_post_index_hook: Optional[Callable[[], None]] = None,
 ) -> DocumentIngestResult:
     """
-    Adapter-independent document ingestion transaction (Stage 5B).
+    Adapter-independent document ingestion transaction (Stage 5B,
+    identity migrated to canonical UUID ownership Stage 5C).
 
     Validates the extension and (against the actual bytes) the size limit,
     then runs storage + indexing as a single unit and returns a structured
@@ -400,6 +690,11 @@ async def ingest_document(
     A plain (non-cancellation) exception from the hook is likewise treated
     exactly like any other indexing-region failure: rolled back via
     `_cleanup_new_upload()` and reported as `success=False`.
+
+    `_test_post_index_hook`, if given, is passed straight through to
+    `_load_and_index_document()` — see its own docstring (Stage 5C
+    corrective pass #4, Blocker 5). Test-only; every real caller leaves
+    this None.
     """
     if extension not in SUPPORTED_EXTENSIONS:
         return DocumentIngestResult(success=False, rejected_reason="unsupported_extension")
@@ -447,7 +742,17 @@ async def ingest_document(
             # blocking pipeline — same submit_worker()/await_worker()
             # pattern: repeated cancellation here must not race the worker
             # for ownership of `stored.physical_path`.
-            index_future = submit_worker(_load_and_index_document, stored, display_name)
+            # _test_post_index_hook is passed as an extra kwarg ONLY when
+            # actually given — never unconditionally — so a test that
+            # monkeypatches `_load_and_index_document` with a double
+            # matching the ordinary (stored, display_name) signature (the
+            # overwhelming majority of this codebase's existing tests)
+            # keeps working unchanged; only a test that deliberately opts
+            # into this hook needs to accept the extra keyword.
+            index_kwargs = {}
+            if _test_post_index_hook is not None:
+                index_kwargs["_test_post_index_hook"] = _test_post_index_hook
+            index_future = submit_worker(_load_and_index_document, stored, display_name, **index_kwargs)
             chunk_count = await await_worker(index_future)
         except asyncio.CancelledError:
             _resolve_cancelled_after_storage(index_future, stored, owner_user_id)
@@ -468,6 +773,25 @@ async def ingest_document(
             cleanup_complete = _cleanup_new_upload(stored)
             if not cleanup_complete:
                 logger.warning("Document upload: cleanup incomplete after upload failure | user_id=%s", owner_user_id)
+        else:
+            # Stage 5C corrective pass #2 (Section 4): `stored` is None
+            # whenever storage itself failed (_store_document_exclusively()
+            # raised before ever returning a StoredUpload) — there is no
+            # owned StoredUpload to hand to _cleanup_new_upload() here, but
+            # that function ALREADY performed its own best-effort cleanup
+            # internally and knows whether it actually succeeded. Reading
+            # that real outcome off the exception (when present) is what
+            # stops this branch from defaulting to a blind
+            # cleanup_complete=True that could misreport a physical file
+            # genuinely left behind on disk. Absent for any other
+            # exception (e.g. the storage-path-exhaustion RuntimeError,
+            # which never created an artifact to begin with) — True stays
+            # correct there.
+            partial_cleanup_complete = getattr(e, "partial_storage_cleanup_complete", None)
+            if partial_cleanup_complete is not None:
+                cleanup_complete = partial_cleanup_complete
+                if not cleanup_complete:
+                    logger.warning("Document upload: cleanup incomplete after partial storage failure | user_id=%s", owner_user_id)
         return DocumentIngestResult(
             success=False, error_type=type(e).__name__, cleanup_complete=cleanup_complete
         )

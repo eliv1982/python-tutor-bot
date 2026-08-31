@@ -51,19 +51,28 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from rag.identity import is_canonical_uuid_str
 from rag.loader import SUPPORTED_EXTENSIONS
 from rag.safe_files import SecureReadError, read_regular_file_secure
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # v1 sidecars (written before Stage 3A) carry no ownership field at all —
 # they predate per-user Qdrant isolation entirely. Still readable (never
 # silently discarded), but `parse_sidecar_bytes()` below always returns an
-# explicit `owner_user_id: None` for them, and every caller that reconciles
-# a managed upload into Qdrant must treat that `None` as "unowned, unknown,
-# fail closed" — never as an implicit reference/shared document, and never
-# guessed from any other source. Every sidecar written from this point on
-# is schema_version=2 — see `build_sidecar()`.
+# explicit `owner_user_id: None` (and `owner_user_uuid: None`) for them,
+# and every caller that reconciles a managed upload into Qdrant must treat
+# that `None` as "unowned, unknown, fail closed" — never as an implicit
+# reference/shared document, and never guessed from any other source.
+#
+# v2 sidecars (Stage 3A through Stage 5B) carry `owner_user_id: int` — the
+# Telegram numeric id. Still readable (migration input for
+# scripts/migrate_sidecars_v2_to_v3.py), but nothing writes v2 anymore.
+#
+# v3 (Stage 5C, current default — see `build_sidecar()`) carries
+# `owner_user_uuid: str` — the canonical internal user UUID — instead of
+# the Telegram integer. Telegram id is no longer canonical ownership
+# identity anywhere in RAG storage; see rag/index.py.
 REQUIRED_FIELDS_V1 = frozenset({
     "schema_version",
     "document_id",
@@ -72,7 +81,8 @@ REQUIRED_FIELDS_V1 = frozenset({
     "content_sha256",
 })
 REQUIRED_FIELDS_V2 = REQUIRED_FIELDS_V1 | {"owner_user_id"}
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
+REQUIRED_FIELDS_V3 = REQUIRED_FIELDS_V1 | {"owner_user_uuid"}
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 # `upload:<32 lowercase hex UUID stem>` — the exact shape
 # rag.identity.upload_document_id() produces from a storage UUID's
@@ -102,16 +112,16 @@ def sidecar_path_for(physical_path: Path) -> Path:
     return physical_path.with_suffix(".meta.json")
 
 
-def build_sidecar(document_id: str, display_name: str, stored_name: str, content_sha256: str, owner_user_id: int) -> Dict[str, Any]:
+def build_sidecar(document_id: str, display_name: str, stored_name: str, content_sha256: str, owner_user_uuid: str) -> Dict[str, Any]:
     """
-    Build a fresh (always schema_version=2) sidecar record.
+    Build a fresh (always schema_version=3) sidecar record.
 
-    `owner_user_id` is the immutable numeric Telegram user id (`from_user.id`
-    — see utils/access_control.py) of the uploader, captured once at upload
-    time and never re-derived later (Stage 3A). Required, never optional:
-    every NEW managed upload has a real, known uploader — there is no such
-    thing as a fresh upload with no owner. A caller with no real id to give
-    has no business calling this function at all.
+    `owner_user_uuid` is the canonical internal user UUID (Stage 5C — see
+    app/identity.py), as a canonical lowercase-hyphenated string, captured
+    once at upload time and never re-derived later. Required, never
+    optional: every NEW managed upload has a real, known owner — there is
+    no such thing as a fresh upload with no owner. A caller with no real
+    UUID to give has no business calling this function at all.
     """
     return {
         "schema_version": SCHEMA_VERSION,
@@ -119,7 +129,7 @@ def build_sidecar(document_id: str, display_name: str, stored_name: str, content
         "display_name": display_name,
         "stored_name": stored_name,
         "content_sha256": content_sha256,
-        "owner_user_id": owner_user_id,
+        "owner_user_uuid": owner_user_uuid,
     }
 
 
@@ -243,11 +253,16 @@ def parse_sidecar_bytes(raw_bytes: bytes) -> Dict[str, Any]:
     if type(schema_version) is not int or schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         raise SidecarError(f"unsupported sidecar schema_version: {schema_version!r}")
 
-    # v1 (pre-Stage-3A) sidecars carry no `owner_user_id` at all — required
-    # fields differ by version so a v1 sidecar is never rejected merely for
-    # lacking a field it was never written with, and a v2 sidecar missing
-    # `owner_user_id` is never silently treated as "no owner" (see below).
-    required_fields = REQUIRED_FIELDS_V2 if schema_version == 2 else REQUIRED_FIELDS_V1
+    # Required fields differ by version, so a v1 sidecar is never rejected
+    # merely for lacking a field it was never written with, and a v2/v3
+    # sidecar missing its own owner field is never silently treated as "no
+    # owner" (see below).
+    if schema_version == 3:
+        required_fields = REQUIRED_FIELDS_V3
+    elif schema_version == 2:
+        required_fields = REQUIRED_FIELDS_V2
+    else:
+        required_fields = REQUIRED_FIELDS_V1
 
     missing = required_fields - data.keys()
     if missing:
@@ -289,7 +304,34 @@ def parse_sidecar_bytes(raw_bytes: bytes) -> Dict[str, Any]:
     if not _CONTENT_SHA256_RE.match(data["content_sha256"]):
         raise SidecarError("sidecar content_sha256 must be exactly 64 lowercase hex characters")
 
-    if schema_version == 2:
+    # v1/v2 (legacy, migration input only — never written by build_sidecar()
+    # any more) always carry BOTH `owner_user_id` (int|None) and
+    # `owner_user_uuid` (str|None) in their returned dict — exactly one
+    # populated, the other explicitly None — extending the pre-existing
+    # v1-synthesizes-`owner_user_id:None` behavior uniformly across both
+    # legacy versions, so legacy-data callers get one self-documenting
+    # shape (`if sidecar["owner_user_uuid"] is not None:`) instead of
+    # having to presence-check which key exists. Neither is ever rejected
+    # merely for predating the field it doesn't have; a caller that reads
+    # a None here must treat it as "unowned/legacy, fail closed" — never
+    # guessed, never silently promoted to a shared/reference document,
+    # never exposed to every authorized user — see
+    # scripts/rebuild_qdrant.py's `_plan_upload_documents()`.
+    #
+    # v3 (current, the only version build_sidecar() ever writes) does NOT
+    # get a synthetic `owner_user_id` added — its returned dict is exactly
+    # what was read plus validation, nothing more, so
+    # `load_sidecar(write_sidecar_atomic(build_sidecar(...)))` round-trips
+    # to precisely the same dict build_sidecar() produced. No production
+    # code path reads `sidecar["owner_user_id"]` without first checking
+    # schema_version == 2, so v3 dicts have no need to carry that key at
+    # all (present-as-None or otherwise).
+    data = dict(data)
+    if schema_version == 3:
+        owner_user_uuid = data["owner_user_uuid"]
+        if not is_canonical_uuid_str(owner_user_uuid):
+            raise SidecarError("sidecar field 'owner_user_uuid' must be a canonical UUID string")
+    elif schema_version == 2:
         owner_user_id = data["owner_user_id"]
         # Same bool-exclusion rationale as schema_version above. Telegram
         # numeric user ids (`from_user.id`) are always positive — a zero or
@@ -297,16 +339,11 @@ def parse_sidecar_bytes(raw_bytes: bytes) -> Dict[str, Any]:
         # be rejected rather than silently accepted as one.
         if type(owner_user_id) is not int or owner_user_id <= 0:
             raise SidecarError("sidecar field 'owner_user_id' must be a positive integer")
+        data["owner_user_uuid"] = None
     else:
-        # v1 legacy sidecar: no ownership was ever recorded. Represent that
-        # explicitly and safely as `owner_user_id: None` — every caller
-        # that reconciles a managed upload into Qdrant must treat `None`
-        # here as "unowned, fail closed" (never guessed, never silently
-        # promoted to a shared/reference document, never exposed to every
-        # authorized user) — see scripts/rebuild_qdrant.py's
-        # `_plan_upload_documents()`.
-        data = dict(data)
+        # v1 legacy sidecar: no ownership was ever recorded at all.
         data["owner_user_id"] = None
+        data["owner_user_uuid"] = None
 
     return data
 

@@ -46,6 +46,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1047,7 +1048,7 @@ async def test_router_ordinary_tutor_path_uses_text_llm_facade(monkeypatch):
     facade_mock = AsyncMock(return_value="Tutor answer.")
     monkeypatch.setattr(text_llm, "generate_text_response", facade_mock)
 
-    response = await route_text_request(user_id=900001, text="What is a list comprehension?")
+    response = await route_text_request(user_id=uuid.uuid4(), text="What is a list comprehension?")
 
     assert response["text"] == "Tutor answer."
     facade_mock.assert_called_once()
@@ -1057,20 +1058,43 @@ async def test_router_ordinary_tutor_path_uses_text_llm_facade(monkeypatch):
 
 
 async def test_rag_response_path_uses_text_llm_facade(monkeypatch):
+    import db.documents as db_documents
     import rag.query as rag_query
+    from rag.identity import upload_document_id
+    from rag.index import SCOPE_PRIVATE
+
+    # Stage 5C corrective pass #3, Blocker 1: _validated_similarity_search()
+    # now requires independently PROVEN canonical reference provenance
+    # (content-hash-verified against the real, version-controlled corpus),
+    # so a bare fake document_id can no longer stand in for "reference".
+    # A genuinely catalog-backed PRIVATE document is a simpler, realistic
+    # stand-in here — this test is about the text_llm facade wiring, not
+    # retrieval provenance itself (see tests/test_stage5c_retrieval_
+    # validation.py for that).
+    owner_uuid = uuid.uuid4()
+    doc_uuid = uuid.uuid4()
+    document_id = upload_document_id(doc_uuid.hex)
+    db_documents.create_pending_sync(
+        document_id=doc_uuid, owner_user_id=owner_uuid,
+        stored_name=f"{doc_uuid.hex}.txt", display_name="notes.txt", content_sha256="a" * 64,
+    )
+    db_documents.mark_active_sync(document_id=doc_uuid)
 
     fake_doc = SimpleNamespace(
-        metadata={"source": "python_basics.txt"},
+        metadata={
+            "source": "python_basics.txt", "document_id": document_id, "chunk_index": 0,
+            "scope": SCOPE_PRIVATE, "owner_user_uuid": str(owner_uuid),
+        },
         page_content="Some retrieved passage.",
     )
     monkeypatch.setattr(
         rag_query.get_vector_index(), "similarity_search_with_score",
-        lambda query, requesting_user_id=None, k=3: [(fake_doc, 0.1)],
+        lambda query, requesting_user_uuid=None, k=3, **kwargs: [(fake_doc, 0.1)],
     )
     facade_mock = AsyncMock(return_value="RAG-grounded answer.")
     monkeypatch.setattr(rag_query.text_llm, "generate_text_response", facade_mock)
 
-    response = await rag_query.query_knowledge_base("What is PEP 8?", 1)
+    response = await rag_query.query_knowledge_base("What is PEP 8?", str(owner_uuid))
 
     assert "RAG-grounded answer." in response
     assert "python_basics.txt" in response
@@ -1082,12 +1106,12 @@ async def test_rag_fallback_path_uses_text_llm_facade(monkeypatch):
 
     monkeypatch.setattr(
         rag_query.get_vector_index(), "similarity_search_with_score",
-        lambda query, requesting_user_id=None, k=3: [],
+        lambda query, requesting_user_uuid=None, k=3, **kwargs: [],
     )
     facade_mock = AsyncMock(return_value="General-knowledge answer.")
     monkeypatch.setattr(rag_query.text_llm, "generate_text_response", facade_mock)
 
-    response = await rag_query.query_knowledge_base("What is a metaclass?", 1)
+    response = await rag_query.query_knowledge_base("What is a metaclass?", str(uuid.uuid4()))
 
     assert "General-knowledge answer." in response
     assert "База знаний не содержит информации" in response

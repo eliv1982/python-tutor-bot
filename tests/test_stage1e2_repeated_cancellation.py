@@ -36,6 +36,7 @@ import asyncio
 import gc
 import logging
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -78,6 +79,7 @@ async def test_cancel_twice_during_storage_still_waits_for_worker(monkeypatch, t
             physical_path=path,
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
+            document_uuid=uuid.uuid4(),
             content_sha256="deadbeef",
             owner_user_id=owner_user_id,
         )
@@ -401,6 +403,7 @@ async def test_shutdown_style_broad_cancellation_does_not_abandon_storage_worker
             physical_path=path,
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
+            document_uuid=uuid.uuid4(),
             content_sha256="deadbeef",
             owner_user_id=owner_user_id,
         )

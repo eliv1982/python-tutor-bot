@@ -5,7 +5,7 @@ Initializes and configures the Telegram bot using pyTelegramBotAPI.
 
 from telebot.async_telebot import AsyncTeleBot, ExceptionHandler
 
-from config import TELEGRAM_BOT_TOKEN
+from telegram_config import TELEGRAM_BOT_TOKEN
 from utils.logging import logger
 
 

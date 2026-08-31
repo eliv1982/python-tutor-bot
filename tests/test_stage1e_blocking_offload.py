@@ -18,15 +18,45 @@ data/documents, data/documents/uploads, data/chroma_db, or bot.log paths
 import asyncio
 import logging
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from rag.identity import upload_document_id
+from rag.index import SCOPE_PRIVATE
+
 
 def _main_thread_id() -> int:
     return threading.get_ident()
+
+
+def _register_fake_private_document(owner_uuid: uuid.UUID) -> str:
+    """
+    Registers a fake-catalog-backed (see tests/conftest.py's autouse
+    _default_fake_documents_catalog) private document owned by
+    `owner_uuid` and returns its document_id. Stage 5C corrective pass #3,
+    Blocker 1: _validated_similarity_search() now requires independently
+    PROVEN canonical reference provenance (content-hash-verified against
+    the real, version-controlled corpus) for anything to be treated as
+    reference — a bare fake document_id is no longer sufficient, and these
+    tests are about thread-offloading mechanics, not retrieval provenance
+    itself (see tests/test_stage5c_retrieval_validation.py for that). A
+    genuinely catalog-backed PRIVATE document is a simpler, realistic
+    stand-in for "a real, safely-retrievable result" here.
+    """
+    import db.documents as db_documents
+
+    doc_uuid = uuid.uuid4()
+    document_id = upload_document_id(doc_uuid.hex)
+    db_documents.create_pending_sync(
+        document_id=doc_uuid, owner_user_id=owner_uuid,
+        stored_name=f"{doc_uuid.hex}.txt", display_name="notes.txt", content_sha256="a" * 64,
+    )
+    db_documents.mark_active_sync(document_id=doc_uuid)
+    return document_id
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +73,17 @@ async def test_rag_similarity_search_runs_off_event_loop_thread(monkeypatch):
     caller_thread_id = _main_thread_id()
     recorded_thread_id = {}
 
-    fake_doc = SimpleNamespace(metadata={"source": "notes.txt"}, page_content="Some content.")
+    owner_uuid = uuid.uuid4()
+    document_id = _register_fake_private_document(owner_uuid)
+    fake_doc = SimpleNamespace(
+        metadata={
+            "source": "notes.txt", "document_id": document_id, "chunk_index": 0,
+            "scope": SCOPE_PRIVATE, "owner_user_uuid": str(owner_uuid),
+        },
+        page_content="Some content.",
+    )
 
-    def synthetic_blocking_search(query, requesting_user_id=None, k=3):
+    def synthetic_blocking_search(query, requesting_user_uuid=None, k=3, **kwargs):
         recorded_thread_id["id"] = threading.get_ident()
         return [(fake_doc, 0.1)]
 
@@ -58,7 +96,7 @@ async def test_rag_similarity_search_runs_off_event_loop_thread(monkeypatch):
         )),
     )
 
-    response = await rag_query.query_knowledge_base("What is a list comprehension?", 1)
+    response = await rag_query.query_knowledge_base("What is a list comprehension?", str(owner_uuid))
 
     assert "id" in recorded_thread_id, "synthetic_blocking_search was never called"
     assert recorded_thread_id["id"] != caller_thread_id
@@ -259,9 +297,17 @@ async def test_event_loop_stays_responsive_during_offloaded_rag_query(monkeypatc
 
     started = threading.Event()
     release = threading.Event()
-    fake_doc = SimpleNamespace(metadata={"source": "notes.txt"}, page_content="Some content.")
+    owner_uuid = uuid.uuid4()
+    document_id = _register_fake_private_document(owner_uuid)
+    fake_doc = SimpleNamespace(
+        metadata={
+            "source": "notes.txt", "document_id": document_id, "chunk_index": 0,
+            "scope": SCOPE_PRIVATE, "owner_user_uuid": str(owner_uuid),
+        },
+        page_content="Some content.",
+    )
 
-    def blocking_search(query, requesting_user_id=None, k=3):
+    def blocking_search(query, requesting_user_uuid=None, k=3, **kwargs):
         started.set()
         assert release.wait(timeout=5), "release was never set by the test"
         return [(fake_doc, 0.1)]
@@ -275,7 +321,7 @@ async def test_event_loop_stays_responsive_during_offloaded_rag_query(monkeypatc
         )),
     )
 
-    task = asyncio.create_task(rag_query.query_knowledge_base("question", 1))
+    task = asyncio.create_task(rag_query.query_knowledge_base("question", str(owner_uuid)))
 
     # Poll (cheaply) for the worker thread to signal it has actually entered
     # the blocking call — bounded, not an arbitrary fixed sleep used as the
@@ -320,14 +366,21 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
     from config import BotMode
 
     caller_thread_id = _main_thread_id()
-    user_id = 777
+    user_id = uuid.uuid4()
     user_sessions.sessions.pop(user_id, None)
-    user_sessions.set_mode(user_id, BotMode.RAG)
+    await user_sessions.set_mode(user_id, BotMode.RAG)
 
     search_thread_id = {}
-    fake_doc = SimpleNamespace(metadata={"source": "notes.txt"}, page_content="Some content.")
+    document_id = _register_fake_private_document(user_id)
+    fake_doc = SimpleNamespace(
+        metadata={
+            "source": "notes.txt", "document_id": document_id, "chunk_index": 0,
+            "scope": SCOPE_PRIVATE, "owner_user_uuid": str(user_id),
+        },
+        page_content="Some content.",
+    )
 
-    def blocking_search(query, requesting_user_id=None, k=3):
+    def blocking_search(query, requesting_user_uuid=None, k=3, **kwargs):
         search_thread_id["id"] = threading.get_ident()
         return [(fake_doc, 0.1)]
 
@@ -358,7 +411,6 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
         await route_text_request(user_id, "What is a Python decorator?")
     finally:
         user_sessions.sessions.pop(user_id, None)
-        user_sessions.sessions.pop(f"{user_id}_mode", None)
 
     assert search_thread_id["id"] != caller_thread_id  # the blocking work really was offloaded
     assert len(add_message_call_threads) == 2  # user message + assistant response

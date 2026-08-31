@@ -11,6 +11,45 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Stage 5C corrective pass (Blocker 3): PostgreSQL is provisioned
+    # explicitly as a GitHub Actions workflow service — infrastructure
+    # provisioning by the platform, distinct from the application/provider
+    # network blockade pytest.ini enforces during the test run itself (see
+    # the "Run tests" step below; --allow-hosts is unchanged and still
+    # rejects everything except 127.0.0.1/::1). A pinned PostgreSQL 16
+    # image (postgres:16-alpine — the same tag tests/conftest.py's local
+    # disposable-container fallback uses) with an explicit health check;
+    # bound to 127.0.0.1 (never `localhost`) on the standard port so it
+    # lands inside pytest-socket's existing loopback allowlist exactly.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pytest
+          POSTGRES_PASSWORD: pytest
+          POSTGRES_DB: pytest_ci
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd="pg_isready -U pytest -d pytest_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=5s
+
+    env:
+      # tests/conftest.py's postgres_container() fixture uses this DSN
+      # directly (its highest-priority path) instead of trying to start
+      # its own local Docker container — see that fixture's own docstring.
+      TEST_POSTGRES_DSN: postgresql+psycopg://pytest:pytest@127.0.0.1:5432/pytest_ci
+      # Makes a missing/unreachable/misconfigured PostgreSQL service a
+      # hard test FAILURE rather than a silent pytest.skip() — this is
+      # what makes it impossible for the Stage 5C PostgreSQL proof to
+      # quietly disappear from CI. See tests/conftest.py's
+      # REQUIRE_POSTGRES_ENV / _unavailable().
+      PYTEST_REQUIRE_POSTGRES: "1"
+
     steps:
       - uses: actions/checkout@v7
 
@@ -28,5 +67,5 @@ jobs:
       - name: Check for dependency conflicts
         run: python -m pip check
 
-      - name: Run tests (offline-enforced)
+      - name: Run tests (offline-enforced; PostgreSQL required, never silently skipped)
         run: python -m pytest

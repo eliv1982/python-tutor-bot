@@ -69,6 +69,18 @@ pydub>=0.25.1,<1.0.0
 aiofiles>=23.2.1,<26.0.0
 aiohttp>=3.9.0,<4.0.0
 
+# PostgreSQL persistence (Stage 5C): canonical user identity, Telegram
+# account mapping, preferences, and document ownership catalog. psycopg
+# (v3) is used for BOTH the sync engine (document-catalog writes inside
+# the existing executor-thread ingest pipeline, and Alembic migrations)
+# and the async engine (identity resolution, preferences) via the same
+# `postgresql+psycopg://` DSN — SQLAlchemy selects sync vs. async mode
+# based on create_engine() vs. create_async_engine(), so a single driver
+# package covers both, rather than declaring asyncpg + psycopg2 separately.
+SQLAlchemy>=2.0.52,<3.0.0
+psycopg[binary]>=3.1.0,<4.0.0
+alembic>=1.13.0,<2.0.0
+
 # Explicit dependencies for compatibility
 numpy>=1.24.0; python_version < '3.13'
 numpy>=1.26.0; python_version >= '3.13'

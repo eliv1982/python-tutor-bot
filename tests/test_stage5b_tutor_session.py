@@ -136,11 +136,11 @@ async def test_current_user_turn_appears_exactly_once_in_rag_mode(monkeypatch):
     """Same regression, RAG mode: route_text_request() passes `history` into
     query_knowledge_base() before add_message() may have mutated it."""
     monkeypatch.setattr(tutor, "detect_image_generation_intent", _no_image_intent())
-    user_sessions.set_mode(777, BotMode.RAG)
+    await user_sessions.set_mode(777, BotMode.RAG)
 
     captured_history = []
 
-    async def fake_query_knowledge_base(query, requesting_user_id, conversation_history=None):
+    async def fake_query_knowledge_base(query, requesting_user_uuid, conversation_history=None):
         captured_history.append(list(conversation_history or []))
         return f"rag response for {query}"
 
@@ -232,23 +232,24 @@ async def test_selected_provider_failure_never_silently_falls_back(monkeypatch):
 # E. Conversation-state ownership: isolation + equivalence after the move
 # ---------------------------------------------------------------------------
 
-def test_users_remain_isolated_across_history_mode_voice_and_pending_image():
+@pytest.mark.asyncio
+async def test_users_remain_isolated_across_history_mode_voice_and_pending_image():
     session = UserSession()
     session.add_message(1, "user", "user one's message")
-    session.set_mode(1, BotMode.RAG)
-    session.set_voice(1, "nova")
+    await session.set_mode(1, BotMode.RAG)
+    await session.set_voice(1, "nova")
     session.set_pending_image(1, "data:image/png;base64,AAA")
 
     session.add_message(2, "user", "user two's message")
-    session.set_mode(2, BotMode.VOICE)
+    await session.set_mode(2, BotMode.VOICE)
 
     assert session.get_history(2) == [{"role": "user", "content": "user two's message"}]
-    assert session.get_mode(2) == BotMode.VOICE
+    assert await session.get_mode(2) == BotMode.VOICE
     assert session.get_pending_image(2) is None  # never set for user 2
 
     # User 1's state is untouched by user 2's activity.
-    assert session.get_mode(1) == BotMode.RAG
-    assert session.get_voice(1) == "nova"
+    assert await session.get_mode(1) == BotMode.RAG
+    assert await session.get_voice(1) == "nova"
     assert session.get_pending_image(1) == "data:image/png;base64,AAA"
     assert len(session.get_history(1)) == 1
 

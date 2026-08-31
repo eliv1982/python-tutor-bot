@@ -33,10 +33,11 @@ load_dotenv()
 # Base directory
 BASE_DIR = Path(__file__).parent
 
-# Telegram Bot Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN is not set in .env file")
+# Telegram Bot Configuration: TELEGRAM_BOT_TOKEN deliberately lives in
+# telegram_config.py, not here (Stage 5C) — this module (and everything
+# that imports only it: db/*.py, app/*.py) must be importable without a
+# Telegram credential. Only bot.py imports telegram_config.py, and it
+# still fails fast exactly as before if the token is missing/invalid.
 
 # OpenAI Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

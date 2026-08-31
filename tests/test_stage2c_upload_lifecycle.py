@@ -37,6 +37,7 @@ real Telegram/OpenAI/Qdrant.
 
 import asyncio
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -44,6 +45,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import app.documents as app_documents
+import db.identity as db_identity
 from rag.index import VectorIndex
 from rag_fakes import DeterministicFakeEmbeddings
 
@@ -60,6 +62,16 @@ def _make_message(user_id: int, file_name: str, file_id: str = "fid"):
     document = SimpleNamespace(file_name=file_name, mime_type="text/plain", file_id=file_id, file_size=100)
     message = SimpleNamespace(from_user=SimpleNamespace(id=user_id), chat=SimpleNamespace(id=user_id), document=document)
     return message, document
+
+
+def _requesting_uuid_for_telegram_id(telegram_id: int) -> str:
+    """These tests drive uploads through the real Telegram handler
+    (document_upload.process_document_upload), which resolves ownership
+    via app.identity.resolve_user_uuid() -> db.identity's (fixture-faked,
+    see conftest.py's _default_fake_preferences) resolver — stable per
+    telegram_id within a test. Retrieving that same UUID here lets these
+    tests query VectorIndex as "the uploader themselves"."""
+    return str(db_identity.resolve_or_create_user_by_telegram_id_sync(telegram_id))
 
 
 @pytest.fixture
@@ -138,7 +150,7 @@ async def test_cancel_during_status_message_after_storage_leaves_no_orphan(real_
     assert list(uploads_dir.iterdir()) == []
     load_mock.assert_not_called()
     add_mock.assert_not_called()
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +188,7 @@ async def test_cancel_while_indexing_worker_runs_leaves_no_orphan(real_upload_en
         await task
 
     assert list(uploads_dir.iterdir()) == []
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +226,7 @@ async def test_repeated_cancellation_while_indexing_worker_runs_leaves_no_orphan
         await task
 
     assert list(uploads_dir.iterdir()) == []
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +272,7 @@ async def test_cancel_after_worker_succeeds_before_observed_retains_everything(r
     sidecar_files = [p for p in uploads_dir.iterdir() if p.name.endswith(".meta.json")]
     assert len(physical_files) == 1
     assert len(sidecar_files) == 1
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] >= 1  # successfully committed, never deleted
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] >= 1  # successfully committed, never deleted
 
     sent_texts = [c.args[1] for c in real_upload_env.send_message_mock.await_args_list]
     assert not any("успешно загружен" in t for t in sent_texts)  # cancelled: no success notification
@@ -282,7 +294,7 @@ async def test_ordinary_indexing_failure_leaves_no_orphan(real_upload_env, monke
     await document_upload.process_document_upload(message, document)
 
     assert list(uploads_dir.iterdir()) == []
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 0
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] == 0
 
     sent_texts = [c.args[1] for c in real_upload_env.send_message_mock.await_args_list]
     assert any("ошибка" in t.lower() for t in sent_texts)
@@ -308,7 +320,7 @@ async def test_successful_upload_preserves_source_sidecar_and_qdrant_document(re
     assert len(physical_files) == 1
     assert len(sidecar_files) == 1
 
-    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_id=42, k=1)
+    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_uuid=_requesting_uuid_for_telegram_id(42), k=1)
     assert len(results) == 1
     assert results[0].metadata["source"] == "notes.txt"
 
@@ -330,7 +342,7 @@ async def test_cleanup_targets_document_id_not_display_filename(real_upload_env,
     # First upload succeeds normally.
     message1, document1 = _make_message(42, "shared_name.txt")
     await document_upload.process_document_upload(message1, document1)
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] >= 1
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] >= 1
     first_physical = [p for p in uploads_dir.iterdir() if not p.name.endswith(".meta.json")]
     assert len(first_physical) == 1
 
@@ -350,7 +362,7 @@ async def test_cleanup_targets_document_id_not_display_filename(real_upload_env,
     assert remaining_physical == first_physical
     assert len(remaining_sidecars) == 1
 
-    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_id=42, k=1)
+    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_uuid=_requesting_uuid_for_telegram_id(42), k=1)
     assert len(results) == 1
     assert results[0].metadata["source"] == "shared_name.txt"
 
@@ -382,6 +394,19 @@ async def test_cleanup_targets_document_id_not_display_filename(real_upload_env,
 
 @pytest.mark.asyncio
 async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(real_upload_env, monkeypatch):
+    """
+    Stage 5C corrective pass #4 (Blocker 5): a source rewrite landing right
+    after the FIRST secure read (the one whose bytes get indexed) is no
+    longer merely "harmless because the old bytes were already captured" —
+    that used to leave Qdrant/sidecar/catalog self-consistently describing
+    a snapshot the DURABLE FILE ON DISK no longer matches, exactly the
+    disk/sidecar/catalog disagreement Principle 1 forbids reporting as
+    success. `_load_and_index_document()`'s final pre-activation
+    revalidation (a SECOND secure read, immediately before
+    mark_active_sync()) now re-detects this same mutation and fails the
+    whole ingestion closed instead: no active document, no orphaned
+    Qdrant content, a truthful failure notification to the user.
+    """
     document_upload = real_upload_env.document_upload
     vi = real_upload_env.vi
 
@@ -392,9 +417,11 @@ async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(re
         # Simulate a controlled race: the managed source is rewritten
         # immediately AFTER its bytes were already securely captured —
         # the narrower lstat-to-open race is proven closed separately
-        # (test_stage2f_upload_secure_read.py); this proves the bytes
-        # already captured are what gets indexed, regardless of what
-        # happens to the pathname afterward.
+        # (test_stage2f_upload_secure_read.py). This module-level
+        # monkeypatch affects BOTH the initial secure read (whose bytes
+        # get indexed) AND the final pre-activation revalidation read
+        # added by Blocker 5 — the second call observes the mutation this
+        # first call just made and fails ingestion closed.
         Path(path).write_bytes(b"MUTATED CONTENT - must never be indexed under the old hash")
         return secure_bytes
 
@@ -403,15 +430,16 @@ async def test_managed_source_mutated_after_secure_read_does_not_reach_qdrant(re
     message, document = _make_message(42, "notes.txt")
     await document_upload.process_document_upload(message, document)
 
-    # Indexing succeeded using the ORIGINAL, already-captured bytes — the
-    # post-capture mutation never reached Qdrant.
-    assert vi.get_stats(requesting_user_id=42)["total_documents"] == 1
-    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_id=42, k=1)
-    assert len(results) == 1
-    assert "MUTATED CONTENT" not in results[0].page_content
+    # Ingestion failed closed — the mutated content never reached Qdrant,
+    # but neither did the original snapshot: no document became active
+    # while the durable file on disk disagreed with what was indexed.
+    assert vi.get_stats(requesting_user_uuid=_requesting_uuid_for_telegram_id(42))["total_documents"] == 0
+    results = vi.similarity_search("Real content for the upload lifecycle test.", requesting_user_uuid=_requesting_uuid_for_telegram_id(42), k=5)
+    assert all("MUTATED CONTENT" not in r.page_content for r in results)
 
     sent_texts = [c.args[1] for c in real_upload_env.send_message_mock.await_args_list]
-    assert any("успешно загружен" in t for t in sent_texts)
+    assert not any("успешно загружен" in t for t in sent_texts)
+    assert any("ошибка" in t.lower() for t in sent_texts)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +459,7 @@ def test_cleanup_new_upload_returns_false_when_qdrant_cleanup_fails(monkeypatch,
     sidecar.write_text("{}", encoding="utf-8")
     stored = app_documents.StoredUpload(
         physical_path=physical, sidecar_path=sidecar,
-        document_id="upload:" + "a" * 32, content_sha256="b" * 64, owner_user_id=1,
+        document_id="upload:" + "a" * 32, document_uuid=uuid.UUID("a" * 32), content_sha256="b" * 64, owner_user_id=uuid.uuid4(),
     )
 
     monkeypatch.setattr(
@@ -456,7 +484,7 @@ def test_cleanup_new_upload_returns_true_on_full_success(monkeypatch, tmp_path):
     sidecar.write_text("{}", encoding="utf-8")
     stored = app_documents.StoredUpload(
         physical_path=physical, sidecar_path=sidecar,
-        document_id="upload:" + "a" * 32, content_sha256="b" * 64, owner_user_id=1,
+        document_id="upload:" + "a" * 32, document_uuid=uuid.UUID("a" * 32), content_sha256="b" * 64, owner_user_id=uuid.uuid4(),
     )
 
     monkeypatch.setattr(app_documents.get_vector_index(), "delete_document", Mock())

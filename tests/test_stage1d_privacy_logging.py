@@ -398,11 +398,16 @@ async def test_stats_command_never_forwards_raw_exception_to_user(monkeypatch, c
     import handlers.start as start_handler
     import rag.index as rag_index
 
-    # Exercise the real VectorIndex.get_stats() implementation (not a
-    # replacement mock) by making the underlying Qdrant client call itself
-    # fail, so the sanitization inside get_stats() is what's tested.
+    # Exercise the real rag.query.get_knowledge_base_stats() implementation
+    # (not a replacement mock) by making the underlying Qdrant client call
+    # itself fail, so the sanitization inside it is what's tested. Stage
+    # 5C corrective pass #3: /stats no longer calls client.count() at all
+    # (see get_knowledge_base_stats()'s manifest-verified reference count
+    # + catalog-validated private count) — client.scroll() is the call
+    # private_chunk_counts_by_document() unconditionally makes, so that's
+    # where a genuine Qdrant-layer failure is now injected.
     leaking_message = _leaking_exception_message()
-    monkeypatch.setattr(rag_index.get_vector_index().client, "count", Mock(side_effect=RuntimeError(leaking_message)))
+    monkeypatch.setattr(rag_index.get_vector_index().client, "scroll", Mock(side_effect=RuntimeError(leaking_message)))
 
     send_message_mock = AsyncMock()
     monkeypatch.setattr(start_handler.bot, "send_message", send_message_mock)

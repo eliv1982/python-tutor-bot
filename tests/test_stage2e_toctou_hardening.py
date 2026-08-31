@@ -38,17 +38,39 @@ Entirely temporary fixtures — no real documents/uploads/Qdrant anywhere.
 import io
 import json
 import os
+import uuid
 import zipfile
 from pathlib import Path
 
 import pytest
 
+import db.documents as db_documents
 import scripts.rebuild_qdrant as rebuild
 from rag.identity import sha256_hex, upload_document_id
 from rag.index import VectorIndex
 from rag.safe_files import SecureReadError, read_regular_file_secure
 from rag.sidecar import build_sidecar, sidecar_path_for, write_sidecar_atomic
 from rag_fakes import DeterministicFakeEmbeddings
+
+_TEST_OWNER_UUID = str(uuid.uuid4())
+
+
+def _register_catalog_row(stem: str, physical: Path, display_name: str, content: bytes) -> None:
+    """Stage 5C corrective pass: registers the matching 'active' PostgreSQL
+    catalog row scripts/rebuild_qdrant.py's ownership gate now requires
+    before it will ever plan a private upload for indexing — see
+    db.documents.get_sync()'s use in _plan_upload_documents(). Only needed
+    by this module's two tests that expect a legitimate, unmolested upload
+    to actually be PLANNED (every other test here proves EXCLUSION for a
+    reason that fires before the catalog gate is ever reached). Backed by
+    tests/conftest.py's autouse fixture-faked db.documents — a plain
+    in-memory registration, never a real PostgreSQL call."""
+    document_uuid = uuid.UUID(stem)
+    db_documents.create_pending_sync(
+        document_id=document_uuid, owner_user_id=uuid.UUID(_TEST_OWNER_UUID),
+        stored_name=physical.name, display_name=display_name, content_sha256=sha256_hex(content),
+    )
+    db_documents.mark_active_sync(document_id=document_uuid)
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +211,12 @@ def test_build_plan_rejects_sidecar_swapped_to_external_symlink_at_secure_read_b
     physical.write_bytes(physical_content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_id=1),
+        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_uuid=_TEST_OWNER_UUID),
     )
 
     external_json = uploads_dir.parent / "external.meta.json"
     external_json.write_text(json.dumps(build_sidecar(
-        upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_id=1,
+        upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_uuid=_TEST_OWNER_UUID,
     )), encoding="utf-8")
 
     real_secure_read = rebuild.secure_read_sidecar_bytes
@@ -228,7 +250,7 @@ def test_build_plan_rejects_source_swapped_to_external_symlink_at_secure_read_bo
     physical.write_bytes(physical_content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_id=1),
+        build_sidecar(upload_document_id(stem), "legit.txt", physical.name, sha256_hex(physical_content), owner_user_uuid=_TEST_OWNER_UUID),
     )
 
     external_source = uploads_dir.parent / "external_source.txt"
@@ -266,8 +288,9 @@ def test_build_plan_accepts_regular_upload_with_no_race(uploads_tree):
     physical.write_bytes(content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "ordinary.txt", physical.name, sha256_hex(content), owner_user_id=1),
+        build_sidecar(upload_document_id(stem), "ordinary.txt", physical.name, sha256_hex(content), owner_user_uuid=_TEST_OWNER_UUID),
     )
+    _register_catalog_row(stem, physical, "ordinary.txt", content)
 
     plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
 
@@ -284,6 +307,23 @@ def test_build_plan_accepts_regular_upload_with_no_race(uploads_tree):
 # ---------------------------------------------------------------------------
 
 def test_apply_plan_does_not_embed_source_swapped_after_plan_built(uploads_tree, tmp_path):
+    """
+    Stage 5C corrective pass #4 (Blocker 7): apply_plan() used to trust the
+    plan's own plan-time `content_bytes` snapshot unconditionally, so
+    embedding the ORIGINAL (pre-swap) content instead of the swapped
+    replacement was considered an acceptable outcome — the swapped content
+    itself never got indexed. That is no longer sufficient: Principle 2
+    requires a destructive/activating apply-time operation to fresh-
+    validate CURRENT source state, not trust planning as authoritative.
+    apply_plan() now revalidates each upload candidate fresh (via the same
+    `_validate_upload_candidate()` build_plan() itself uses) immediately
+    before reconciling it — the swap-to-a-symlink here is detected as a
+    path containment violation at that point, and the whole candidate is
+    skipped closed: NEITHER the original plan-time snapshot NOR the
+    swapped content is ever indexed, and its existing Qdrant state (none
+    yet, for a document this new) is left untouched rather than acted on
+    from stale plan data.
+    """
     documents_dir, uploads_dir = uploads_tree
     stem = "d" * 32
     physical = uploads_dir / f"{stem}.txt"
@@ -291,8 +331,9 @@ def test_apply_plan_does_not_embed_source_swapped_after_plan_built(uploads_tree,
     physical.write_bytes(original_content)
     write_sidecar_atomic(
         sidecar_path_for(physical),
-        build_sidecar(upload_document_id(stem), "doc.txt", physical.name, sha256_hex(original_content), owner_user_id=1),
+        build_sidecar(upload_document_id(stem), "doc.txt", physical.name, sha256_hex(original_content), owner_user_uuid=_TEST_OWNER_UUID),
     )
+    _register_catalog_row(stem, physical, "doc.txt", original_content)
 
     plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
     assert len(plan.upload_documents) == 1
@@ -313,13 +354,80 @@ def test_apply_plan_does_not_embed_source_swapped_after_plan_built(uploads_tree,
     vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=fake, collection_name="apply_boundary_test")
     try:
         report = rebuild.apply_plan(plan, vi)
-        assert report.documents_reconciled == 1
-        assert report.documents_reindexed == 1
+        assert report.documents_reconciled == 0
+        assert report.documents_reindexed == 0
+        assert report.uploads_skipped_stale_at_apply == 1
 
-        results = vi.similarity_search("ORIGINAL PLAN-TIME CONTENT", requesting_user_id=1, k=1)
-        assert results
-        assert "ORIGINAL PLAN-TIME CONTENT" in results[0].page_content
-        assert "SWAPPED" not in results[0].page_content
+        results = vi.similarity_search("ORIGINAL PLAN-TIME CONTENT", requesting_user_uuid=_TEST_OWNER_UUID, k=5)
+        assert all("ORIGINAL PLAN-TIME CONTENT" not in r.page_content for r in results)
+        assert all("SWAPPED" not in r.page_content for r in results)
+    finally:
+        vi.close()
+
+
+def test_apply_plan_does_not_index_old_bytes_when_content_rewritten_in_place_after_plan_built(uploads_tree, tmp_path):
+    """
+    Stage 5C corrective pass #4 (Blocker 7), plain-content-mutation variant:
+    the same physical PATH (a genuine regular file, never a symlink swap)
+    has its CONTENT simply rewritten in place after build_plan() already
+    captured the OLD bytes, before apply_plan() runs. This exercises the
+    content-hash-mismatch branch of apply_plan()'s fresh revalidation
+    (_validate_upload_candidate() re-reading the file and finding its
+    sidecar/catalog content_sha256 no longer matches), distinct from the
+    symlink-triggered path-containment branch the sibling test above
+    exercises. Neither the stale plan-time snapshot NOR the new content is
+    ever indexed — the candidate is skipped closed either way.
+    """
+    documents_dir, uploads_dir = uploads_tree
+    stem = "e" * 32
+    physical = uploads_dir / f"{stem}.txt"
+    original_content = b"ORIGINAL PLAN-TIME CONTENT, captured before the in-place rewrite."
+    physical.write_bytes(original_content)
+    write_sidecar_atomic(
+        sidecar_path_for(physical),
+        build_sidecar(upload_document_id(stem), "doc.txt", physical.name, sha256_hex(original_content), owner_user_uuid=_TEST_OWNER_UUID),
+    )
+    _register_catalog_row(stem, physical, "doc.txt", original_content)
+
+    plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
+    assert len(plan.upload_documents) == 1
+    upload_doc = plan.upload_documents[0]
+    assert upload_doc.content_bytes == original_content
+
+    # Rewrite the SAME path's content in place — no symlink, no path
+    # containment violation at all; the sidecar is deliberately left
+    # untouched too, so this is purely a content-hash disagreement.
+    new_content = b"REWRITTEN IN PLACE AFTER PLAN BUILD, before apply ever ran."
+    physical.write_bytes(new_content)
+
+    fake = DeterministicFakeEmbeddings()
+    vi = VectorIndex(persist_directory=tmp_path / "qdrant", embeddings=fake, collection_name="apply_boundary_content_test")
+    try:
+        report = rebuild.apply_plan(plan, vi)
+        assert report.documents_reconciled == 0
+        assert report.documents_reindexed == 0
+        assert report.uploads_skipped_stale_at_apply == 1
+
+        results = vi.similarity_search("ORIGINAL PLAN-TIME CONTENT", requesting_user_uuid=_TEST_OWNER_UUID, k=5)
+        assert all("ORIGINAL PLAN-TIME CONTENT" not in r.page_content for r in results)
+        results2 = vi.similarity_search("REWRITTEN IN PLACE", requesting_user_uuid=_TEST_OWNER_UUID, k=5)
+        assert all("REWRITTEN IN PLACE" not in r.page_content for r in results2)
+
+        # Recoverable: a fresh plan built against the NOW-current content
+        # (with a matching sidecar/catalog row) reconciles normally —
+        # proving this is a clean skip, not a permanently stuck state.
+        write_sidecar_atomic(
+            sidecar_path_for(physical),
+            build_sidecar(upload_document_id(stem), "doc.txt", physical.name, sha256_hex(new_content), owner_user_uuid=_TEST_OWNER_UUID),
+        )
+        db_documents.delete_sync(document_id=uuid.UUID(stem))
+        _register_catalog_row(stem, physical, "doc.txt", new_content)
+        fresh_plan = rebuild.build_plan(documents_dir, uploads_dir, reference_filenames=None)
+        assert len(fresh_plan.upload_documents) == 1
+        fresh_report = rebuild.apply_plan(fresh_plan, vi)
+        assert fresh_report.documents_reconciled == 1
+        results3 = vi.similarity_search("REWRITTEN IN PLACE", requesting_user_uuid=_TEST_OWNER_UUID, k=5)
+        assert any("REWRITTEN IN PLACE" in r.page_content for r in results3)
     finally:
         vi.close()
 
@@ -354,7 +462,7 @@ def test_reconcile_document_with_source_bytes_never_reopens_file_path(tmp_path):
         assert status == "reindexed"
         assert chunk_count >= 1
         assert not nonexistent_path.exists()  # never created/touched
-        results = vi.similarity_search("content that only ever exists in memory", requesting_user_id=1, k=1)
+        results = vi.similarity_search("content that only ever exists in memory", requesting_user_uuid=_TEST_OWNER_UUID, k=1)
         assert results
     finally:
         vi.close()

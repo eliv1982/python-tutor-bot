@@ -7,6 +7,7 @@ from telebot import types
 from bot import bot
 from app.tutor import route_voice_request
 from app.session import user_sessions
+from app.identity import resolve_user_uuid
 from services.tts import get_available_voices, get_voice_info
 from utils.logging import logger
 from utils.helpers import save_file_async, cleanup_files, strip_markdown, download_telegram_file
@@ -18,18 +19,19 @@ from config import VoiceType
 @require_authorized
 async def cmd_voice(message: types.Message):
     """Handle /voice command - change TTS voice."""
-    user_id = message.from_user.id
-    
+    telegram_user_id = message.from_user.id
+    user_uuid = await resolve_user_uuid(telegram_user_id)
+
     # Parse command arguments
     args = message.text.split(maxsplit=1)
-    
+
     if len(args) < 2:
         # Show current voice and available voices
-        current_voice = user_sessions.get_voice(user_id)
+        current_voice = await user_sessions.get_voice(user_uuid)
         current_info = get_voice_info(current_voice)
-        
+
         voice_list = get_available_voices()
-        
+
         await bot.send_message(
             message.chat.id,
             f"🔊 Текущий голос: {current_info['name']} ({current_voice})\n"
@@ -38,7 +40,7 @@ async def cmd_voice(message: types.Message):
             f"Использование: /voice <название>\nПример: /voice nova"
         )
         return
-    
+
     # Set new voice
     new_voice = args[1].lower()
     valid_voices = [
@@ -49,16 +51,16 @@ async def cmd_voice(message: types.Message):
         VoiceType.ONYX,
         VoiceType.SHIMMER
     ]
-    
+
     if new_voice not in valid_voices:
         await bot.send_message(
             message.chat.id,
             f"❌ Неизвестный голос: {new_voice}\n\nИспользуйте /voice для списка доступных голосов."
         )
         return
-    
-    user_sessions.set_voice(user_id, new_voice)
-    logger.info(f"User {user_id} switched to voice: {new_voice}")
+
+    await user_sessions.set_voice(user_uuid, new_voice)
+    logger.info(f"User {telegram_user_id} switched to voice: {new_voice}")
     
     voice_info = get_voice_info(new_voice)
     
@@ -83,66 +85,68 @@ async def cmd_voices(message: types.Message):
 @require_authorized
 async def handle_voice_message(message: types.Message):
     """Handle voice messages."""
-    user_id = message.from_user.id
-    
-    logger.info("Voice message | user_id=%s", user_id)
-    
+    telegram_user_id = message.from_user.id
+
+    logger.info("Voice message | telegram_user_id=%s", telegram_user_id)
+
     await bot.send_chat_action(message.chat.id, 'typing')
-    
+
     voice_file_path = None
     audio_response_path = None
     image_path = None
-    
+
     try:
+        user_uuid = await resolve_user_uuid(telegram_user_id)
+
         # Download voice message
         voice_bytes, _ = await download_telegram_file(bot, message.voice.file_id, operation="voice_download")
 
         # Save to temporary file
         voice_file_path = await save_file_async(voice_bytes, "ogg")
-        
-        logger.debug("Voice file saved | user_id=%s, name=%s", user_id, voice_file_path.name)
-        
+
+        logger.debug("Voice file saved | telegram_user_id=%s, name=%s", telegram_user_id, voice_file_path.name)
+
         # Process voice request
-        response = await route_voice_request(user_id, voice_file_path)
-        
+        response = await route_voice_request(user_uuid, voice_file_path)
+
         # Send transcription
         await bot.send_message(
             message.chat.id,
             f"🎤 Распознано: {response['transcription']}\n"
         )
-        
+
         # Check if response contains an image
         if response.get('has_image') and response.get('image_path'):
-            logger.info("Voice response: image generated | user_id=%s", user_id)
+            logger.info("Voice response: image generated | telegram_user_id=%s", telegram_user_id)
             await bot.send_message(message.chat.id, strip_markdown(response["text"]))
-            
+
             # Then send the generated image
             image_path = response['image_path']
-            
+
             try:
                 await bot.send_chat_action(message.chat.id, 'upload_photo')
                 with open(image_path, 'rb') as photo:
                     await bot.send_photo(message.chat.id, photo)
-                logger.debug("Voice: image sent | user_id=%s", user_id)
+                logger.debug("Voice: image sent | telegram_user_id=%s", telegram_user_id)
             except Exception as img_error:
-                logger.error("Voice: failed to send image | user_id=%s, error_type=%s", user_id, type(img_error).__name__)
-            
+                logger.error("Voice: failed to send image | telegram_user_id=%s, error_type=%s", telegram_user_id, type(img_error).__name__)
+
             return
-        
+
         # Show voice action
         await bot.send_chat_action(message.chat.id, 'record_voice')
-        
+
         await bot.send_message(message.chat.id, strip_markdown(response["text"]))
         # Send voice response
         audio_response_path = response.get("voice_path")
         if audio_response_path:
             with open(audio_response_path, 'rb') as audio:
                 await bot.send_voice(message.chat.id, audio)
-    
+
     except Exception as e:
         # Wraps Telegram send calls (token-bearing request URL on HTTP
         # failure) alongside STT/TTS/router calls — never log raw text.
-        logger.error("Voice message failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
+        logger.error("Voice message failed | telegram_user_id=%s, error_type=%s", telegram_user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка при обработке голосового сообщения.\n"

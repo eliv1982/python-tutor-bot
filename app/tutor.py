@@ -11,6 +11,7 @@ its own transport-specific input into these primitive values and
 translates the returned dict back into its own response format.
 """
 
+import uuid
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from config import BotMode
 
 
 async def route_text_request(
-    user_id: int,
+    user_id: uuid.UUID,
     text: str,
     mode: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -34,7 +35,7 @@ async def route_text_request(
     Route text request to appropriate handler.
 
     Args:
-        user_id: User ID
+        user_id: Canonical internal user UUID (Stage 5C)
         text: User's text message
         mode: Bot mode (text, rag, etc.)
 
@@ -43,7 +44,7 @@ async def route_text_request(
     """
     try:
         if mode is None:
-            mode = user_sessions.get_mode(user_id)
+            mode = await user_sessions.get_mode(user_id)
         history = user_sessions.get_history(user_id)
         logger.debug("route_text_request | user_id=%s, mode=%s, history_len=%s, text_len=%s", user_id, mode, len(history), len(text))
         image_intent = await detect_image_generation_intent(text, history)
@@ -61,7 +62,7 @@ async def route_text_request(
         if mode == BotMode.RAG:
             logger.info("route_text_request: RAG | user_id=%s, query_len=%s", user_id, len(text))
             from rag.query import query_knowledge_base
-            response_text = await query_knowledge_base(text, user_id, history)
+            response_text = await query_knowledge_base(text, str(user_id), history)
         else:
             logger.debug("route_text_request: GPT | user_id=%s, model=default", user_id)
             system_prompt = (
@@ -90,14 +91,14 @@ async def route_text_request(
 
 
 async def route_voice_request(
-    user_id: int,
+    user_id: uuid.UUID,
     voice_path: Path
 ) -> Dict[str, Any]:
     """
     Route voice request: transcribe, process, and generate voice response.
 
     Args:
-        user_id: User ID
+        user_id: Canonical internal user UUID (Stage 5C)
         voice_path: Path to voice message file
 
     Returns:
@@ -123,7 +124,7 @@ async def route_voice_request(
                 "voice_path": None  # No voice response when image is generated
             }
 
-        user_voice = user_sessions.get_voice(user_id)
+        user_voice = await user_sessions.get_voice(user_id)
         plain_text = strip_markdown(text_response["text"])
         logger.debug("route_voice_request: generating TTS | user_id=%s, voice=%s", user_id, user_voice)
         voice_response_path = await generate_voice_response(plain_text, voice=user_voice)
@@ -144,7 +145,7 @@ async def route_voice_request(
 
 
 async def route_image_request(
-    user_id: int,
+    user_id: uuid.UUID,
     image_path: Optional[Path] = None,
     image_url: Optional[str] = None,
     caption: Optional[str] = None
@@ -153,7 +154,7 @@ async def route_image_request(
     Route image request: analyze image with Vision API.
 
     Args:
-        user_id: User ID
+        user_id: Canonical internal user UUID (Stage 5C)
         image_path: Local path to image
         image_url: URL to image
         caption: Optional caption/question about image
@@ -192,14 +193,14 @@ async def route_image_request(
 
 
 async def route_rag_request(
-    user_id: int,
+    user_id: uuid.UUID,
     query: str
 ) -> Dict[str, Any]:
     """
     Route RAG request: query knowledge base.
 
     Args:
-        user_id: User ID
+        user_id: Canonical internal user UUID (Stage 5C)
         query: User's query
 
     Returns:
@@ -213,7 +214,7 @@ async def route_rag_request(
 
         # Query knowledge base
         logger.debug(f"Querying knowledge base for user {user_id}")
-        response = await query_knowledge_base(query, user_id, history)
+        response = await query_knowledge_base(query, str(user_id), history)
 
         # Add to history
         user_sessions.add_message(user_id, "user", query)
@@ -232,7 +233,7 @@ async def route_rag_request(
 
 
 async def route_image_generation_request(
-    user_id: int,
+    user_id: uuid.UUID,
     prompt: str,
     original_text: str,
     size: str = "1024x1024",
@@ -243,7 +244,7 @@ async def route_image_generation_request(
     Route image generation request: generate image with DALL-E.
 
     Args:
-        user_id: User ID
+        user_id: Canonical internal user UUID (Stage 5C)
         prompt: Processed prompt for image generation
         original_text: Original user text
         size: Image size (1024x1024, 1024x1792, 1792x1024)

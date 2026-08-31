@@ -9,6 +9,7 @@ from telebot import types
 from bot import bot
 from utils.logging import logger
 from app.session import user_sessions
+from app.identity import resolve_user_uuid
 from utils.access_control import require_authorized
 from config import BotMode, DEFAULT_MODE
 
@@ -17,14 +18,15 @@ from config import BotMode, DEFAULT_MODE
 @require_authorized
 async def cmd_start(message: types.Message):
     """Handle /start command."""
-    user_id = message.from_user.id
+    telegram_user_id = message.from_user.id
     # first_name is user-controlled personal data — used in the greeting
     # text sent back to this same user below, but never logged.
     user_name = message.from_user.first_name
-    logger.info("Command /start | user_id=%s", user_id)
-    
+    logger.info("Command /start | telegram_user_id=%s", telegram_user_id)
+
     # Initialize user session
-    user_sessions.set_mode(user_id, DEFAULT_MODE)
+    user_uuid = await resolve_user_uuid(telegram_user_id)
+    await user_sessions.set_mode(user_uuid, DEFAULT_MODE)
     
     welcome_text = f"""👋 Привет, {user_name}!
 
@@ -48,8 +50,8 @@ async def cmd_start(message: types.Message):
 @require_authorized
 async def cmd_help(message: types.Message):
     """Handle /help command."""
-    user_id = message.from_user.id
-    logger.info("Command /help | user_id=%s", user_id)
+    telegram_user_id = message.from_user.id
+    logger.info("Command /help | telegram_user_id=%s", telegram_user_id)
     
     help_text = """📖 Personal Python Tutor — справка
 
@@ -81,11 +83,12 @@ async def cmd_help(message: types.Message):
 @require_authorized
 async def cmd_reset(message: types.Message):
     """Handle /reset command - clear conversation history."""
-    user_id = message.from_user.id
-    user_sessions.clear_history(user_id)
-    user_sessions.clear_pending_image(user_id)
-    logger.info("Command /reset | user_id=%s, history_cleared=True, pending_image_cleared=True", user_id)
-    
+    telegram_user_id = message.from_user.id
+    user_uuid = await resolve_user_uuid(telegram_user_id)
+    user_sessions.clear_history(user_uuid)
+    user_sessions.clear_pending_image(user_uuid)
+    logger.info("Command /reset | telegram_user_id=%s, history_cleared=True, pending_image_cleared=True", telegram_user_id)
+
     await bot.send_message(
         message.chat.id,
         "✅ История диалога очищена!\n\n"
@@ -97,10 +100,11 @@ async def cmd_reset(message: types.Message):
 @require_authorized
 async def cmd_stats(message: types.Message):
     """Handle /stats command - show knowledge base statistics."""
-    user_id = message.from_user.id
-    logger.info("Command /stats | user_id=%s", user_id)
+    telegram_user_id = message.from_user.id
+    logger.info("Command /stats | telegram_user_id=%s", telegram_user_id)
     try:
         from rag.query import get_knowledge_base_stats
+        user_uuid = await resolve_user_uuid(telegram_user_id)
         # get_knowledge_base_stats() reaches VectorIndex's shared lock,
         # which a concurrent upload/RAG query may hold for a while — call it
         # off the event loop so /stats can't stall on that contention.
@@ -113,7 +117,7 @@ async def cmd_stats(message: types.Message):
         # Stage 3A: scoped to this user — reference corpus + this user's
         # own private documents only, never a global count that would
         # reveal another user's private upload activity.
-        stats = await asyncio.to_thread(get_knowledge_base_stats, user_id)
+        stats = await asyncio.to_thread(get_knowledge_base_stats, str(user_uuid))
         logger.debug("Command /stats | stats=%s", stats)
         if "error" in stats:
             await bot.send_message(
@@ -135,7 +139,7 @@ async def cmd_stats(message: types.Message):
         await bot.send_message(message.chat.id, stats_text)
         
     except Exception as e:
-        logger.error("Command /stats failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
+        logger.error("Command /stats failed | telegram_user_id=%s, error_type=%s", telegram_user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "⚠️ Ошибка получения статистики базы знаний."

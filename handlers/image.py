@@ -7,6 +7,7 @@ from telebot import types
 from bot import bot
 from app.tutor import route_image_request
 from app.session import user_sessions
+from app.identity import resolve_user_uuid
 from services.vision import encode_image_bytes_to_data_url
 from utils.logging import logger
 from utils.helpers import cleanup_file, strip_markdown, download_telegram_file
@@ -18,11 +19,12 @@ from config import MAX_TELEGRAM_IMAGE_BYTES
 @require_authorized
 async def handle_photo_message(message: types.Message):
     """Handle photo messages."""
-    user_id = message.from_user.id
+    telegram_user_id = message.from_user.id
     caption = message.caption or ""
-    logger.info("Photo message | user_id=%s, has_caption=%s", user_id, bool(caption.strip()))
+    logger.info("Photo message | telegram_user_id=%s, has_caption=%s", telegram_user_id, bool(caption.strip()))
     await bot.send_chat_action(message.chat.id, 'typing')
     try:
+        user_uuid = await resolve_user_uuid(telegram_user_id)
         photo = message.photo[-1]
         # Downloaded via the bot's own token-scoped call so the token never
         # has to be embedded in a URL that gets passed to another service.
@@ -30,8 +32,8 @@ async def handle_photo_message(message: types.Message):
 
         if len(file_bytes) > MAX_TELEGRAM_IMAGE_BYTES:
             logger.warning(
-                "Photo rejected: too large | user_id=%s, size_bytes=%s, limit_bytes=%s",
-                user_id, len(file_bytes), MAX_TELEGRAM_IMAGE_BYTES
+                "Photo rejected: too large | telegram_user_id=%s, size_bytes=%s, limit_bytes=%s",
+                telegram_user_id, len(file_bytes), MAX_TELEGRAM_IMAGE_BYTES
             )
             await bot.send_message(
                 message.chat.id,
@@ -43,8 +45,8 @@ async def handle_photo_message(message: types.Message):
         image_data_url = encode_image_bytes_to_data_url(file_bytes, filename_hint=file_path)
 
         if not caption or not caption.strip():
-            user_sessions.set_pending_image(user_id, image_data_url)
-            logger.info("Photo without caption: asking user for question | user_id=%s", user_id)
+            user_sessions.set_pending_image(user_uuid, image_data_url)
+            logger.info("Photo without caption: asking user for question | telegram_user_id=%s", telegram_user_id)
             await bot.send_message(
                 message.chat.id,
                 "📸 Изображение получено. Что именно нужно извлечь или проанализировать?\n\n"
@@ -59,13 +61,13 @@ async def handle_photo_message(message: types.Message):
             message.chat.id,
             f"📸 Анализирую изображение с вопросом: {caption.strip()}"
         )
-        logger.debug("Photo with caption: calling Vision | user_id=%s, caption_len=%s", user_id, len(caption))
+        logger.debug("Photo with caption: calling Vision | telegram_user_id=%s, caption_len=%s", telegram_user_id, len(caption))
         response = await route_image_request(
-            user_id=user_id,
+            user_id=user_uuid,
             image_url=image_data_url,
             caption=caption.strip()
         )
-        logger.info("Photo analyzed | user_id=%s, response_len=%s", user_id, len(response.get("text", "")))
+        logger.info("Photo analyzed | telegram_user_id=%s, response_len=%s", telegram_user_id, len(response.get("text", "")))
         await bot.send_message(
             message.chat.id,
             f"🔍 Анализ изображения:\n\n{strip_markdown(response['text'])}"
@@ -73,7 +75,7 @@ async def handle_photo_message(message: types.Message):
     except Exception as e:
         # Wraps Telegram send calls and the OpenAI Vision call — never log
         # raw exception text.
-        logger.error("Photo handler failed | user_id=%s, error_type=%s", user_id, type(e).__name__)
+        logger.error("Photo handler failed | telegram_user_id=%s, error_type=%s", telegram_user_id, type(e).__name__)
         await bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка при анализе изображения.\n"

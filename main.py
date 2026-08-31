@@ -78,6 +78,16 @@ async def shutdown_bot():
         logger.debug("Shutdown: vector index closed")
     except Exception as e:
         logger.debug("Shutdown: close_vector_index exception (ignored) | error_type=%s", type(e).__name__)
+    try:
+        # Stage 5C: deterministic release of the shared sync DB engine's
+        # connection pool on every real shutdown — same "explicit close,
+        # safe no-op if never constructed" pattern as close_vector_index()
+        # above.
+        from db.engine import close_db
+        close_db()
+        logger.debug("Shutdown: DB engine closed")
+    except Exception as e:
+        logger.debug("Shutdown: close_db exception (ignored) | error_type=%s", type(e).__name__)
     logger.info("Shutdown: complete")
 
 

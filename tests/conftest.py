@@ -12,9 +12,13 @@ os.environ.
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -25,6 +29,15 @@ if str(PROJECT_ROOT) not in sys.path:
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456789:TEST-TOKEN-DO-NOT-USE"
 os.environ["OPENAI_API_KEY"] = "sk-test-dummy-key"
 os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-dummy-key"
+# Stage 5C defense-in-depth (mirrors this file's own neutralize_proxy_env()
+# philosophy): an obviously-unreachable default so that if some future code
+# path ever bypassed the _default_fake_preferences autouse fixture below and
+# genuinely tried to connect, it fails fast and loudly instead of silently
+# reaching a real local PostgreSQL a developer happens to have running.
+# tests/test_stage5c_*.py's Docker-Postgres fixtures override
+# db.settings.DATABASE_URL directly (a module-attribute monkeypatch, not
+# this env var) for the one test process that actually needs a real DB.
+os.environ["DATABASE_URL"] = "postgresql+psycopg://invalid:invalid@127.0.0.1:1/pytest_should_never_connect"
 
 # Stage 2A: the accepted 137-test baseline mocks OpenAI at the SDK boundary
 # (openai_client.client.chat.completions.create) throughout. Pinning the
@@ -109,6 +122,416 @@ def _default_test_access_allowed(monkeypatch):
     """
     import utils.access_control as access_control
     monkeypatch.setattr(access_control, "is_authorized", lambda user_id: True)
+
+
+@pytest.fixture(autouse=True)
+def _default_fake_preferences(monkeypatch):
+    """
+    Stage 5C added a PostgreSQL-backed identity/preferences layer
+    (db.identity/db.preferences) that app/identity.py's resolve_user_uuid()
+    and app/session.py's UserSession.get_mode/set_mode/get_voice/set_voice
+    call via asyncio.to_thread(). Without a fake here, the FIRST test in the
+    session to exercise any of these would construct the real sync DB engine
+    singleton against DATABASE_URL — hanging/failing against the
+    deliberately-unreachable default above, or (if that default were ever
+    weakened) silently writing to a real local PostgreSQL instance, exactly
+    the "must never mutate real runtime state" violation this suite's other
+    fixtures already guard against for the filesystem (see pytest_configure()
+    below). Every test defaults to fully in-memory, per-test-isolated fakes
+    here — same shape as the real db.* contract (stable UUID per Telegram
+    id, (None, None) preferences for an unseen user) but backed by plain
+    dicts.
+
+    tests/test_stage5c_identity.py / test_stage5c_preferences.py /
+    test_stage5c_documents_catalog.py / test_stage5c_migration.py define a
+    same-named fixture that shadows this one (same mechanism
+    tests/test_stage1c_access_control.py already uses against
+    _default_test_access_allowed above) so they exercise the REAL db.*
+    functions against a real disposable PostgreSQL container instead — see
+    postgres_container()/postgres_db() below.
+    """
+    import db.identity as db_identity
+    import db.preferences as db_preferences
+
+    telegram_to_uuid = {}
+    preferences = {}
+
+    def fake_resolve(telegram_id):
+        if telegram_id not in telegram_to_uuid:
+            telegram_to_uuid[telegram_id] = uuid.uuid4()
+        return telegram_to_uuid[telegram_id]
+
+    def fake_get_preferences(user_id):
+        row = preferences.get(user_id, {})
+        return row.get("mode"), row.get("voice")
+
+    def fake_set_mode(user_id, mode):
+        preferences.setdefault(user_id, {})["mode"] = mode
+
+    def fake_set_voice(user_id, voice):
+        preferences.setdefault(user_id, {})["voice"] = voice
+
+    monkeypatch.setattr(db_identity, "resolve_or_create_user_by_telegram_id_sync", fake_resolve)
+    monkeypatch.setattr(db_preferences, "get_preferences_sync", fake_get_preferences)
+    monkeypatch.setattr(db_preferences, "set_mode_sync", fake_set_mode)
+    monkeypatch.setattr(db_preferences, "set_voice_sync", fake_set_voice)
+
+
+def _install_fake_documents_catalog(monkeypatch) -> None:
+    """
+    Shared implementation, factored out (Stage 5C corrective pass #2,
+    Section 5) so it can be reused verbatim by both the autouse fixture
+    immediately below AND tests/test_stage5c_migration.py's own
+    conditional override — that module's offline "Section A" tests need
+    this exact in-memory fake (no real PostgreSQL reachable without
+    postgres_db), while its "Section B" tests take `postgres_db` and must
+    exercise REAL db.documents against it. A previous version of that
+    module shadowed `_default_fake_preferences` only, leaving THIS fake
+    silently active even for its "against a REAL disposable PostgreSQL
+    container" tests — their own catalog assertions were therefore
+    secretly checking this in-memory dict, never PostgreSQL.
+
+    Same rationale as _default_fake_preferences above, for the document
+    ownership/catalog layer (db.documents) — app/documents.py's
+    _store_document_exclusively()/_load_and_index_document()/
+    _cleanup_new_upload() call db.documents.create_pending_sync()/
+    mark_active_sync()/delete_sync() on EVERY managed-upload ingest, inside
+    the executor-thread worker functions (see db/engine.py's module
+    docstring for why these are sync, not async). Any test that exercises
+    the real ingest pipeline — most of tests/test_stage1b_document_upload.py,
+    tests/test_stage2c_upload_lifecycle.py, etc. — would otherwise need a
+    real reachable PostgreSQL. Fakes mirror the real contract: create_pending
+    inserts a 'pending' row, mark_active flips it to 'active' and raises if
+    no such row exists, delete is a no-op if absent.
+    """
+    import db.documents as db_documents
+
+    catalog = {}
+
+    def fake_create_pending(*, document_id, owner_user_id, stored_name, display_name, content_sha256):
+        catalog[document_id] = {
+            "owner_user_id": owner_user_id,
+            "stored_name": stored_name,
+            "display_name": display_name,
+            "content_sha256": content_sha256,
+            "status": "pending",
+        }
+
+    def fake_mark_active(*, document_id):
+        if document_id not in catalog:
+            raise RuntimeError("mark_active_sync: no pending document row found to update")
+        catalog[document_id]["status"] = "active"
+
+    def fake_delete(*, document_id):
+        catalog.pop(document_id, None)
+
+    def fake_reconcile_ambiguous_create_pending(*, document_id, owner_user_id, stored_name, display_name, content_sha256):
+        # Mirrors db.documents.reconcile_ambiguous_create_pending_sync()'s
+        # exact conditional-delete contract (Stage 5C corrective pass #3,
+        # Blocker 3) against this same in-memory dict — without this fake,
+        # app/documents.py's own call to the REAL function would try to
+        # reach the deliberately-unreachable poisoned DATABASE_URL (see
+        # this file's top-level comment) and simply return False from its
+        # own except-clause, silently making every offline "ordinary
+        # create_pending failure" test look like an incomplete cleanup.
+        row = catalog.get(document_id)
+        if row is None:
+            return True
+        if (
+            row["owner_user_id"] != owner_user_id
+            or row["stored_name"] != stored_name
+            or row["display_name"] != display_name
+            or row["content_sha256"] != content_sha256
+            or row["status"] != "pending"
+        ):
+            return False
+        catalog.pop(document_id, None)
+        return True
+
+    def fake_get(*, document_id):
+        row = catalog.get(document_id)
+        if row is None:
+            return None
+        return db_documents.DocumentRecord(
+            id=document_id,
+            owner_user_id=row["owner_user_id"],
+            stored_name=row["stored_name"],
+            display_name=row["display_name"],
+            content_sha256=row["content_sha256"],
+            status=row["status"],
+        )
+
+    def fake_get_active_owners(document_ids):
+        return {
+            doc_id: catalog[doc_id]["owner_user_id"]
+            for doc_id in document_ids
+            if doc_id in catalog and catalog[doc_id]["status"] in db_documents.ACTIVE_STATUSES
+        }
+
+    monkeypatch.setattr(db_documents, "create_pending_sync", fake_create_pending)
+    monkeypatch.setattr(db_documents, "mark_active_sync", fake_mark_active)
+    monkeypatch.setattr(db_documents, "delete_sync", fake_delete)
+    monkeypatch.setattr(db_documents, "reconcile_ambiguous_create_pending_sync", fake_reconcile_ambiguous_create_pending)
+    monkeypatch.setattr(db_documents, "get_sync", fake_get)
+    monkeypatch.setattr(db_documents, "get_active_owners_sync", fake_get_active_owners)
+
+
+@pytest.fixture(autouse=True)
+def _default_fake_documents_catalog(monkeypatch):
+    """
+    Same rationale as _default_fake_preferences immediately above, for the
+    document ownership/catalog layer (db.documents) — see
+    _install_fake_documents_catalog() above for the actual fake and its
+    full rationale.
+
+    tests/test_stage5c_documents_catalog.py / test_stage5c_migration.py
+    define a same-named fixture that shadows this one to exercise the REAL
+    db.documents functions against a real disposable PostgreSQL container.
+    """
+    _install_fake_documents_catalog(monkeypatch)
+
+
+def _docker_available() -> bool:
+    return shutil.which("docker") is not None
+
+
+# Stage 5C corrective pass: an explicit test PostgreSQL DSN — set by CI
+# (see .github/workflows/tests.yml's `postgres` service) — always takes
+# priority over any local-Docker fallback. Never the ambient DATABASE_URL
+# (that name is deliberately poisoned at module import time, above, so
+# nothing can ever silently fall back to it).
+TEST_POSTGRES_DSN_ENV = "TEST_POSTGRES_DSN"
+
+# When set truthy, the absence/unreadiness of a required PostgreSQL proof
+# is a hard test FAILURE, never a silent skip — this is what CI sets so a
+# broken/misconfigured service can never make the Stage 5C PostgreSQL
+# proof quietly disappear from the required-checks signal. Local
+# developer runs leave this unset, so a missing Docker/image remains a
+# clearly-reported skip rather than blocking unrelated work.
+REQUIRE_POSTGRES_ENV = "PYTEST_REQUIRE_POSTGRES"
+
+_POSTGRES_IMAGE = "postgres:16-alpine"
+
+
+def _postgres_required() -> bool:
+    return os.environ.get(REQUIRE_POSTGRES_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _unavailable(reason: str) -> None:
+    """Either pytest.fail() (REQUIRE_POSTGRES_ENV set — e.g. CI) or
+    pytest.skip() (ordinary local dev run) for the same underlying
+    condition — see REQUIRE_POSTGRES_ENV's own docstring above."""
+    if _postgres_required():
+        pytest.fail(f"PostgreSQL proof is required ({REQUIRE_POSTGRES_ENV}=1) but unavailable: {reason}")
+    else:
+        pytest.skip(f"PostgreSQL is not available — skipping PostgreSQL-backed tests: {reason}")
+
+
+def _image_available_locally(image: str) -> bool:
+    """True only if `image` is already present in the local Docker image
+    cache — checked with `docker image inspect`, which never touches the
+    network/registry (unlike `docker pull`/`docker run` without
+    --pull=never, which fall back to pulling on a cache miss). Used to
+    decide whether a LOCAL developer run may start a disposable container
+    at all: Section 7's requirement that ordinary test execution must
+    never itself trigger an unexpected Docker Hub pull."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _wait_for_real_postgres_connection(dsn: str, *, timeout_seconds: float) -> Optional[str]:
+    """
+    Deterministic readiness (Section 8): a container/service reporting
+    "healthy" (or an in-container `pg_isready` succeeding once) can still
+    be observing PostgreSQL's temporary initialization server in the
+    narrow window immediately before the official server restarts —
+    Codex's documented race. The only proof that actually matters is a
+    REAL host-side client successfully connecting and executing a trivial
+    query, repeatedly, until it stops flaking.
+
+    Requires `_STABLE_SUCCESSES` consecutive successful `SELECT 1` round
+    trips (never just one) before declaring readiness — a single success
+    could still land in that same restart window by chance. Bounded by
+    `timeout_seconds`; returns None on success, or a short SANITIZED
+    failure reason on timeout (never the DSN itself, which embeds a
+    password) for a caller to report.
+    """
+    import psycopg
+
+    # psycopg.connect() speaks plain `postgresql://` connection strings —
+    # not SQLAlchemy's `+<driver>` dialect suffix (`postgresql+psycopg://`,
+    # the form every DSN in this codebase otherwise uses for
+    # db.settings.DATABASE_URL/create_engine()). Strip it for this one
+    # direct-driver readiness probe only; the DSN yielded to callers keeps
+    # the SQLAlchemy form unchanged.
+    psycopg_dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+
+    _STABLE_SUCCESSES = 3
+    deadline = time.monotonic() + timeout_seconds
+    consecutive_successes = 0
+    last_error_type = None
+    while time.monotonic() < deadline:
+        try:
+            with psycopg.connect(psycopg_dsn, connect_timeout=3) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            consecutive_successes += 1
+            if consecutive_successes >= _STABLE_SUCCESSES:
+                return None
+        except Exception as e:
+            consecutive_successes = 0
+            last_error_type = type(e).__name__
+        time.sleep(0.3)
+    return f"no stable connection within {timeout_seconds:.0f}s (last error_type={last_error_type})"
+
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    """
+    Session-scoped PostgreSQL DSN (Stage 5C) for tests that must prove
+    REAL PostgreSQL-specific behavior (unique constraints, the
+    pg_advisory_xact_lock race-safety pattern, the actual Alembic
+    migration path) — never pretend SQLite/mock behavior proves that.
+
+    Three paths, in priority order (Section 6/7):
+
+    1. TEST_POSTGRES_DSN_ENV is set — the CI path (see
+       .github/workflows/tests.yml's `postgres` service). Used directly;
+       this fixture never starts/stops anything itself, since the service
+       container's lifecycle belongs to the CI job, not this test run.
+       Readiness is still verified for real (see below) — CI's own service
+       healthcheck proves the SERVICE started, not that a genuine
+       host-side client round trip through the mapped port succeeds.
+    2. No explicit DSN, but Docker is on PATH AND the pinned image
+       (`postgres:16-alpine`) is ALREADY cached locally — starts a
+       disposable, `--pull=never` (Section 7: local test execution must
+       never itself trigger an unexpected Docker Hub pull), `--rm`, no-
+       volume-mount container bound to 127.0.0.1 on a Docker-assigned free
+       port (an explicitly pytest-socket-allowed host — see pytest.ini),
+       removed in the `finally` block below.
+    3. Neither — `_unavailable()` skips (ordinary local dev run) or fails
+       (REQUIRE_POSTGRES_ENV=1 — e.g. CI) with a clear, specific reason.
+       This is what makes "PostgreSQL proof silently disappearing from
+       CI" impossible: CI always sets REQUIRE_POSTGRES_ENV, so a
+       misconfigured/absent service is a hard failure there, never a skip.
+    """
+    explicit_dsn = os.environ.get(TEST_POSTGRES_DSN_ENV)
+    if explicit_dsn:
+        failure = _wait_for_real_postgres_connection(explicit_dsn, timeout_seconds=60)
+        if failure is not None:
+            _unavailable(f"{TEST_POSTGRES_DSN_ENV} was set but never became reachable — {failure}")
+            return
+        yield explicit_dsn
+        return
+
+    if not _docker_available():
+        _unavailable("docker is not on PATH")
+        return
+    if not _image_available_locally(_POSTGRES_IMAGE):
+        _unavailable(
+            f"image {_POSTGRES_IMAGE!r} is not already cached locally (local runs never auto-pull — "
+            f"`docker pull {_POSTGRES_IMAGE}` once, or set {TEST_POSTGRES_DSN_ENV})"
+        )
+        return
+
+    container_name = f"pytutorbot_test_pg_{uuid.uuid4().hex[:8]}"
+    try:
+        subprocess.run(
+            [
+                "docker", "run", "--rm", "-d", "--pull=never", "--name", container_name,
+                "-e", "POSTGRES_PASSWORD=pytest", "-e", "POSTGRES_USER=pytest", "-e", "POSTGRES_DB=pytest",
+                "-p", "127.0.0.1::5432",
+                "--health-cmd", "pg_isready -U pytest -d pytest",
+                "--health-interval=1s", "--health-timeout=3s", "--health-retries=30", "--health-start-period=5s",
+                _POSTGRES_IMAGE,
+            ],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        _unavailable(f"could not start a disposable PostgreSQL container — error_type={type(e).__name__}")
+        return
+
+    try:
+        port_output = subprocess.run(
+            ["docker", "port", container_name, "5432/tcp"],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        host_port = port_output.rsplit(":", 1)[-1]
+        url = f"postgresql+psycopg://pytest:pytest@127.0.0.1:{host_port}/pytest"
+
+        # Step 1: wait for Docker's OWN healthcheck (pg_isready run INSIDE
+        # the container) to report "healthy" — bounded, since --health-
+        # retries=30 at a 1s interval already caps this around ~35s.
+        healthy = False
+        for _ in range(60):
+            inspect = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Health.Status}}", container_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            if inspect.returncode == 0 and inspect.stdout.strip() == "healthy":
+                healthy = True
+                break
+            time.sleep(0.5)
+        if not healthy:
+            _unavailable("container health status never reached 'healthy'")
+            return
+
+        # Step 2 (Section 8): Docker's healthcheck proves the IN-CONTAINER
+        # pg_isready succeeded — Codex's documented race is that this can
+        # still observe the temporary initialization server immediately
+        # before the official server restarts. Only a real, repeated,
+        # HOST-SIDE psycopg connection through the actual mapped port
+        # proves the server this test suite will actually talk to is the
+        # genuine, stable one.
+        failure = _wait_for_real_postgres_connection(url, timeout_seconds=30)
+        if failure is not None:
+            _unavailable(f"container reported healthy but host-side connection never stabilized — {failure}")
+            return
+
+        yield url
+    finally:
+        subprocess.run(["docker", "stop", container_name], capture_output=True, timeout=30)
+
+
+@pytest.fixture
+def postgres_db(postgres_container, monkeypatch):
+    """
+    Function-scoped: redirects db.settings.DATABASE_URL (read fresh by
+    db.engine.get_sync_engine() on every call — see its own module
+    docstring on why that matters here) to the session's disposable
+    PostgreSQL container, resets the engine singleton so a fresh Engine
+    binds to the redirected URL, applies the REAL Alembic migration path
+    (never Base.metadata.create_all() — proves the actual operator-facing
+    migration, not just that the ORM models are internally consistent),
+    and truncates every table first so each test starts from a clean slate
+    with zero cross-test data leakage.
+    """
+    import db.engine as db_engine
+    import db.settings as db_settings
+
+    monkeypatch.setattr(db_settings, "DATABASE_URL", postgres_container)
+    monkeypatch.setattr(db_engine, "_sync_engine", None)
+
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(PROJECT_ROOT / "alembic.ini"))
+    cfg.attributes["sqlalchemy_url"] = postgres_container
+    command.upgrade(cfg, "head")
+
+    from sqlalchemy import text
+    engine = db_engine.get_sync_engine()
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE users, telegram_accounts, user_preferences, documents CASCADE"))
+
+    yield postgres_container
 
 
 def pytest_configure(config):

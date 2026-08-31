@@ -36,6 +36,7 @@ data/documents, data/documents/uploads, data/chroma_db, or bot.log paths
 import asyncio
 import logging
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -82,6 +83,7 @@ async def test_cancel_during_storage_waits_for_worker_and_removes_only_owned_fil
             physical_path=path,
             sidecar_path=tmp_path / "owned_upload.meta.json",
             document_id="upload:test-fake",
+            document_uuid=uuid.uuid4(),
             content_sha256="deadbeef",
             owner_user_id=owner_user_id,
         )
