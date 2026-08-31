@@ -84,3 +84,11 @@ alembic>=1.13.0,<2.0.0
 # Explicit dependencies for compatibility
 numpy>=1.24.0; python_version < '3.13'
 numpy>=1.26.0; python_version >= '3.13'
+
+# Web adapter (Stage 6A): FastAPI application + ASGI server, alongside the
+# existing Telegram adapter (pyTelegramBotAPI, above). Verified installable
+# and conflict-free with this file's existing pins (resolved to
+# fastapi 0.141.1 / starlette 1.6.0 against the already-pinned
+# pydantic 2.x this repo's other dependencies already bring in).
+fastapi>=0.121.0,<1.0.0
+uvicorn>=0.34.0,<1.0.0

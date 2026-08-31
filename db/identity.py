@@ -15,6 +15,8 @@ once is now a known user").
 """
 
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import select, text
@@ -22,6 +24,33 @@ from sqlalchemy.orm import Session
 
 from db.engine import get_sync_engine
 from db.models import TelegramAccount, User
+
+
+@dataclass(frozen=True)
+class UserRecord:
+    """Minimal, safe-to-expose snapshot of a canonical `users` row — see
+    get_user_by_id_sync() below."""
+    id: uuid.UUID
+    created_at: datetime
+
+
+def get_user_by_id_sync(user_id: uuid.UUID) -> Optional[UserRecord]:
+    """
+    Plain read of the canonical `users` row by its internal UUID, or None
+    if no such user exists. Adapter-agnostic (despite this module's other
+    functions being Telegram-specific): used by the web adapter's
+    authenticated "current user" endpoint via app/auth_session.py, and
+    fine for any future adapter to reuse the same way. Deliberately
+    returns only `id`/`created_at` — never a Telegram id or any other
+    internal detail — mirroring db.documents.DocumentRecord's own
+    "minimal, concrete snapshot" philosophy rather than exposing the raw
+    ORM row.
+    """
+    with Session(get_sync_engine()) as session:
+        row = session.get(User, user_id)
+        if row is None:
+            return None
+        return UserRecord(id=row.id, created_at=row.created_at)
 
 
 def lookup_user_by_telegram_id_sync(telegram_id: int) -> Optional[uuid.UUID]:

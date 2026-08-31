@@ -41,6 +41,32 @@
 
 ---
 
+## Web-адаптер (Stage 6A)
+
+Помимо Telegram-бота, репозиторий содержит отдельный FastAPI-адаптер
+(`web/`) поверх того же канонического слоя идентичности — без второй
+модели пользователя и без второго источника истины. Аутентификация
+браузера — настоящая **серверная сессия** в PostgreSQL (не JWT, не
+подписанный клиентский токен): cookie несёт только непрозрачный
+криптографически случайный идентификатор, в базе хранится лишь его
+SHA-256-дайджест (см. `db/auth_sessions.py`, `app/auth_session.py`).
+
+- Запуск (отдельный процесс, не запускает Telegram-бота):
+  ```
+  python web_main.py
+  ```
+  Требует `SESSION_SECRET_KEY` в `.env` (подпись CSRF-токенов) —
+  без него адаптер не запустится (fail closed), см. `.env.example`.
+- Эндпоинты: `GET /healthz` (без авторизации), `GET /api/me` (текущий
+  пользователь — только `id`/`created_at`, без Telegram id и внутренних
+  деталей), `POST /api/logout` (требует валидную сессию и CSRF-заголовок
+  `X-CSRF-Token`).
+- CSRF: stateless double-submit cookie, значение криптографически привязано
+  к самому токену сессии (`web/csrf.py`) — не единственная защита от CSRF,
+  но SameSite=Lax остаётся дополнительным слоем, не основным механизмом.
+- GitHub OAuth и связывание Telegram/Web-аккаунтов — сознательно вне
+  рамок этой стадии (Stage 6B).
+
 ## Режимы
 
 | Команда        | Описание |
@@ -118,13 +144,16 @@
 
 ## Структура проекта
 
-- `main.py` — точка входа, подключение обработчиков, индексация RAG, инициализация/закрытие DB-движка
+- `main.py` — точка входа Telegram-бота, подключение обработчиков, индексация RAG, инициализация/закрытие DB-движка
 - `bot.py` — экземпляр бота (pyTelegramBotAPI)
+- `web_main.py` — точка входа web-адаптера (Stage 6A, отдельный процесс от `main.py`)
+- `web_config.py` — настройки только для web-адаптера (`SESSION_SECRET_KEY` и др.), не требуется для Telegram-бота
 - `config.py` — настройки, пути, режимы (без Telegram-credential — см. `telegram_config.py`)
 - `telegram_config.py` — валидация `TELEGRAM_BOT_TOKEN`, импортируется только Telegram-адаптером (`bot.py`)
 - `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры; резолвят внутренний UUID сразу после проверки доступа)
-- `app/` — Telegram-независимый прикладной слой: tutor (оркестрация диалога), session (состояние пользователя — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID)
-- `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя), preferences (mode/voice upsert), documents (каталог владения документами)
+- `web/` — тонкий FastAPI-адаптер (Stage 6A): app (фабрика приложения), routes, dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`
+- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв — Stage 6A)
+- `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, Stage 6A)
 - `alembic/`, `alembic.ini` — миграции схемы PostgreSQL (`alembic upgrade head`)
 - `services/` — text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation
 - `rag/` — index (Qdrant, владение по `owner_user_uuid`), query, loader (PDF, TXT, MD, DOCX), identity (стабильные ID документов/чанков + валидация канонического UUID), sidecar (метаданные загруженных документов, схема v3)
@@ -151,6 +180,7 @@ Telegram-аккаунтов, настроек (mode/voice) и каталога �
 | `telegram_accounts` | Привязка Telegram id → `users.id` (unique в обе стороны) |
 | `user_preferences` | `mode`/`voice` пользователя (durable) |
 | `documents` | Каталог владения загруженными документами (`status`: pending/active) |
+| `web_sessions` | Серверные web-сессии (Stage 6A, `alembic/versions/0002_web_sessions.py`): `session_token_hash` (SHA-256 браузерного bearer-токена, PK) → `users.id`, `expires_at`, `revoked_at` |
 
 Схема создаётся ТОЛЬКО через Alembic — приложение не создаёт таблицы
 самостоятельно при старте:
@@ -167,7 +197,7 @@ alembic upgrade head
 
 ## Зависимости
 
-Основные: pyTelegramBotAPI, openai, anthropic, qdrant-client, langchain-core, langchain-openai, langchain-community, langchain-text-splitters, pypdf, docx2txt, pydub, aiofiles, aiohttp, SQLAlchemy, psycopg, alembic.
+Основные: pyTelegramBotAPI, openai, anthropic, qdrant-client, langchain-core, langchain-openai, langchain-community, langchain-text-splitters, pypdf, docx2txt, pydub, aiofiles, aiohttp, SQLAlchemy, psycopg, alembic, fastapi, uvicorn.
 
 Подробный список: `requirements.txt`.
 

@@ -10,3 +10,8 @@ pytest-asyncio>=1.4.0,<2.0.0
 # fails the test run instead of silently succeeding or silently being
 # skipped.
 pytest-socket>=0.8.1,<1.0.0
+
+# Required by Starlette's TestClient (FastAPI's own recommended test
+# client, used by tests/test_stage6a_fastapi_app.py) — not a runtime
+# dependency of the web adapter itself, only of testing it.
+httpx>=0.27.0,<1.0.0

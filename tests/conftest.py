@@ -39,6 +39,12 @@ os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-dummy-key"
 # this env var) for the one test process that actually needs a real DB.
 os.environ["DATABASE_URL"] = "postgresql+psycopg://invalid:invalid@127.0.0.1:1/pytest_should_never_connect"
 
+# Stage 6A: web_config.py fails closed at import time without this (same
+# posture as OPENAI_API_KEY/ANTHROPIC_API_KEY above) — set deterministically
+# here so any test importing web/*.py or app/auth_session.py never depends
+# on a developer's local .env defining it. Never a real secret.
+os.environ["SESSION_SECRET_KEY"] = "test-session-secret-key-do-not-use-in-production"
+
 # Stage 2A: the accepted 137-test baseline mocks OpenAI at the SDK boundary
 # (openai_client.client.chat.completions.create) throughout. Pinning the
 # test-session provider to "openai" here keeps every one of those existing
@@ -512,6 +518,20 @@ def postgres_db(postgres_container, monkeypatch):
     migration, not just that the ORM models are internally consistent),
     and truncates every table first so each test starts from a clean slate
     with zero cross-test data leakage.
+
+    `web_session_policy` (Stage 6A independent-audit corrective pass #3) is
+    deliberately NOT in that TRUNCATE list: it is a singleton row, seeded
+    ONCE by the migration itself (see alembic/versions/0002_web_sessions.py)
+    — TRUNCATEing it would leave the table empty and make
+    db.auth_sessions.create_sync()'s/apply_startup_posture_sync()'s
+    `SELECT ... FOR UPDATE ... .scalar_one()` raise NoResultFound for
+    every subsequent test in the session (the container, and therefore its
+    already-migrated schema, is session-scoped — `command.upgrade(cfg,
+    "head")` below is a no-op on every test after the first, since
+    alembic_version already reads "head"). Instead, its one row is reset
+    to the fail-safe default (`current_secure = true`) before every test,
+    the same "known clean state" guarantee TRUNCATE gives the other
+    tables, without ever deleting the row itself.
     """
     import db.engine as db_engine
     import db.settings as db_settings
@@ -529,7 +549,8 @@ def postgres_db(postgres_container, monkeypatch):
     from sqlalchemy import text
     engine = db_engine.get_sync_engine()
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE users, telegram_accounts, user_preferences, documents CASCADE"))
+        conn.execute(text("TRUNCATE users, telegram_accounts, user_preferences, documents, web_sessions CASCADE"))
+        conn.execute(text("UPDATE web_session_policy SET current_secure = true, updated_at = now()"))
 
     yield postgres_container
 
