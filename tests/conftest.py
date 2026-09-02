@@ -45,6 +45,22 @@ os.environ["DATABASE_URL"] = "postgresql+psycopg://invalid:invalid@127.0.0.1:1/p
 # on a developer's local .env defining it. Never a real secret.
 os.environ["SESSION_SECRET_KEY"] = "test-session-secret-key-do-not-use-in-production"
 
+# Stage 6B: github_oauth_config.py fails closed at import time without
+# these (same posture as SESSION_SECRET_KEY above) — web.app.create_app()
+# imports web.github_oauth unconditionally (see web/app.py's own
+# docstring), so any test importing web.app/web.github_oauth transitively
+# requires these. Never real credentials; GITHUB_REDIRECT_URI uses an
+# https:// scheme purely so it validates under WEB_ENV's untouched
+# "production" test default (see web_config.py) — no test ever dials it
+# for real (all GitHub HTTP is mocked at the httpx transport layer, see
+# services/github_oauth_client.py's own docstring), and the actual inbound
+# TestClient request path (e.g. "/api/auth/github/callback") is unrelated
+# to this configured value, which only ever appears as an outbound
+# parameter/body value this suite asserts on.
+os.environ["GITHUB_CLIENT_ID"] = "test-github-client-id-do-not-use"
+os.environ["GITHUB_CLIENT_SECRET"] = "test-github-client-secret-do-not-use"
+os.environ["GITHUB_REDIRECT_URI"] = "https://testserver.example/api/auth/github/callback"
+
 # Stage 2A: the accepted 137-test baseline mocks OpenAI at the SDK boundary
 # (openai_client.client.chat.completions.create) throughout. Pinning the
 # test-session provider to "openai" here keeps every one of those existing
@@ -519,19 +535,32 @@ def postgres_db(postgres_container, monkeypatch):
     and truncates every table first so each test starts from a clean slate
     with zero cross-test data leakage.
 
-    `web_session_policy` (Stage 6A independent-audit corrective pass #3) is
-    deliberately NOT in that TRUNCATE list: it is a singleton row, seeded
-    ONCE by the migration itself (see alembic/versions/0002_web_sessions.py)
-    — TRUNCATEing it would leave the table empty and make
-    db.auth_sessions.create_sync()'s/apply_startup_posture_sync()'s
-    `SELECT ... FOR UPDATE ... .scalar_one()` raise NoResultFound for
-    every subsequent test in the session (the container, and therefore its
+    Stage 6B adds `github_accounts`/`github_oauth_transactions` to the
+    TRUNCATE list below for the identical cross-test-isolation reason as
+    every other non-singleton table here.
+
+    `web_session_policy` (Stage 6A independent-audit corrective pass #3)
+    and `github_oauth_admission` (Stage 6B independent-audit corrective
+    pass #1, MAJOR 2) are deliberately NOT in that TRUNCATE list: both are
+    singleton rows, seeded ONCE by their own migration
+    (alembic/versions/0002_web_sessions.py /
+    alembic/versions/0003_github_oauth.py) — TRUNCATEing either would
+    leave its table empty and make the next `SELECT ... FOR UPDATE ...
+    .scalar_one()`/`.one()` against it raise NoResultFound for every
+    subsequent test in the session (the container, and therefore its
     already-migrated schema, is session-scoped — `command.upgrade(cfg,
     "head")` below is a no-op on every test after the first, since
-    alembic_version already reads "head"). Instead, its one row is reset
-    to the fail-safe default (`current_secure = true`) before every test,
-    the same "known clean state" guarantee TRUNCATE gives the other
-    tables, without ever deleting the row itself.
+    alembic_version already reads "head"). Instead, each singleton's one
+    row is reset to a known default state before every test — the same
+    "known clean state" guarantee TRUNCATE gives the other tables, without
+    ever deleting either row itself. For `github_oauth_admission`, without
+    this reset `starts_in_window` would keep accumulating across every
+    test in the session instead of giving each test the same fresh
+    admission budget, and `window_start` would drift arbitrarily far into
+    the past — resetting both here mirrors db.oauth_transactions.
+    create_sync()'s own "reset when the window has elapsed" logic, just
+    performed unconditionally for test isolation rather than only when a
+    real window has actually elapsed.
     """
     import db.engine as db_engine
     import db.settings as db_settings
@@ -549,8 +578,12 @@ def postgres_db(postgres_container, monkeypatch):
     from sqlalchemy import text
     engine = db_engine.get_sync_engine()
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE users, telegram_accounts, user_preferences, documents, web_sessions CASCADE"))
+        conn.execute(text(
+            "TRUNCATE users, telegram_accounts, user_preferences, documents, web_sessions, "
+            "github_accounts, github_oauth_transactions CASCADE"
+        ))
         conn.execute(text("UPDATE web_session_policy SET current_secure = true, updated_at = now()"))
+        conn.execute(text("UPDATE github_oauth_admission SET window_start = now(), starts_in_window = 0"))
 
     yield postgres_container
 

@@ -64,8 +64,124 @@ SHA-256-дайджест (см. `db/auth_sessions.py`, `app/auth_session.py`).
 - CSRF: stateless double-submit cookie, значение криптографически привязано
   к самому токену сессии (`web/csrf.py`) — не единственная защита от CSRF,
   но SameSite=Lax остаётся дополнительным слоем, не основным механизмом.
-- GitHub OAuth и связывание Telegram/Web-аккаунтов — сознательно вне
-  рамок этой стадии (Stage 6B).
+
+### GitHub OAuth-логин (Stage 6B)
+
+Браузер может дополнительно войти через настоящий OAuth 2.0 Authorization
+Code + PKCE (S256) флоу GitHub — `GET /api/auth/github/login` (редирект на
+GitHub) и `GET /api/auth/github/callback` (обмен кода, резолв личности,
+выпуск сессии). GitHub здесь — **только внешний провайдер идентичности**:
+канонический пользователь остаётся тем же `users.id` UUID, что и для
+Telegram, а не второй моделью пользователя.
+
+- Устойчивый внешний идентификатор — числовой `id` GitHub-аккаунта
+  (`GET https://api.github.com/user`), НИКОГДА login/username (может
+  измениться) и НИКОГДА email (может отсутствовать/быть приватным).
+  Таблица `github_accounts` — привязка этого id к `users.id`, структурно
+  идентична `telegram_accounts`.
+- Access-токен GitHub — эфемерный bootstrap-креденшл: используется один раз
+  сразу после обмена кода (запрос `GET /user`) и нигде не сохраняется, не
+  логируется и не попадает в cookie/ответ. Область доступа (scope) не
+  запрашивается вовсе — минимально необходимый для чтения публичного
+  профиля уровень.
+- OAuth-транзакция (`state` + PKCE `code_verifier`) хранится в PostgreSQL
+  (`github_oauth_transactions`) короткоживущей (по умолчанию 10 минут,
+  `GITHUB_OAUTH_TRANSACTION_TTL_SECONDS`) и одноразовой: атомарный
+  `DELETE ... RETURNING` в `db/oauth_transactions.py` гарантирует, что
+  повторное или параллельное использование одного и того же `state`
+  успевает только один раз, а cleartext PKCE-verifier удаляется из базы
+  сразу после использования (никогда не хранится бессрочно). Сохраняется
+  лишь SHA-256 дайджест `state` (не само значение) — как и
+  `session_token_hash` для web-сессий.
+- Защита от login CSRF: `/login` дополнительно ставит короткоживущую
+  HttpOnly-cookie с тем же `state`, что ушёл в GitHub; `/callback`
+  требует точного совпадения query-параметра `state` с этой cookie ДО
+  обращения к базе — иначе злоумышленник, легитимно начавший СВОЙ
+  собственный вход, мог бы завлечь чужой браузер на callback-URL и
+  подсадить жертве сессию от своего же GitHub-аккаунта. Cookie
+  сбрасывается только когда query `state` совпал с ней (эта транзакция
+  действительно текущая для браузера) — несовпадающий/старый callback
+  никогда не сбрасывает cookie другой, всё ещё активной вкладки.
+- После успешной идентификации всегда выпускается ЗАНОВО созданная Stage
+  6A-сессия (`app/auth_session.create_session()`) — существующая сессия
+  браузера (если была) не читается, не переиспользуется и не отзывается
+  как побочный эффект чужого входа.
+- **Stage 6C (явное связывание Telegram- и GitHub-аккаунтов одного
+  человека) сознательно НЕ реализовано здесь.** Первый вход через GitHub
+  всегда создаёт свой отдельный канонический аккаунт — даже если тот же
+  человек уже существует как Telegram-пользователь; слияние по
+  email/username/эвристике никогда не происходит.
+- Требует `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET`/`GITHUB_REDIRECT_URI` в
+  `.env` (см. `.env.example`) — без них web-адаптер не запустится (fail
+  closed), это обязательный маршрут адаптера, не опциональный флаг.
+  `GITHUB_REDIRECT_URI` должен точно совпадать с callback URL,
+  зарегистрированным в настройках GitHub OAuth App
+  (https://github.com/settings/developers); используйте отдельные
+  OAuth-приложения для разработки и продакшна. Допускается только
+  https:// в продакшне, либо http:// на буквальном loopback-хосте
+  (`127.0.0.1` или `::1` — НЕ `localhost`) при `WEB_ENV=development`; URI
+  не может содержать userinfo/fragment/query, путь обязан быть ровно
+  `/api/auth/github/callback`.
+
+#### Ограничение хранилища OAuth-транзакций и глобальный rate limit (Stage 6B corrective pass #1)
+
+Каждый `GET /api/auth/github/login` — неаутентифицированный маршрут.
+Чтобы он не мог неограниченно расти в PostgreSQL, `db.oauth_transactions.
+create_sync()` выполняет ВСЁ следующее одной атомарной транзакцией,
+сериализованной между процессами через `SELECT ... FOR UPDATE` над
+singleton-строкой `github_oauth_admission` (тот же приём, что
+`web_session_policy` уже использует для Stage 6A cookie-posture):
+
+1. удаляет все просроченные строки `github_oauth_transactions`
+   (индекс `ix_github_oauth_transactions_expires_at`);
+2. сбрасывает/продлевает фиксированное 60-секундное окно
+   глобального rate limit (`GITHUB_OAUTH_MAX_STARTS_PER_MINUTE`,
+   по умолчанию 30 стартов/минуту — глобально, не по IP: у приложения
+   пока нет доверенного контракта на IP клиента за прокси);
+3. отклоняет запрос (HTTP 429, строка НЕ создаётся) если окно rate limit
+   исчерпано, ИЛИ если количество ещё живых транзакций уже достигло
+   жёсткого потолка `GITHUB_OAUTH_MAX_OUTSTANDING_TRANSACTIONS`
+   (по умолчанию 200) — оба предела configurable через `.env`, оба
+   fail closed на некорректном/неположительном значении.
+
+Это делает рост таблицы физически ограниченным даже без внешнего
+cron/воркера и даже при нескольких процессах web-адаптера, делящих одну
+БД. Внешний rate limit на reverse-proxy/ingress перед
+`/api/auth/github/login` остаётся желательной defense-in-depth мерой
+(см. ниже), но не единственной защитой хранилища.
+
+#### Приватность callback (обязательное production-требование)
+
+`GET /api/auth/github/callback` получает `code`/`state` в query-строке —
+это, по определению OAuth Authorization Code, чувствительные
+одноразовые креденшлы. Уровни защиты:
+
+- **Код-уровневая гарантия (реализована и протестирована сейчас).**
+  `web_main.py` запускает Uvicorn с `access_log=False` — access-лог с
+  query-строкой никогда не пишется этим процессом. `web/app.py`'s
+  `create_app()` дополнительно отключает логгер `"uvicorn.access"`
+  (defense-in-depth) на случай запуска через голый `uvicorn`
+  CLI/конфиг (`uvicorn web.app:create_app --factory`), где access-лог
+  включён по умолчанию. Ответы `/api/auth/github/callback` (успех и
+  ошибки одинаково) несут `Referrer-Policy: no-referrer` и
+  `Cache-Control: no-store`.
+- **Production-требование к reverse-proxy/ingress (ОБЯЗАТЕЛЬНОЕ,
+  документируется здесь, физически НЕ проверяется кодом этого
+  приложения).** ASGI-приложение не может задним числом запретить
+  вышестоящему reverse-proxy/ingress/балансировщику логировать сырой
+  входящий URI ДО того, как запрос дойдёт до этого сервера. Поэтому
+  при развёртывании production reverse-proxy/ingress ОБЯЗАН либо (a)
+  полностью отключить access-логирование для маршрута
+  `/api/auth/github/callback`, либо (b) логировать только путь без
+  query-строки / редактировать (redact) `code` и `state`. Это
+  требование безопасности, а не опциональная настройка
+  производительности — Stage 6B не является стадией развёртывания
+  (Caddy/Traefik сознательно не настраиваются здесь), но при первом
+  реальном production-развёртывании это должно быть физически
+  проверено (просмотром реальной конфигурации/логов прокси), а не
+  просто задокументировано. Дополнительно production ingress должен
+  rate-limit'ить `/api/auth/github/login` — defense-in-depth поверх
+  описанного выше database-уровневого предела, никогда не замена ему.
 
 ## Режимы
 
@@ -151,11 +267,12 @@ SHA-256-дайджест (см. `db/auth_sessions.py`, `app/auth_session.py`).
 - `config.py` — настройки, пути, режимы (без Telegram-credential — см. `telegram_config.py`)
 - `telegram_config.py` — валидация `TELEGRAM_BOT_TOKEN`, импортируется только Telegram-адаптером (`bot.py`)
 - `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры; резолвят внутренний UUID сразу после проверки доступа)
-- `web/` — тонкий FastAPI-адаптер (Stage 6A): app (фабрика приложения), routes, dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`
-- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв — Stage 6A)
-- `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, Stage 6A)
+- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes, dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`
+- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв — Stage 6A), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B)
+- `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, Stage 6A), github_identity (race-safe резолв/создание пользователя по GitHub id, Stage 6B), oauth_transactions (короткоживущая одноразовая OAuth-транзакция + database-authoritative admission control/rate limit, Stage 6B)
+- `github_oauth_config.py` — настройки только для GitHub-логина (`GITHUB_CLIENT_ID`/`SECRET`/`REDIRECT_URI` и др., Stage 6B), не требуется для Telegram-бота
 - `alembic/`, `alembic.ini` — миграции схемы PostgreSQL (`alembic upgrade head`)
-- `services/` — text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation
+- `services/` — text_llm (провайдер-фасад), anthropic_client, openai_client, stt, tts, vision, image_generation, github_oauth_client (HTTP-клиент token exchange + `/user`, Stage 6B)
 - `rag/` — index (Qdrant, владение по `owner_user_uuid`), query, loader (PDF, TXT, MD, DOCX), identity (стабильные ID документов/чанков + валидация канонического UUID), sidecar (метаданные загруженных документов, схема v3)
 - `scripts/` — `rebuild_qdrant.py` (полная переиндексация Qdrant из исходников), `migrate_sidecars_v2_to_v3.py` (разовый перевод legacy-сайдкаров с Telegram-id на внутренний UUID)
 - `utils/` — logging, helpers (Telegram-утилиты: скачивание файлов, strip_markdown, очистка файлов), access_control (fail-closed allowlist по Telegram id)
@@ -181,6 +298,9 @@ Telegram-аккаунтов, настроек (mode/voice) и каталога �
 | `user_preferences` | `mode`/`voice` пользователя (durable) |
 | `documents` | Каталог владения загруженными документами (`status`: pending/active) |
 | `web_sessions` | Серверные web-сессии (Stage 6A, `alembic/versions/0002_web_sessions.py`): `session_token_hash` (SHA-256 браузерного bearer-токена, PK) → `users.id`, `expires_at`, `revoked_at` |
+| `github_accounts` | Привязка числового GitHub id → `users.id` (Stage 6B, `alembic/versions/0003_github_oauth.py`), структурно как `telegram_accounts` |
+| `github_oauth_transactions` | Короткоживущая одноразовая OAuth-транзакция GitHub-логина (Stage 6B): `state_hash` (SHA-256 дайджест `state`, PK), `code_verifier` (PKCE), `expires_at` (индексирован для cleanup). Claim — атомарный `DELETE ... RETURNING`: заявленная/просроченная строка удаляется, а не помечается — таблица никогда не содержит «мёртвых» строк, и каждая существующая строка учитывается в потолке `github_oauth_admission` |
+| `github_oauth_admission` | Singleton-строка (`id=1`) глобального admission control для `/api/auth/github/login` (Stage 6B corrective pass #1): `window_start`, `starts_in_window` — фиксированное 60-секундное окно rate limit, читается/обновляется под `SELECT ... FOR UPDATE` в той же транзакции, что cleanup+вставка новой OAuth-транзакции |
 
 Схема создаётся ТОЛЬКО через Alembic — приложение не создаёт таблицы
 самостоятельно при старте:

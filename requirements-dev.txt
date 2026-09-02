@@ -11,7 +11,12 @@ pytest-asyncio>=1.4.0,<2.0.0
 # skipped.
 pytest-socket>=0.8.1,<1.0.0
 
-# Required by Starlette's TestClient (FastAPI's own recommended test
-# client, used by tests/test_stage6a_fastapi_app.py) — not a runtime
-# dependency of the web adapter itself, only of testing it.
-httpx>=0.27.0,<1.0.0
+# httpx: also used directly by Starlette's TestClient (FastAPI's own
+# recommended test client, used by tests/test_stage6a_fastapi_app.py and
+# every Stage 6B test). Stage 6B independent-audit corrective pass #1,
+# MINOR 5: httpx is now declared as a direct RUNTIME dependency in
+# requirements.txt (services/github_oauth_client.py imports it in
+# production code, not merely for testing) — NOT re-declared here, to
+# avoid two separately-maintained version constraints for the same
+# package ever silently drifting apart. `pip install -r requirements.txt
+# -r requirements-dev.txt` (this file's own header) already installs it.

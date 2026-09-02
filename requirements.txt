@@ -92,3 +92,14 @@ numpy>=1.26.0; python_version >= '3.13'
 # pydantic 2.x this repo's other dependencies already bring in).
 fastapi>=0.121.0,<1.0.0
 uvicorn>=0.34.0,<1.0.0
+
+# GitHub OAuth HTTP client (Stage 6B): services/github_oauth_client.py
+# imports httpx directly and is production code, not test-only — so this
+# is now a direct RUNTIME dependency (Stage 6B independent-audit
+# corrective pass #1, MINOR 5), not merely a transitive dependency of
+# fastapi/starlette or a requirements-dev.txt-only test tool. Previously
+# only declared in requirements-dev.txt (where Starlette's TestClient
+# still needs it — see that file's own comment); the floor here matches
+# that file's existing floor exactly so the two never disagree about the
+# minimum installable version.
+httpx>=0.27.0,<1.0.0

@@ -12,6 +12,16 @@ every other adapter in this codebase. This is what lets "the application
 can be constructed offline" hold as a plain, unconditional fact,
 independent of whether a database is reachable.
 
+Stage 6B: web.github_oauth (GitHub login) is imported unconditionally
+below, the same as web.routes — GitHub login is a core route of this
+adapter, not an optional feature flag. That import transitively requires
+github_oauth_config.py's checks to pass (GITHUB_CLIENT_ID/SECRET/
+REDIRECT_URI configured and valid) — the same fail-closed posture
+web_config.py's SESSION_SECRET_KEY check already established for every
+route in this module, including ones (like /healthz) that don't
+themselves touch either credential. This has no effect on the Telegram
+adapter: main.py/bot.py never import anything under web/.
+
 Deliberately no module-level `app = create_app()` singleton (unlike
 bot.py's eager `bot = AsyncTeleBot(...)`): a FastAPI application built
 purely from route registration has no equivalent reason to be a singleton,
@@ -66,11 +76,13 @@ to true alongside a wide `allow_origins`.
 """
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 import web_config
+from web.github_oauth import router as github_oauth_router
 from web.routes import router
 
 
@@ -87,7 +99,39 @@ async def _lifespan(app: FastAPI):
     await asyncio.to_thread(close_db)
 
 
+def _disable_uvicorn_access_logging() -> None:
+    """Defense-in-depth for MAJOR 1 (Stage 6B independent-audit corrective
+    pass #1) — see web_main.py's own docstring for the PRIMARY guarantee
+    (`uvicorn.run(..., access_log=False)`), which stops Uvicorn's access-
+    log call site entirely regardless of logger configuration. This
+    additionally silences the `"uvicorn.access"` logger itself, so a
+    deployment that launches this exact ASGI app through the bare
+    `uvicorn` CLI/config (e.g. `uvicorn web.app:create_app --factory`,
+    where `access_log` defaults to True and a deployer may not think to
+    add an equivalent `--no-access-log` flag) still never has this
+    application's own callback query strings (`code`/`state`) written to
+    an access log.
+
+    Safe to call unconditionally from create_app(): Uvicorn installs its
+    OWN default logging configuration (which (re)creates/configures the
+    `"uvicorn.access"` logger) during `Config.__init__()` — which always
+    runs BEFORE `Config.load()` imports and calls this factory — so by the
+    time create_app() runs, Uvicorn's own setup has already happened and
+    this reliably overrides it, regardless of launch method. Only
+    `"uvicorn.access"` is touched; `"uvicorn"`/`"uvicorn.error"` (startup/
+    crash diagnostics) and this application's own `"bot"` logger
+    (utils/logging.py) are left completely alone — Do NOT disable
+    application security/error logging here.
+    """
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.disabled = True
+    access_logger.handlers = []
+    access_logger.propagate = False
+
+
 def create_app() -> FastAPI:
+    _disable_uvicorn_access_logging()
     app = FastAPI(title="Python Tutor Bot — Web API", lifespan=_lifespan)
     app.include_router(router)
+    app.include_router(github_oauth_router)
     return app

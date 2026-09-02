@@ -14,6 +14,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Integer,
     LargeBinary,
     SmallInteger,
     String,
@@ -286,3 +287,156 @@ class WebSessionPolicy(Base):
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
     current_secure: Mapped[bool] = mapped_column(Boolean, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class GithubAccount(Base):
+    """GitHub numeric user id -> internal user UUID mapping (Stage 6B) —
+    mirrors TelegramAccount above exactly, and is subject to the identical
+    Stage 6C non-merge boundary: `user_id` is UNIQUE, so one internal user
+    can never accumulate two GitHub accounts, and linking an existing
+    Telegram-backed user to a GitHub identity (or vice versa) is
+    explicitly out of Stage 6B's scope — a human with both a Telegram-
+    backed canonical user and a GitHub-backed one intentionally ends up
+    with two separate canonical users until Stage 6C's explicit linking
+    ships. See db/github_identity.py's own module docstring.
+
+    `github_user_id` is GitHub's own stable NUMERIC `id` from
+    `GET https://api.github.com/user` — NEVER the login/username (which
+    can change) and NEVER email (which may be absent/private/change). It
+    IS the primary key — same natural-key-as-PK choice as
+    TelegramAccount.telegram_user_id above, no redundant surrogate key
+    needed."""
+
+    __tablename__ = "github_accounts"
+
+    github_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id"), nullable=False, unique=True
+    )
+    linked_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class GithubOAuthTransaction(Base):
+    """Short-lived, replay-resistant server-side OAuth transaction state
+    (Stage 6B) for the GitHub Authorization Code + PKCE flow — see
+    db/oauth_transactions.py for the create/claim operations and
+    web/github_oauth.py for how the login flow actually uses them.
+
+    `state_hash` (SHA-256 digest of the random `state` value handed to
+    GitHub) is the PRIMARY KEY — the exact same "digest only, never the
+    raw bearer/secret value itself" design as WebSession.
+    session_token_hash above, and the same `octet_length(...) = 32` CHECK
+    constraint for the identical reason documented on that model:
+    `LargeBinary(32)` alone compiles to an unconstrained BYTEA on
+    PostgreSQL and enforces nothing server-side without it. A stolen
+    database dump can therefore never be replayed as a live OAuth
+    callback without also knowing the actual `state` value that hashes to
+    a given row — and even then, db.oauth_transactions.claim_sync()'s
+    atomic single-use DELETE ... RETURNING means it can be redeemed at
+    most once.
+
+    `code_verifier` IS stored in cleartext, deliberately unlike
+    `state_hash` — see db/oauth_transactions.py's own module docstring for
+    why that is an acceptable trust boundary here (it never crosses the
+    browser, unlike `state`, which a network observer watching the
+    GitHub redirect can always see regardless of how it's stored here).
+
+    `created_at`/`expires_at` are `TIMESTAMP WITH TIME ZONE` — same
+    rationale as WebSession above (Stage 6A independent-audit corrective
+    pass #1, Blocker 1): db.oauth_transactions.claim_sync() and
+    create_sync()'s own expired-row cleanup both compare `expires_at`
+    against PostgreSQL's own now(), so this must be an instant-vs-instant
+    comparison, correct regardless of the PostgreSQL session's TimeZone
+    GUC. `expires_at` also carries a plain b-tree index — create_sync()'s
+    admission-path cleanup (independent-audit corrective pass #1, MAJOR 2)
+    deletes every row past its expiry on every call, and this index is
+    what keeps that a cheap, indexed operation rather than a growing
+    sequential scan as the table churns.
+
+    independent-audit corrective pass #1 (MAJOR 2, Section 8) REMOVED the
+    previous `consumed_at` column entirely: claim_sync() now atomically
+    DELETEs the row it claims (`DELETE ... WHERE state_hash = :h AND
+    expires_at > now() ... RETURNING code_verifier`) instead of merely
+    marking it consumed with an UPDATE. Replay-safety is unchanged (a
+    second claim attempt matches zero rows — the row is simply gone,
+    exactly as final as "already consumed" was) and this closes two
+    findings at once: the cleartext PKCE verifier of a completed
+    transaction no longer lingers in the table indefinitely (Section 8 —
+    "do not retain cleartext PKCE verifiers indefinitely"), and every row
+    remaining in this table at any moment is, by construction, still a
+    genuinely live, unclaimed, unexpired transaction — which is exactly
+    the "outstanding transaction count" create_sync()'s own admission
+    control (db/models.py's GithubOAuthAdmission, below) counts against
+    its hard cap. No row is ever left behind after either a successful
+    claim (deleted here) or an expiry sweep (deleted by create_sync()'s
+    own cleanup step) — there is no more "dead but not yet cleaned up"
+    row category left for this table at all."""
+
+    __tablename__ = "github_oauth_transactions"
+    __table_args__ = (
+        CheckConstraint("octet_length(state_hash) = 32", name="state_hash_length"),
+    )
+
+    state_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
+    code_verifier: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+# The one and only allowed primary key value for GithubOAuthAdmission's
+# singleton row — same pattern as WEB_SESSION_POLICY_ID above.
+GITHUB_OAUTH_ADMISSION_ID = 1
+
+
+class GithubOAuthAdmission(Base):
+    """Singleton, PostgreSQL-authoritative GLOBAL admission-control state
+    for GitHub OAuth login starts (Stage 6B independent-audit corrective
+    pass #1, MAJOR 2) — closes "an unauthenticated attacker can grow
+    `github_oauth_transactions` without bound by hammering `GET
+    /api/auth/github/login`" by making db.oauth_transactions.create_sync()
+    a single atomic transaction that locks THIS row first
+    (`SELECT ... FOR UPDATE`, the exact same singleton-row-lock idiom
+    WebSessionPolicy above already established for db.auth_sessions.
+    create_sync()/apply_startup_posture_sync()), then — all inside that
+    one lock — deletes expired transaction rows, resets/advances a fixed
+    GLOBAL rate window, and refuses to insert a new transaction row at all
+    if either the rate window or the outstanding-row hard cap
+    (`COUNT(*)` of `github_oauth_transactions` after cleanup) is already
+    exhausted. Real PostgreSQL row-level mutual exclusion serializes this
+    across every FastAPI worker/process sharing the same database — never
+    a process-local counter, which would only bound one process at a time.
+
+    Deliberately GLOBAL, not per-IP: this application has no trustworthy
+    reverse-proxy client-IP contract yet (Stage 6B is not the deployment
+    stage — see README.md's production deployment invariants), so a
+    per-IP scheme here would either trust a spoofable header or persist
+    IP addresses for no real benefit. A global bound is sufficient to make
+    storage growth impossible and keeps this table entirely free of any
+    new PII. Future reverse-proxy/edge rate limiting remains valid
+    defense-in-depth on top of this, never a substitute for it (see
+    db/oauth_transactions.py's own module docstring).
+
+    `window_start`/`starts_in_window` implement one fixed-size sliding
+    window (never persisted per caller): `starts_in_window` counts
+    admitted `/login` starts since `window_start`; once
+    `now() - window_start` exceeds the window length, create_sync() resets
+    both back to a fresh window as part of the same locked transaction.
+    Rejected attempts (rate-limited OR over the outstanding-row hard cap)
+    never increment this counter and never insert a transaction row — a
+    rejection costs the database nothing but the (already-necessary)
+    singleton-row lock and the cleanup DELETE.
+
+    `id` is CHECK-constrained to exactly GITHUB_OAUTH_ADMISSION_ID — same
+    "a second row can never exist" enforcement as WebSessionPolicy.id
+    above. Seeded with its one row directly by
+    alembic/versions/0003_github_oauth.py at migration time, never lazily
+    created by application code, for the identical "sidesteps a first-
+    process bootstrap race entirely" reason WebSessionPolicy's own
+    docstring documents."""
+
+    __tablename__ = "github_oauth_admission"
+    __table_args__ = (CheckConstraint(f"id = {GITHUB_OAUTH_ADMISSION_ID}", name="singleton_id"),)
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    starts_in_window: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
