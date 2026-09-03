@@ -55,6 +55,7 @@ defense-in-depth on top of this, documented as a production requirement in
 README.md — never a substitute for this application/database-layer bound.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
@@ -63,6 +64,20 @@ from sqlalchemy.orm import Session
 
 from db.engine import get_sync_engine
 from db.models import GITHUB_OAUTH_ADMISSION_ID, GithubOAuthAdmission, GithubOAuthTransaction
+
+
+@dataclass(frozen=True)
+class ClaimedTransaction:
+    """Returned ONLY by claim_sync() (Stage 6C corrective pass,
+    independent-audit MAJOR 1) — carries the transaction's captured
+    `auth_generation` alongside its `code_verifier` so the callback can
+    perform the generation-aware resolution
+    (db.github_identity.resolve_or_create_user_by_github_id_for_oauth_sync())
+    without a second round trip. Replaces claim_sync()'s previous bare
+    `Optional[str]` return."""
+
+    code_verifier: str
+    auth_generation: int
 
 
 def create_sync(
@@ -128,10 +143,26 @@ def create_sync(
     (via a blocking threading.Event.wait()) for as long as needed to
     deterministically force a concurrent caller to contend on the same
     lock, without any time.sleep()-based race.
+
+    Stage 6C corrective pass (independent-audit MAJOR 1): while this same
+    locked transaction holds the GithubOAuthAdmission row, it also reads
+    `unlink_generation` (the ONE global, monotonically-increasing OAuth-
+    generation counter — see that model's own docstring) and stores it
+    verbatim as the new transaction's `auth_generation`. This is the ONLY
+    place `auth_generation` is ever captured — never derived from an
+    application timestamp or process-local state — and reusing the
+    already-locked admission row for this read (rather than a second lock)
+    is what guarantees the captured value is exactly the generation in
+    effect at the instant this transaction is admitted, with no window for
+    a concurrent unlink to advance it in between.
     """
     with Session(get_sync_engine()) as session:
-        window_start, starts_in_window = session.execute(
-            select(GithubOAuthAdmission.window_start, GithubOAuthAdmission.starts_in_window)
+        window_start, starts_in_window, unlink_generation = session.execute(
+            select(
+                GithubOAuthAdmission.window_start,
+                GithubOAuthAdmission.starts_in_window,
+                GithubOAuthAdmission.unlink_generation,
+            )
             .where(GithubOAuthAdmission.id == GITHUB_OAUTH_ADMISSION_ID)
             .with_for_update()
         ).one()
@@ -165,16 +196,19 @@ def create_sync(
                 state_hash=state_hash,
                 code_verifier=code_verifier,
                 expires_at=expires_at,
+                auth_generation=unlink_generation,
             )
         )
         session.commit()
         return True
 
 
-def claim_sync(*, state_hash: bytes) -> Optional[str]:
+def claim_sync(*, state_hash: bytes) -> Optional[ClaimedTransaction]:
     """
     Atomic, single-use claim: DELETEs the transaction and returns its
-    `code_verifier` in ONE statement (`DELETE ... RETURNING`), or None if
+    `code_verifier` (plus, Stage 6C corrective pass MAJOR 1, its captured
+    `auth_generation` — see ClaimedTransaction above) in ONE statement
+    (`DELETE ... RETURNING`), or None if
     no row exists / it has already been claimed / it has expired — all
     three collapse to the exact same fail-closed outcome, mirroring
     db.auth_sessions.get_active_sync()'s own "unknown vs. expired vs.
@@ -226,8 +260,10 @@ def claim_sync(*, state_hash: bytes) -> Optional[str]:
                 GithubOAuthTransaction.state_hash == state_hash,
                 GithubOAuthTransaction.expires_at > func.now(),
             )
-            .returning(GithubOAuthTransaction.code_verifier)
+            .returning(GithubOAuthTransaction.code_verifier, GithubOAuthTransaction.auth_generation)
         )
         row = result.first()
         session.commit()
-        return row[0] if row is not None else None
+        if row is None:
+            return None
+        return ClaimedTransaction(code_verifier=row[0], auth_generation=row[1])

@@ -36,7 +36,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from db.engine import get_sync_engine
-from db.models import WEB_SESSION_POLICY_ID, WebSession, WebSessionPolicy
+from db.models import WEB_SESSION_POLICY_ID, GithubAccount, User, WebSession, WebSessionPolicy
 
 
 class StalePostureError(Exception):
@@ -62,6 +62,76 @@ class SessionRecord:
     expires_at: datetime
 
 
+def _lock_policy_and_insert_session(
+    session: Session,
+    *,
+    token_hash: bytes,
+    user_id: uuid.UUID,
+    issued_secure: bool,
+    expires_at: datetime,
+    _test_hook_after_lock: Optional[Callable[[], None]] = None,
+) -> None:
+    """
+    Shared core of create_sync()/create_for_github_sync() (Stage 6C,
+    Section K) — the ONE implementation of "lock the authoritative posture
+    row, compare, insert" so this security-critical logic is never
+    duplicated. MUST be called as the LAST lock this transaction takes
+    (module docstring / db/models.py's WebSessionPolicy docstring: the
+    policy row lock is always the final serialization point before the
+    INSERT, position 5 of the corrected lock order in db/telegram_link.py's
+    module docstring) — callers that need additional locks first (e.g.
+    create_for_github_sync()'s provider/user row locks) MUST take them
+    BEFORE calling this helper, never after.
+
+    `SELECT ... FOR UPDATE` on the singleton policy row is the FIRST
+    statement THIS HELPER executes (though not necessarily the first
+    statement of the caller's overall transaction — see above). The row
+    lock it takes is held for the rest of the transaction — through the
+    posture comparison, the INSERT (or the early rollback), and the
+    caller's own final commit — because everything runs on the same
+    `Session`/connection. This is what makes "check posture, then insert"
+    a single atomic unit against a concurrent apply_startup_posture_sync()
+    call, which takes the exact same lock, the exact same way, before
+    doing anything else: whichever of the two reaches the lock first runs
+    to completion (commit) before the other can even read the row.
+
+    Raises StalePostureError (transaction rolled back by this helper — the
+    caller must not also commit afterward) if `issued_secure` no longer
+    matches the authoritative posture — not a bug in the caller; it means
+    the calling process's own web_config.COOKIE_SECURE is stale relative
+    to the database.
+
+    `_test_hook_after_lock`: test-only synchronization seam, never passed
+    by any real (non-test) caller — see tests/test_stage6a_corrective3_
+    policy_race.py's own docstring for why this exists. If provided, it is
+    called with no arguments immediately after the policy row lock is
+    acquired, before the posture comparison.
+    """
+    current_secure = session.execute(
+        select(WebSessionPolicy.current_secure).where(WebSessionPolicy.id == WEB_SESSION_POLICY_ID).with_for_update()
+    ).scalar_one()
+
+    if _test_hook_after_lock is not None:
+        _test_hook_after_lock()
+
+    if current_secure != issued_secure:
+        session.rollback()
+        raise StalePostureError(
+            f"requested issued_secure={issued_secure} does not match the authoritative "
+            f"database posture (current_secure={current_secure}) — refusing to create a "
+            f"session under a stale process posture"
+        )
+
+    session.add(
+        WebSession(
+            session_token_hash=token_hash,
+            user_id=user_id,
+            issued_secure=issued_secure,
+            expires_at=expires_at,
+        )
+    )
+
+
 def create_sync(
     *,
     token_hash: bytes,
@@ -71,77 +141,129 @@ def create_sync(
     _test_hook_after_lock: Optional[Callable[[], None]] = None,
 ) -> None:
     """
-    Insert a brand-new session row — but ONLY inside the SAME transaction
-    as a fresh, LOCKED read of the authoritative posture in
-    `web_session_policy` (Stage 6A independent-audit corrective pass #3;
-    see db/models.py's WebSessionPolicy docstring for the full protocol
-    and the exact cross-process race this closes).
-
-    `SELECT ... FOR UPDATE` on the singleton policy row is the FIRST
-    statement this function executes. The row lock it takes is held for
-    the rest of THIS function's transaction — through the posture
-    comparison, the INSERT (or the early rollback), and the final commit
-    — because everything below runs on the same `Session`/connection, and
-    nothing here ever commits or opens a second transaction before the
-    real work is done. This is what makes "check posture, then insert" a
-    single atomic unit against a concurrent apply_startup_posture_sync()
-    call, which takes the exact same lock, the exact same way, before
-    doing anything else: whichever of the two reaches the lock first runs
-    to completion (commit) before the other can even read the row.
+    Insert a brand-new session row for an ALREADY-RESOLVED `user_id` — but
+    ONLY inside the SAME transaction as a fresh, LOCKED read of the
+    authoritative posture in `web_session_policy` (Stage 6A independent-
+    audit corrective pass #3; see db/models.py's WebSessionPolicy
+    docstring for the full protocol and the exact cross-process race this
+    closes). See _lock_policy_and_insert_session() above for the full
+    transactional protocol this delegates to — this function's own
+    contract (signature, StalePostureError, `_test_hook_after_lock`
+    timing) is UNCHANGED from before Stage 6C's refactor.
 
     `expires_at` is computed by the caller (app/auth_session.py, from
     session_config.SESSION_TTL_SECONDS) — this function performs no
     expiry-policy decisions of its own. `issued_secure` (Stage 6A
     independent-audit corrective pass #2, Major 1) is what gets persisted
     onto the new row (see db/models.py's WebSession docstring) — the
-    SAME value is also what gets compared against the locked policy row
-    here in pass #3.
+    SAME value is also what gets compared against the locked policy row.
 
-    Raises StalePostureError (no row inserted, transaction rolled back) if
-    `issued_secure` no longer matches the authoritative posture — this is
-    not a bug in the caller; it means the calling process's own
-    web_config.COOKIE_SECURE is stale relative to the database.
-
-    `_test_hook_after_lock`: test-only synchronization seam, never passed
-    by any real (non-test) caller — see tests/test_stage6a_corrective3_
-    policy_race.py's own docstring for why this exists (deterministic,
-    non-sleep-based proof of the real PostgreSQL row-lock interleaving,
-    mirroring the threading.Event pattern tests/test_stage1e1_
-    cancellation_safety.py already established for worker-thread
-    synchronization elsewhere in this codebase). If provided, it is
-    called with no arguments immediately after the policy row lock is
-    acquired, before the posture comparison — a test can use it to pause
-    this transaction open (via a blocking threading.Event.wait()) for as
-    long as needed to deterministically force a concurrent caller to
-    contend on the same lock.
+    Trusts `user_id` as-is — unlike create_for_github_sync() (Stage 6C),
+    this function does no provider/user-row locking of its own, because it
+    has no provider identity to re-resolve: the caller (Telegram identity
+    resolution today) already did that resolution itself, synchronously,
+    immediately before calling this. See create_for_github_sync()'s own
+    docstring for why GitHub-backed issuance needs the additional lock
+    steps this function deliberately does not have.
     """
     with Session(get_sync_engine()) as session:
-        current_secure = session.execute(
-            select(WebSessionPolicy.current_secure)
-            .where(WebSessionPolicy.id == WEB_SESSION_POLICY_ID)
-            .with_for_update()
-        ).scalar_one()
-
-        if _test_hook_after_lock is not None:
-            _test_hook_after_lock()
-
-        if current_secure != issued_secure:
-            session.rollback()
-            raise StalePostureError(
-                f"requested issued_secure={issued_secure} does not match the authoritative "
-                f"database posture (current_secure={current_secure}) — refusing to create a "
-                f"session under a stale process posture"
-            )
-
-        session.add(
-            WebSession(
-                session_token_hash=token_hash,
-                user_id=user_id,
-                issued_secure=issued_secure,
-                expires_at=expires_at,
-            )
+        _lock_policy_and_insert_session(
+            session,
+            token_hash=token_hash,
+            user_id=user_id,
+            issued_secure=issued_secure,
+            expires_at=expires_at,
+            _test_hook_after_lock=_test_hook_after_lock,
         )
         session.commit()
+
+
+def create_for_github_sync(
+    *,
+    github_user_id: int,
+    token_hash: bytes,
+    issued_secure: bool,
+    expires_at: datetime,
+    _test_hook_after_lock: Optional[Callable[[], None]] = None,
+) -> Optional[uuid.UUID]:
+    """
+    GitHub-backed session issuance (Stage 6C, Section K) — closes the race
+    the pre-Stage-6C GitHub OAuth callback had: it resolved a canonical
+    UUID in ONE transaction (app.github_identity.resolve_user_uuid()) and
+    minted a session for that UUID in a SEPARATE, later transaction
+    (create_sync() above) — a Stage 6C merge could move `github_user_id`'s
+    mapping onto a different (Telegram) canonical UUID in between, and the
+    old two-step flow would still mint a session for the now-stale UUID it
+    resolved a moment earlier.
+
+    This function re-resolves `github_user_id` -> canonical UUID FRESH,
+    under a lock, in the SAME transaction as the session INSERT — the
+    session is always minted for whichever UUID `github_accounts` ACTUALLY
+    maps `github_user_id` to at the moment of insertion, never a value
+    read moments earlier by a different transaction. It NEVER calls
+    db.github_identity.resolve_or_create_user_by_github_id_sync() or
+    otherwise creates a `github_accounts` row itself — a plain, read-only,
+    locked lookup only (Section K: "never recreates a GitHub mapping").
+    The caller (web/github_oauth.py) is still responsible for the
+    first-login creation path via app.github_identity.resolve_user_uuid(),
+    exactly as before Stage 6C; this function only replaces the SECOND
+    half (minting the session) with a race-safe version.
+
+    Lock order (db/telegram_link.py's module docstring, positions 3/4/5):
+      1. `github_accounts` row for `github_user_id`, `FOR UPDATE`. Missing
+         -> fail closed (returns None, no session, transaction rolled
+         back) — Section K: "returns a fail-closed result if the mapping
+         disappeared". This is the ONLY lock this function takes that
+         db.telegram_link.py's redeem_attempt_sync()/unlink_github_sync()
+         also take (the identical `github_accounts` row, by
+         `github_user_id`), which is exactly what serializes GitHub-backed
+         issuance against a concurrent merge/unlink of the SAME GitHub
+         account — see this module's own docstring at the top of the file
+         for the shared partial order this respects.
+      2. The mapped `users` row, `FOR UPDATE` — pins the current mapping
+         for the rest of this transaction; a merge that moves the
+         `github_accounts` row away is only possible by first taking the
+         SAME `github_accounts` row lock this function already holds, so
+         no TOCTOU window exists between reading `user_id` here and using
+         it below.
+      3. `web_session_policy`, via _lock_policy_and_insert_session() —
+         always the LAST lock, never touched before steps 1-2 above.
+
+    Returns the actual canonical UUID the session was minted for (never
+    the caller's own possibly-stale prior resolution), or None if
+    `github_user_id` has no current mapping at all (fail closed — no
+    session created). Raises StalePostureError exactly like create_sync()
+    (propagated from the shared helper, unchanged semantics) if the
+    posture check fails; never itself raises for a missing mapping — that
+    is an ordinary, expected outcome for this specific race window, not a
+    persistence error.
+
+    Never touches `telegram_link_attempts` (Section K: "it never touches a
+    link-attempt row") — GitHub-backed session issuance has no reason to
+    know about, or serialize against, a Telegram linking attempt for a
+    DIFFERENT user that happens to be in flight.
+    """
+    with Session(get_sync_engine()) as session:
+        github_row = session.execute(
+            select(GithubAccount.user_id).where(GithubAccount.github_user_id == github_user_id).with_for_update()
+        ).scalar_one_or_none()
+        if github_row is None:
+            session.rollback()
+            return None
+        mapped_user_id: uuid.UUID = github_row
+
+        session.execute(select(User.id).where(User.id == mapped_user_id).with_for_update()).scalar_one()
+
+        _lock_policy_and_insert_session(
+            session,
+            token_hash=token_hash,
+            user_id=mapped_user_id,
+            issued_secure=issued_secure,
+            expires_at=expires_at,
+            _test_hook_after_lock=_test_hook_after_lock,
+        )
+        session.commit()
+        return mapped_user_id
 
 
 def get_active_sync(*, token_hash: bytes, expected_secure: bool) -> Optional[SessionRecord]:

@@ -344,10 +344,14 @@ def test_stale_posture_during_session_mint_fails_closed_no_cookies(monkeypatch):
     client = TestClient(create_app())
     state, _ = _do_login(client)
 
-    async def _boom(user_id, *, issued_secure):
+    async def _boom(github_user_id, *, issued_secure):
         raise auth_session.StalePostureError("stale for test")
 
-    monkeypatch.setattr(auth_session, "create_session", _boom)
+    # Stage 6C: the callback now mints its session through
+    # create_session_for_github() (see web/github_oauth.py/db/auth_sessions.py's
+    # create_for_github_sync() docstrings) — never the older, plain
+    # create_session() this test used to patch.
+    monkeypatch.setattr(auth_session, "create_session_for_github", _boom)
 
     response = client.get(CALLBACK_PATH, params={"code": "c", "state": state}, follow_redirects=False)
 

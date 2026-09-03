@@ -341,6 +341,26 @@ class GithubOAuthTransaction(Base):
     browser, unlike `state`, which a network observer watching the
     GitHub redirect can always see regardless of how it's stored here).
 
+    `auth_generation` (Stage 6C corrective pass, independent-audit MAJOR 1)
+    is the `github_oauth_admission.unlink_generation` value in effect at
+    the moment `db.oauth_transactions.create_sync()` created this row —
+    captured under that singleton's own lock, in the same transaction (see
+    GithubOAuthAdmission's own docstring below). Carried through
+    claim_sync() unchanged and handed to
+    db.github_identity.resolve_or_create_user_by_github_id_for_oauth_sync()
+    at callback time: that resolver rejects the transaction outright if a
+    LATER unlink has since tombstoned this GitHub identity at a higher
+    generation, closing a real race where a callback that already
+    authenticated with GitHub — but had not yet resolved/created its
+    canonical mapping — could otherwise recreate (or re-attach to) a
+    mapping a concurrent unlink just tore down. NOT NULL with a `>= 0`
+    CHECK and a `0` default: a transaction created before this column
+    existed (impossible in practice — transactions are short-lived — but
+    also a transaction created without an explicit value) reads as
+    generation 0, the earliest possible generation, so it is rejected by
+    any tombstone at all, never treated as inherently trustworthy. See
+    db/telegram_link.py's module docstring for the complete protocol.
+
     `created_at`/`expires_at` are `TIMESTAMP WITH TIME ZONE` — same
     rationale as WebSession above (Stage 6A independent-audit corrective
     pass #1, Blocker 1): db.oauth_transactions.claim_sync() and
@@ -375,12 +395,14 @@ class GithubOAuthTransaction(Base):
     __tablename__ = "github_oauth_transactions"
     __table_args__ = (
         CheckConstraint("octet_length(state_hash) = 32", name="state_hash_length"),
+        CheckConstraint("auth_generation >= 0", name="auth_generation_non_negative"),
     )
 
     state_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
     code_verifier: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    auth_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
 
 # The one and only allowed primary key value for GithubOAuthAdmission's
@@ -432,11 +454,152 @@ class GithubOAuthAdmission(Base):
     alembic/versions/0003_github_oauth.py at migration time, never lazily
     created by application code, for the identical "sidesteps a first-
     process bootstrap race entirely" reason WebSessionPolicy's own
-    docstring documents."""
+    docstring documents.
+
+    `unlink_generation` (Stage 6C corrective pass, independent-audit
+    MAJOR 1) is the ONE global, monotonically-increasing OAuth-generation
+    counter this application maintains — reusing THIS row (rather than a
+    new singleton) so "capture the current generation at login" (db.
+    oauth_transactions.create_sync(), which already locks this row first)
+    and "advance the generation at unlink" (db.telegram_link.
+    unlink_github_sync(), which acquires this same row's lock as the LAST
+    step of a successful unlink) share one existing lock idiom instead of
+    inventing a second. It is deliberately a single GLOBAL counter, not one
+    per GitHub identity: every successful unlink — regardless of which
+    GitHub id it affects — advances it, and db.github_identity.
+    resolve_or_create_user_by_github_id_for_oauth_sync() compares an OAuth
+    transaction's captured `auth_generation` against the PER-IDENTITY
+    tombstone this same unlink writes (GithubUnlinkTombstone below) to
+    decide staleness; the global counter only needs to be monotonic, never
+    partitioned, for that comparison to be correct. NOT NULL with a `>= 0`
+    CHECK and a `0` default (added by this same migration, alongside
+    `github_oauth_transactions.auth_generation`)."""
 
     __tablename__ = "github_oauth_admission"
-    __table_args__ = (CheckConstraint(f"id = {GITHUB_OAUTH_ADMISSION_ID}", name="singleton_id"),)
+    __table_args__ = (
+        CheckConstraint(f"id = {GITHUB_OAUTH_ADMISSION_ID}", name="singleton_id"),
+        CheckConstraint("unlink_generation >= 0", name="unlink_generation_non_negative"),
+    )
 
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     starts_in_window: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    unlink_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class GithubUnlinkTombstone(Base):
+    """Durable, per-GitHub-identity record of the LATEST successful unlink's
+    generation (Stage 6C corrective pass, independent-audit MAJOR 1) — one
+    bounded row per GitHub identity that has EVER been unlinked, written
+    atomically by db.telegram_link.unlink_github_sync() in the same
+    transaction as the generation bump on GithubOAuthAdmission above and
+    the unlink's own mutations (mapping removal, session revocation/
+    deletion, user deletion where applicable).
+
+    `github_user_id` is the PRIMARY KEY (mirrors GithubAccount.
+    github_user_id's own natural-key choice) — at most one tombstone row
+    per GitHub identity; a SECOND unlink of the same identity (after a
+    fresh re-link) simply advances this row's `unlink_generation` via
+    `INSERT ... ON CONFLICT DO UPDATE` rather than accumulating history,
+    since only the LATEST generation ever matters for the staleness
+    comparison db.github_identity.
+    resolve_or_create_user_by_github_id_for_oauth_sync() performs.
+
+    Deliberately carries NO foreign key to `github_accounts`: the entire
+    point of this table is to remember a GitHub identity's unlink history
+    AFTER its `github_accounts` mapping has been removed (that removal is
+    exactly what triggers writing/advancing this row) — an FK to a
+    provider mapping that no longer exists by design would be incoherent,
+    unlike every other cross-table reference in this schema.
+
+    `unlink_generation` carries a `> 0` CHECK (never `>= 0`, unlike the
+    admission singleton's own generation column): a tombstone is only ever
+    written as the result of a successful unlink, which always advances
+    the global counter from its current value to a strictly higher one
+    (starting from 1) — a tombstone at generation 0 could never mean
+    anything meaningful (every OAuth transaction's own default
+    `auth_generation` is already 0, so a generation-0 tombstone could never
+    reject anything) and would only ever indicate a persistence bug.
+
+    `unlinked_at` is `TIMESTAMP WITH TIME ZONE`, diagnostic/observability
+    only — no code path in this application compares it against `now()` or
+    otherwise makes an authorization decision from it; `unlink_generation`
+    alone is the authoritative signal."""
+
+    __tablename__ = "github_unlink_tombstones"
+    __table_args__ = (CheckConstraint("unlink_generation > 0", name="unlink_generation_positive"),)
+
+    github_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    unlink_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    unlinked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class TelegramLinkAttempt(Base):
+    """Short-lived, replay-resistant server-side state for one authenticated
+    web (GitHub) user's outstanding request to link their canonical
+    identity to a Telegram account (Stage 6C) — see db/telegram_link.py for
+    the create/redeem operations and web/routes.py's
+    POST /api/link/telegram/start for how the flow starts it, and
+    handlers/start.py's `/start link_<secret>` payload for how it is
+    redeemed.
+
+    `web_user_id` (not a surrogate id) is the PRIMARY KEY — this table holds
+    AT MOST ONE outstanding attempt per canonical user by construction (a
+    second POST /api/link/telegram/start atomically SUPERSEDES the first;
+    see db/telegram_link.py's create_attempt_sync()), so there is no
+    redundant surrogate key to add. `ON DELETE RESTRICT` (explicit, not the
+    unspecified-FK default used elsewhere in this schema) is deliberate: a
+    `users` row must never be deleted while it still holds an outstanding
+    link attempt — every code path that deletes a `users` row (Stage 6C's
+    merge-on-redemption and GitHub-only unlink) is REQUIRED to delete this
+    row itself, in the same transaction, BEFORE the `users` row — as part of
+    the corrected lock order (Stage 6C corrective pass, independent-audit
+    MAJOR 2 — see db/telegram_link.py's own module docstring for the full
+    protocol): advisory lock, where one applies -> `github_accounts` rows ->
+    `users` rows -> (success path only) `web_session_policy`/
+    `github_oauth_admission` -> this table's row, ALWAYS LAST, mutated via
+    one atomic statement (never a separate prior lock/probe step). RESTRICT
+    is a defense-in-depth backstop making "never leave a `users` row FK-
+    orphaned by this table" a hard database invariant, not merely an
+    application-level convention — it says nothing about lock ORDER, which
+    is the opposite of this table's actual position in it (LAST, not
+    first).
+
+    `link_secret_hash` (SHA-256 digest of the raw bearer secret handed to
+    the browser as part of the `https://t.me/<bot>?start=link_<secret>`
+    deep link) is UNIQUE and NOT the primary key — mirrors WebSession.
+    session_token_hash's/GithubOAuthTransaction.state_hash's own "digest
+    only, never the raw secret" design (see those models' docstrings): a
+    stolen database dump can never be replayed as a valid redemption
+    without also knowing the raw secret that hashes to a given row. It is
+    UNIQUE (not the PK) because the natural lookup key for CREATING/
+    SUPERSEDING an attempt is `web_user_id` (one outstanding attempt per
+    user), while the natural lookup key for REDEEMING one is the secret's
+    digest — both must be fast, indexed lookups, hence a unique index on
+    each. The same `octet_length(link_secret_hash) = 32` CHECK constraint
+    every other digest column in this schema carries, for the identical
+    reason (`sa.LargeBinary(length=32)` alone compiles to an unconstrained
+    BYTEA on PostgreSQL).
+
+    `created_at`/`expires_at` are `TIMESTAMP WITH TIME ZONE` — same
+    rationale as every other short-lived bearer-secret table in this schema
+    (WebSession, GithubOAuthTransaction): db.telegram_link.py's redemption
+    path compares `expires_at` against PostgreSQL's own now(), which must be
+    an instant-vs-instant comparison, correct regardless of the PostgreSQL
+    session's TimeZone GUC. `expires_at` carries a plain b-tree index for
+    the same reason GithubOAuthTransaction.expires_at does: bounded,
+    indexed expired-row cleanup (see db/telegram_link.py's
+    cleanup_expired_attempts_sync()) must never degrade to a sequential
+    scan as this table churns."""
+
+    __tablename__ = "telegram_link_attempts"
+    __table_args__ = (
+        CheckConstraint("octet_length(link_secret_hash) = 32", name="link_secret_hash_length"),
+    )
+
+    web_user_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), primary_key=True
+    )
+    link_secret_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)

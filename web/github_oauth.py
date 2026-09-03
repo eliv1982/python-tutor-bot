@@ -48,25 +48,48 @@ route:
     fails closed here — BEFORE claiming (consuming) the transaction, so a
     forged, cookie-less callback attempt can never grief a legitimate
     holder's still-unused transaction either.
-  - A fresh Stage 6A session (app.auth_session.create_session()) is ALWAYS
-    minted on success, and this module never reads, inspects, or reuses
-    any *session* cookie the browser may already be carrying — an
-    existing session's identity can never leak into, or be confused with,
-    a new GitHub login, and there is no session identifier here for an
-    attacker to plant: the raw bearer token is generated fresh, entirely
-    server-side, every single time (see app/auth_session.create_session()).
-    An old, pre-existing browser session (if any) is left exactly as it
-    was — neither adopted, merged, nor silently revoked by an unrelated
-    login elsewhere; see tests/test_stage6b_github_oauth_routes.py's
-    "existing session" coverage for the exact proof of this choice.
+  - A fresh session (app.auth_session.create_session_for_github() — Stage
+    6C corrective pass, independent-audit MAJOR 1: generation-aware, see
+    below) is ALWAYS minted on success, and this module never reads,
+    inspects, or reuses any *session* cookie the browser may already be
+    carrying — an existing session's identity can never leak into, or be
+    confused with, a new GitHub login, and there is no session identifier
+    here for an attacker to plant: the raw bearer token is generated
+    fresh, entirely server-side, every single time. An old, pre-existing
+    browser session (if any) is left exactly as it was — neither adopted,
+    merged, nor silently revoked by an unrelated login elsewhere; see
+    tests/test_stage6b_github_oauth_routes.py's "existing session"
+    coverage for the exact proof of this choice.
+  - Stage 6C corrective pass, independent-audit MAJOR 1 (see
+    db/telegram_link.py's own module docstring for the full protocol):
+    each OAuth transaction created by GET /login captures the current
+    global unlink-generation counter (`claimed.auth_generation`,
+    propagated from app.oauth_transaction.create_transaction() through to
+    this callback). The callback resolves identity through
+    app.github_identity.resolve_user_uuid_for_oauth() (never the plain,
+    non-generation-aware resolve_user_uuid()) — it rejects the callback
+    outright if a concurrent/prior unlink has since tombstoned this GitHub
+    identity at a generation newer than the one this transaction captured,
+    closing a race where a callback that had already authenticated with
+    GitHub, but had not yet resolved/created its mapping, could otherwise
+    recreate access an unlink just tore down. Session issuance itself then
+    re-resolves the CURRENT mapping a second time, under lock, inside
+    create_session_for_github() — see that function's own docstring for
+    why the generation check alone is not sufficient. See
+    tests/test_stage6c_oauth_generation_race.py for the real-PostgreSQL,
+    real-thread proof of every required race, including a stale, already-
+    in-flight callback arriving strictly AFTER its identity's unlink.
 
 Callback error handling (Section 15 of the Stage 6B spec): every failure
 path — GitHub denial, missing/malformed/mismatched/invalid/expired/
 replayed state, missing code, a provider HTTP/network/JSON error, an
-invalid GitHub identity payload, or a StalePostureError from session
-minting — returns a generic 4xx/5xx response and mints no session, never
-leaking the client secret, the PKCE verifier, the access token, the raw
-authorization code, or internal database error detail.
+invalid GitHub identity payload, a stale OAuth generation (Stage 6C
+corrective pass, independent-audit MAJOR 1 — see
+app.github_identity.resolve_user_uuid_for_oauth()'s own docstring), or a
+StalePostureError from session minting — returns a generic 4xx/5xx
+response and mints no session, never leaking the client secret, the PKCE
+verifier, the access token, the raw authorization code, or internal
+database error detail.
 
 Callback privacy headers and OAuth-binding-cookie lifecycle (Stage 6B
 independent-audit corrective pass #1, MAJOR 1 / MINOR 4A/4B/4C):
@@ -274,8 +297,8 @@ async def github_callback(request: Request) -> Response:
         # complete normally.
         return _error_response(status.HTTP_400_BAD_REQUEST, "Missing authorization code")
 
-    code_verifier = await oauth_transaction.claim_transaction(query_state)
-    if code_verifier is None:
+    claimed = await oauth_transaction.claim_transaction(query_state)
+    if claimed is None:
         # Unknown, expired, or already-consumed — indistinguishable by
         # design (see app.oauth_transaction.claim_transaction()'s own
         # docstring); a second callback replaying an already-used `state`
@@ -287,7 +310,7 @@ async def github_callback(request: Request) -> Response:
     try:
         access_token = await github_oauth_client.exchange_code_for_token(
             code=code,
-            code_verifier=code_verifier,
+            code_verifier=claimed.code_verifier,
             redirect_uri=github_oauth_config.GITHUB_REDIRECT_URI,
         )
         github_user_id = await github_oauth_client.fetch_github_user_id(access_token=access_token)
@@ -297,15 +320,56 @@ async def github_callback(request: Request) -> Response:
             status.HTTP_502_BAD_GATEWAY, "GitHub authentication failed", clear_oauth_cookie=True
         )
 
-    user_id = await github_identity.resolve_user_uuid(github_user_id)
+    # Generation-aware resolution (Stage 6C corrective pass, independent-
+    # audit MAJOR 1) — guarantees a github_accounts row exists (creating
+    # both it and the canonical user on first login), exactly like the
+    # plain resolve_user_uuid() this replaces, but ALSO rejects this
+    # transaction outright if a concurrent/prior unlink has since
+    # tombstoned this GitHub identity at a generation newer than the one
+    # this transaction captured at login start (`claimed.auth_generation`)
+    # — see app.github_identity.resolve_user_uuid_for_oauth()'s own
+    # docstring for the exact race this closes. Its RETURN VALUE is still
+    # deliberately not what session issuance trusts: create_session_for_
+    # github() below re-resolves github_user_id -> canonical UUID itself,
+    # under a lock, in the SAME transaction as the session insert, and
+    # that freshly-locked resolution is the one this callback ultimately
+    # relies on for WHICH user the session is minted for (see
+    # app/auth_session.py's create_session_for_github() and
+    # db/auth_sessions.py's create_for_github_sync() docstrings for the
+    # exact race THAT closes) — this call's only job here is the
+    # generation gate: None means "reject", anything else means "at least
+    # not stale as of this check".
+    gated_user_id = await github_identity.resolve_user_uuid_for_oauth(
+        github_user_id=github_user_id, auth_generation=claimed.auth_generation
+    )
+    if gated_user_id is None:
+        # This GitHub identity was unlinked at a generation newer than
+        # this login flow's own — the claimed transaction stays consumed
+        # either way (Section D: "the user must start a genuinely new
+        # login"); never resurrect a user/mapping/session for it.
+        logger.warning("GitHub OAuth login rejected: stale generation (unlinked since this login began)")
+        return _error_response(status.HTTP_400_BAD_REQUEST, "Login must be restarted", clear_oauth_cookie=True)
 
     try:
-        issued = await auth_session.create_session(user_id, issued_secure=web_config.COOKIE_SECURE)
+        issued = await auth_session.create_session_for_github(github_user_id, issued_secure=web_config.COOKIE_SECURE)
     except auth_session.StalePostureError:
         # Fail closed (Section 12/18): this process's own cookie posture
         # is no longer authoritative — never silently retry under another
         # posture, never issue a cookie anyway.
         logger.warning("GitHub OAuth login rejected: stale session-cookie posture")
+        return _error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Login temporarily unavailable, please retry",
+            clear_oauth_cookie=True,
+        )
+
+    if issued is None:
+        # Extremely tight race (Stage 6C): the github_accounts row resolved
+        # moments ago no longer exists by the time issuance re-resolved it
+        # under lock (e.g. a concurrent unlink). Fail closed exactly like
+        # StalePostureError above — never fall back to the earlier,
+        # possibly-stale resolution.
+        logger.warning("GitHub OAuth login rejected: GitHub mapping no longer current at session issuance")
         return _error_response(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Login temporarily unavailable, please retry",

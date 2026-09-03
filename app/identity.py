@@ -27,3 +27,11 @@ import db.identity as db_identity
 
 async def resolve_user_uuid(telegram_user_id: int) -> uuid.UUID:
     return await asyncio.to_thread(db_identity.resolve_or_create_user_by_telegram_id_sync, telegram_user_id)
+
+
+async def is_telegram_linked(user_id: uuid.UUID) -> bool:
+    """Stage 6C, Section M — thin async wrapper around
+    db.identity.has_telegram_account_sync(), used by web/routes.py's
+    `/api/me` to expose a safe boolean without ever leaking the Telegram
+    numeric id itself."""
+    return await asyncio.to_thread(db_identity.has_telegram_account_sync, user_id)

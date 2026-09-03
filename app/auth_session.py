@@ -221,6 +221,47 @@ async def create_session(user_id: uuid.UUID, *, issued_secure: bool) -> IssuedSe
     return IssuedSession(raw_token=raw_token, expires_at=expires_at)
 
 
+async def create_session_for_github(github_user_id: int, *, issued_secure: bool) -> Optional[IssuedSession]:
+    """
+    GitHub-backed session issuance (Stage 6C, Section K) — the async
+    wrapper around db.auth_sessions.create_for_github_sync(), mirroring
+    create_session() above's own asyncio.to_thread() offload idiom. Unlike
+    create_session(), this does not take an already-resolved `user_id`: it
+    re-resolves `github_user_id` -> canonical UUID FRESH, under a lock, in
+    the SAME transaction as the session insert, so the session is always
+    bound to whichever UUID is CURRENTLY mapped, never a value the caller
+    resolved moments earlier through a separate transaction (see that
+    function's own docstring for the exact race this closes — a Stage 6C
+    merge can move a GitHub mapping onto a different, Telegram-backed UUID
+    between an earlier resolve and session issuance).
+
+    Returns None if `github_user_id` has no current mapping at all (fail
+    closed — no session created; Section K: "returns a fail-closed result
+    if the mapping disappeared"). The caller (web/github_oauth.py) must
+    treat None exactly like a failed login attempt: no cookie is set, and
+    it is the caller's job to have already ensured a mapping exists via
+    app.github_identity.resolve_user_uuid() before calling this — this
+    function itself never creates one (Section K: "never recreates a
+    GitHub mapping").
+
+    Raises StalePostureError exactly like create_session() (unchanged
+    semantics, same re-exported exception) if this process's own cookie
+    posture is no longer authoritative.
+    """
+    raw_token = secrets.token_urlsafe(_TOKEN_BYTES)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=session_config.SESSION_TTL_SECONDS)
+    user_id = await asyncio.to_thread(
+        db_auth_sessions.create_for_github_sync,
+        github_user_id=github_user_id,
+        token_hash=_hash_token(raw_token),
+        issued_secure=issued_secure,
+        expires_at=expires_at,
+    )
+    if user_id is None:
+        return None
+    return IssuedSession(raw_token=raw_token, expires_at=expires_at)
+
+
 async def resolve_session_user_id(raw_token: Optional[str], *, expected_secure: bool) -> Optional[uuid.UUID]:
     """Fail closed for anything that isn't a plausible, currently-active,
     CURRENT-POSTURE session token: a missing/empty/non-canonical value

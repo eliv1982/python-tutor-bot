@@ -122,6 +122,21 @@ class IssuedTransaction:
     code_challenge: str
 
 
+@dataclass(frozen=True)
+class ClaimedOAuthTransaction:
+    """Returned ONLY by claim_transaction() (Stage 6C corrective pass,
+    independent-audit MAJOR 1) — the PKCE `code_verifier` plus the
+    transaction's captured `auth_generation`, mirroring
+    db.oauth_transactions.ClaimedTransaction one layer up. The callback
+    (web/github_oauth.py) threads `auth_generation` into
+    app.github_identity.resolve_user_uuid_for_oauth() once it has a
+    verified GitHub identity — see that function's own docstring for the
+    staleness check this enables."""
+
+    code_verifier: str
+    auth_generation: int
+
+
 class OAuthAdmissionRejected(Exception):
     """Raised by create_transaction() when database-authoritative OAuth
     admission control (db.oauth_transactions.create_sync() — Stage 6B
@@ -170,16 +185,21 @@ async def create_transaction() -> IssuedTransaction:
     return IssuedTransaction(state=raw_state, code_challenge=code_challenge_for(code_verifier))
 
 
-async def claim_transaction(raw_state: Optional[str]) -> Optional[str]:
+async def claim_transaction(raw_state: Optional[str]) -> Optional[ClaimedOAuthTransaction]:
     """
     Atomically claim the transaction named by `raw_state` and return its
-    original PKCE `code_verifier` — or None for anything that isn't a
-    plausible, currently-valid, not-yet-consumed transaction: a missing,
-    malformed, unknown, expired, or already-consumed `state` all fail
-    closed alike (see db.oauth_transactions.claim_sync()'s own contract),
-    exactly mirroring app/auth_session.resolve_session_user_id()'s
-    "shape-check before hashing/DB lookup" design.
+    original PKCE `code_verifier` plus its captured `auth_generation`
+    (Stage 6C corrective pass, independent-audit MAJOR 1) — or None for
+    anything that isn't a plausible, currently-valid, not-yet-consumed
+    transaction: a missing, malformed, unknown, expired, or already-
+    consumed `state` all fail closed alike (see db.oauth_transactions.
+    claim_sync()'s own contract), exactly mirroring
+    app/auth_session.resolve_session_user_id()'s "shape-check before
+    hashing/DB lookup" design.
     """
     if not raw_state or not is_canonical_state(raw_state):
         return None
-    return await asyncio.to_thread(db_oauth_transactions.claim_sync, state_hash=_hash_state(raw_state))
+    claimed = await asyncio.to_thread(db_oauth_transactions.claim_sync, state_hash=_hash_state(raw_state))
+    if claimed is None:
+        return None
+    return ClaimedOAuthTransaction(code_verifier=claimed.code_verifier, auth_generation=claimed.auth_generation)

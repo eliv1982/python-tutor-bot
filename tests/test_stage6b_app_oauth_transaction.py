@@ -96,10 +96,14 @@ async def test_issued_transaction_never_carries_the_raw_code_verifier(postgres_d
 async def test_claim_transaction_round_trip_recovers_a_verifier_matching_the_challenge(postgres_db):
     issued = await oauth_transaction.create_transaction()
 
-    code_verifier = await oauth_transaction.claim_transaction(issued.state)
+    claimed = await oauth_transaction.claim_transaction(issued.state)
 
-    assert code_verifier is not None
-    assert oauth_transaction.code_challenge_for(code_verifier) == issued.code_challenge
+    # Stage 6C corrective pass (independent-audit MAJOR 1): claim_transaction()
+    # now returns a ClaimedOAuthTransaction(code_verifier, auth_generation)
+    # rather than a bare string.
+    assert claimed is not None
+    assert oauth_transaction.code_challenge_for(claimed.code_verifier) == issued.code_challenge
+    assert claimed.auth_generation == 0
 
 
 @pytest.mark.asyncio

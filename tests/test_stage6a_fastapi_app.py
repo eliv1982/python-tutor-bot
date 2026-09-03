@@ -96,7 +96,11 @@ async def test_me_with_a_valid_session_returns_only_safe_fields(monkeypatch, pos
     assert response.status_code == 200
     body = response.json()
     assert body["id"] == str(user_id)
-    assert set(body.keys()) == {"id", "created_at"}
+    # Stage 6C, Section M added a safe `telegram_linked: bool` field — this
+    # module's _real_user() helper resolves via Telegram, so it must be
+    # True here, and never the Telegram numeric id or any other new field.
+    assert set(body.keys()) == {"id", "created_at", "telegram_linked"}
+    assert body["telegram_linked"] is True
 
 
 @pytest.mark.asyncio

@@ -10,8 +10,34 @@ from bot import bot
 from utils.logging import logger
 from app.session import user_sessions
 from app.identity import resolve_user_uuid
+from app.telegram_link import LINK_PAYLOAD_PREFIX, RedemptionOutcome, extract_link_secret, redeem_link
 from utils.access_control import require_authorized
 from config import BotMode, DEFAULT_MODE
+
+# Stage 6C, Section I: every REJECTED_* outcome renders to this exact same
+# text — deliberately generic, never revealing WHICH conflict occurred (a
+# distinguishable response here would let a sender enumerate account state
+# they otherwise have no way to observe).
+_LINK_REJECTED_TEXT = (
+    "⚠️ Не удалось привязать аккаунт. Попробуйте начать привязку заново на сайте."
+)
+_LINK_INVALID_OR_EXPIRED_TEXT = (
+    "⚠️ Эта ссылка недействительна или уже истекла. Запросите новую ссылку на сайте."
+)
+_LINK_MERGED_TEXT = "✅ Готово! Этот Telegram-аккаунт теперь связан с вашим GitHub-аккаунтом на сайте."
+_LINK_ALREADY_LINKED_TEXT = "✅ Этот Telegram-аккаунт уже связан с этим GitHub-аккаунтом."
+
+
+def _link_outcome_text(outcome: RedemptionOutcome) -> str:
+    if outcome == RedemptionOutcome.MERGED:
+        return _LINK_MERGED_TEXT
+    if outcome == RedemptionOutcome.ALREADY_LINKED:
+        return _LINK_ALREADY_LINKED_TEXT
+    if outcome == RedemptionOutcome.INVALID_OR_EXPIRED:
+        return _LINK_INVALID_OR_EXPIRED_TEXT
+    # Every REJECTED_* outcome falls through here (Section I) — see this
+    # module's own docstring on _LINK_REJECTED_TEXT above.
+    return _LINK_REJECTED_TEXT
 
 
 @bot.message_handler(commands=['start'])
@@ -24,10 +50,33 @@ async def cmd_start(message: types.Message):
     user_name = message.from_user.first_name
     logger.info("Command /start | telegram_user_id=%s", telegram_user_id)
 
-    # Initialize user session
+    # Initialize user session — existing first canonical Telegram
+    # resolution (Stage 6C, Section I: "existing first canonical Telegram
+    # resolution" — preserved unchanged, and always run BEFORE any linking
+    # logic below: db.telegram_link.redeem_attempt_sync() requires a
+    # telegram_accounts row to already exist for this sender).
     user_uuid = await resolve_user_uuid(telegram_user_id)
     await user_sessions.set_mode(user_uuid, DEFAULT_MODE)
-    
+
+    # Stage 6C: a `/start link_<secret>` payload is redeemed here, narrowly
+    # extending the existing handler — every other `/start` shape (no
+    # payload, or a payload that isn't a link_ prefix at all) falls through
+    # to the unchanged normal welcome flow below. The raw payload is never
+    # logged (Section F/I.1) — only the typed outcome is.
+    message_text = getattr(message, "text", None) or ""
+    payload = message_text.split(maxsplit=1)[1].strip() if " " in message_text else ""
+    if payload.startswith(LINK_PAYLOAD_PREFIX):
+        raw_secret = extract_link_secret(payload)
+        if raw_secret is None:
+            await bot.send_message(message.chat.id, _LINK_INVALID_OR_EXPIRED_TEXT)
+            return
+        outcome = await redeem_link(telegram_user_id=telegram_user_id, raw_secret=raw_secret)
+        logger.info(
+            "Telegram link redemption | telegram_user_id=%s, outcome=%s", telegram_user_id, outcome.value
+        )
+        await bot.send_message(message.chat.id, _link_outcome_text(outcome))
+        return
+
     welcome_text = f"""👋 Привет, {user_name}!
 
 Я — персональный тьютор по Python с мультимодальным функционалом:

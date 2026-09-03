@@ -124,7 +124,12 @@ def test_claim_sync_returns_the_original_code_verifier(postgres_db):
 
     claimed = db_oauth_transactions.claim_sync(state_hash=state_hash)
 
-    assert claimed == code_verifier
+    # Stage 6C corrective pass (independent-audit MAJOR 1): claim_sync()
+    # now returns a ClaimedTransaction(code_verifier, auth_generation)
+    # rather than a bare string — see db.oauth_transactions.
+    # ClaimedTransaction's own docstring.
+    assert claimed.code_verifier == code_verifier
+    assert claimed.auth_generation == 0
 
 
 def test_claim_sync_deletes_the_row(postgres_db):
@@ -147,7 +152,7 @@ def test_claim_sync_is_single_use_a_second_claim_fails_closed(postgres_db):
     first = db_oauth_transactions.claim_sync(state_hash=state_hash)
     second = db_oauth_transactions.claim_sync(state_hash=state_hash)
 
-    assert first == code_verifier
+    assert first.code_verifier == code_verifier
     assert second is None
 
 
@@ -187,8 +192,8 @@ def test_two_different_transactions_do_not_interfere(postgres_db):
     _, hash_a, verifier_a = _new_transaction()
     _, hash_b, verifier_b = _new_transaction()
 
-    assert db_oauth_transactions.claim_sync(state_hash=hash_a) == verifier_a
-    assert db_oauth_transactions.claim_sync(state_hash=hash_b) == verifier_b
+    assert db_oauth_transactions.claim_sync(state_hash=hash_a).code_verifier == verifier_a
+    assert db_oauth_transactions.claim_sync(state_hash=hash_b).code_verifier == verifier_b
     # Each remains individually single-use.
     assert db_oauth_transactions.claim_sync(state_hash=hash_a) is None
     assert db_oauth_transactions.claim_sync(state_hash=hash_b) is None
@@ -224,7 +229,7 @@ def test_concurrent_double_claim_only_one_thread_ever_receives_the_verifier(post
 
     assert all(not t.is_alive() for t in threads)
     successes = [r for r in results if r is not None]
-    assert successes == [code_verifier], f"expected exactly one success, got: {results}"
+    assert [s.code_verifier for s in successes] == [code_verifier], f"expected exactly one success, got: {results}"
     assert len(results) == 20
 
 

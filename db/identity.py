@@ -73,6 +73,24 @@ def lookup_user_by_telegram_id_sync(telegram_id: int) -> Optional[uuid.UUID]:
         ).scalar_one_or_none()
 
 
+def has_telegram_account_sync(user_id: uuid.UUID) -> bool:
+    """
+    Plain existence check: does `user_id` have a `telegram_accounts` row?
+    (Stage 6C) — used by web/routes.py's `/api/me` to expose a safe
+    `telegram_linked: bool` field without ever revealing the Telegram
+    numeric id itself. Read-only, no advisory lock needed: an ordinary
+    "yes/no" read for a display field has none of resolve_or_create_user_by_
+    telegram_id_sync()'s first-creation race to guard against.
+    """
+    with Session(get_sync_engine()) as session:
+        return (
+            session.execute(
+                select(TelegramAccount.telegram_user_id).where(TelegramAccount.user_id == user_id).limit(1)
+            ).first()
+            is not None
+        )
+
+
 def resolve_or_create_user_by_telegram_id_sync(telegram_id: int) -> uuid.UUID:
     """
     Resolve a trusted Telegram numeric user id to its stable internal user

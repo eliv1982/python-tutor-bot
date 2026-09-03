@@ -537,7 +537,10 @@ def postgres_db(postgres_container, monkeypatch):
 
     Stage 6B adds `github_accounts`/`github_oauth_transactions` to the
     TRUNCATE list below for the identical cross-test-isolation reason as
-    every other non-singleton table here.
+    every other non-singleton table here. Stage 6C corrective pass
+    (independent-audit MAJOR 1) adds `github_unlink_tombstones` for the
+    same reason — a non-singleton, per-GitHub-identity table that must
+    start empty for every test.
 
     `web_session_policy` (Stage 6A independent-audit corrective pass #3)
     and `github_oauth_admission` (Stage 6B independent-audit corrective
@@ -560,7 +563,11 @@ def postgres_db(postgres_container, monkeypatch):
     the past — resetting both here mirrors db.oauth_transactions.
     create_sync()'s own "reset when the window has elapsed" logic, just
     performed unconditionally for test isolation rather than only when a
-    real window has actually elapsed.
+    real window has actually elapsed. Stage 6C corrective pass
+    (independent-audit MAJOR 1) also resets `unlink_generation` to 0 here,
+    for the identical reason — without it, the global OAuth-generation
+    counter would keep climbing across every test in the session instead
+    of giving each test the same fresh baseline generation.
     """
     import db.engine as db_engine
     import db.settings as db_settings
@@ -580,10 +587,13 @@ def postgres_db(postgres_container, monkeypatch):
     with engine.begin() as conn:
         conn.execute(text(
             "TRUNCATE users, telegram_accounts, user_preferences, documents, web_sessions, "
-            "github_accounts, github_oauth_transactions CASCADE"
+            "github_accounts, github_oauth_transactions, telegram_link_attempts, "
+            "github_unlink_tombstones CASCADE"
         ))
         conn.execute(text("UPDATE web_session_policy SET current_secure = true, updated_at = now()"))
-        conn.execute(text("UPDATE github_oauth_admission SET window_start = now(), starts_in_window = 0"))
+        conn.execute(text(
+            "UPDATE github_oauth_admission SET window_start = now(), starts_in_window = 0, unlink_generation = 0"
+        ))
 
     yield postgres_container
 
