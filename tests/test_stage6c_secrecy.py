@@ -115,8 +115,13 @@ def test_assert_no_secret_leak_survives_real_pytest_reporting(tmp_path):
     sentinel out too. This closes that gap (Stage 6C corrective pass,
     independent-audit MINOR 2, required strengthened self-test): it writes
     a deliberately-failing test into `tmp_path` — pytest's own disposable
-    per-test directory, NEVER the repository itself, and cleaned up
-    automatically — that calls assert_no_secret_leak() with a sentinel it
+    per-test directory, NEVER the repository itself. That directory lives
+    outside the repository and is managed entirely by pytest: it may
+    persist for a while after this test finishes (pytest retains a bounded
+    number of recent per-test directories under the OS temp root), and its
+    eventual removal depends on pytest's own retention/rotation pruning on
+    a LATER invocation, not on any immediate, this-test-scoped cleanup —
+    that calls assert_no_secret_leak() with a sentinel it
     WILL find, runs it through a genuinely SEPARATE, nested `python -m
     pytest` process, and inspects the COMPLETE combined stdout+stderr of
     that nested run (never only a caught exception), confirming: the

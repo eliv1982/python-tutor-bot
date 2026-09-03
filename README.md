@@ -103,11 +103,20 @@ Telegram, а не второй моделью пользователя.
   действительно текущая для браузера) — несовпадающий/старый callback
   никогда не сбрасывает cookie другой, всё ещё активной вкладки.
 - После успешной идентификации всегда выпускается ЗАНОВО созданная сессия
-  через `app/auth_session.create_session_for_github()` (Stage 6C corrective
-  pass, independent-audit MAJOR 1: generation-aware — переразрешает
+  через `app/auth_session.create_session_for_github()` — переразрешает
   GitHub-id → канонический UUID заново, под блокировкой, в ТОЙ ЖЕ
-  транзакции, что и вставка сессии, и отклоняет попытку, если GitHub-
-  маппинг устарел относительно более позднего unlink) — существующая
+  транзакции, что и вставка сессии, и отказывает (fail closed), если
+  GitHub-маппинг к этому моменту вообще исчез (например, конкурентный
+  unlink); сама эта функция `auth_generation` не проверяет и generation-
+  aware не является — это отдельная, более узкая перепроверка. Проверку
+  generation-staleness (Stage 6C corrective pass, independent-audit
+  MAJOR 1: отклоняет попытку, если GitHub-маппинг был отвязан на более
+  позднем `auth_generation`, чем тот, что зафиксирован при старте этого
+  OAuth-флоу) выполняет ДО этого шага `app.github_identity.
+  resolve_user_uuid_for_oauth()`, вызываемый в `web/github_oauth.py` перед
+  `create_session_for_github()`. Здесь и далее "generation" — счётчик
+  `auth_generation`/unlink race gate, а не лимит одновременных LLM text-
+  generation запросов (см. `app/generation_limits.py`). Существующая
   сессия браузера (если была) не читается, не переиспользуется и не
   отзывается как побочный эффект чужого входа.
 - Первый вход через GitHub **сам по себе** всегда создаёт свой отдельный

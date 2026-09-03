@@ -5,7 +5,7 @@ Handles queries against the knowledge base with context-aware responses.
 
 import asyncio
 import uuid
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 from rag.identity import is_canonical_reference_point, is_eligible_private_candidate, parse_upload_document_id
 from rag.index import get_vector_index
@@ -22,6 +22,77 @@ from config import RAG_TOP_K
 # credentials. A top-level `import db.documents` would break that contract
 # outright (ModuleNotFoundError) even though no query ever actually needs
 # it unless a non-reference result is present to validate.
+
+
+class RagGenerationOutputError(RuntimeError):
+    """Raised (Stage 7A-1 second corrective pass) when a raw provider
+    text-generation call made INSIDE this module — either
+    _generate_rag_response()'s primary answer-generation call or
+    _fallback_response()'s own call — returns something other than a
+    genuine, non-empty, non-whitespace-only `str`. Validated by
+    _validate_raw_generation_text() IMMEDIATELY after each such call,
+    before any `.rstrip()`, source/citation decoration, warning
+    decoration, concatenation, or fallback-decision logic ever runs — a
+    malformed raw result (`None`, a list, a dict, an arbitrary non-string
+    value, or an empty/whitespace-only string) must never be silently
+    decorated into an apparently-successful response.
+
+    Deliberately caught and RE-RAISED (never swallowed into a second
+    provider attempt) by query_knowledge_base()'s own except clauses,
+    exactly like services.text_llm.TextGenerationTimeoutError already is —
+    malformed output is not a provider EXCEPTION this module's existing
+    "any other failure -> fall back to a plain-chat answer" behavior is
+    meant to cover, so it must never trigger a second, hidden provider
+    call. Propagates out of rag.query as a plain RuntimeError;
+    app.text_chat.execute_admitted_text_chat()'s own broad
+    `except Exception` wraps it into TextChatGenerationError exactly like
+    any other RAG failure, with the same exception-chain secrecy
+    guarantees. Carries only a fixed, safe message — never the invalid
+    raw value or its content."""
+
+
+def _validate_raw_generation_text(raw: Any) -> str:
+    """Validates a RAW provider text-generation result (Stage 7A-1 second
+    corrective pass) — called IMMEDIATELY after every
+    text_llm.generate_text_response() call in this module, before the
+    result is ever `.rstrip()`-ed, decorated with sources/warnings,
+    concatenated, or used to decide whether to fall back. Only a genuine,
+    non-empty, non-whitespace-only `str` passes; `None`, a list, a dict, or
+    any other non-string value, and an empty/whitespace-only string, all
+    raise RagGenerationOutputError. Never logs the invalid value itself —
+    only its Python type name (Stage 1D privacy-safe logging convention),
+    matching app.text_chat's identical validation of the final RAG
+    result."""
+    if not isinstance(raw, str) or not raw.strip():
+        logger.error(
+            "RAG provider generation returned an invalid raw result | result_type=%s",
+            type(raw).__name__,
+        )
+        raise RagGenerationOutputError("RAG provider generation returned an invalid result")
+    return raw
+
+
+def _fresh_history_messages(conversation_history: Optional[List[Dict]]) -> List[Dict[str, str]]:
+    """Builds a BRAND NEW list of BRAND NEW plain dicts from (the most
+    recent slice of) `conversation_history`, every time it is called
+    (Stage 7A-1 second corrective pass — RAG provider-attempt isolation).
+    `_generate_rag_response()` (the primary answer-generation attempt) and
+    `_fallback_response()` (a possible SECOND, independent attempt reached
+    via query_knowledge_base()'s own "no results" branch or its broad
+    `except Exception` fallback) each call this separately, so each gets
+    its OWN independent set of message dicts — never a dict object shared
+    between the two attempts, and never a dict object shared with
+    `conversation_history` itself. A primary provider fake/adversary that
+    mutates the list/dicts it was actually handed (append, reassign a key)
+    can therefore never influence what a subsequent fallback attempt
+    receives, and can never mutate `conversation_history` itself either —
+    exactly the same isolation guarantee app.text_chat's own
+    _fresh_messages() already provides one level up, applied HERE too so
+    RAG's own internal primary/fallback pair gets it independently."""
+    if not conversation_history:
+        return []
+    recent_history = conversation_history[-6:]  # Last 3 exchanges
+    return [{"role": entry["role"], "content": entry["content"]} for entry in recent_history]
 
 
 def _trusted_reference_points() -> Dict[str, str]:
@@ -409,9 +480,35 @@ async def query_knowledge_base(
         # display_name) — log only a count, never the names themselves.
         logger.info("RAG query done | response_len=%s, source_count=%s", len(response), len(sources))
         return response
+    except text_llm.TextGenerationTimeoutError:
+        # Stage 7A-1 corrective pass: a timeout on the PRIMARY RAG answer-
+        # generation provider call (_generate_rag_response() above) must
+        # propagate as a clean timeout — NEVER silently retried through
+        # _fallback_response()'s own separate provider call below. Falling
+        # back here would both risk doubling the effective wait (a second,
+        # independent config.TEXT_GENERATION_TIMEOUT_SECONDS-bounded call)
+        # and could turn a genuine provider-availability problem into a
+        # late "success" that masks it entirely. Retrieval itself
+        # (asyncio.to_thread(_validated_similarity_search, ...) above)
+        # never raises this exception type, so this clause is unambiguous
+        # about which stage failed.
+        raise
+    except RagGenerationOutputError:
+        # Stage 7A-1 second corrective pass: malformed RAW provider output
+        # on the PRIMARY answer-generation call (validated IMMEDIATELY
+        # after that call, inside _generate_rag_response() — never here,
+        # and never after the `.rstrip()`/source-decoration above) must
+        # propagate as a clean, sanitized failure — NEVER silently retried
+        # through _fallback_response()'s own separate provider call below.
+        # Exactly the same one-attempt rationale as the timeout clause
+        # immediately above: a second hidden provider call could turn a
+        # genuine malformed-output failure into a late "success" that
+        # masks it entirely.
+        raise
     except Exception as e:
         # Wraps Qdrant similarity search (embeddings network call) and the
-        # OpenAI chat completion — never log raw exception text.
+        # OpenAI/Anthropic chat completion for every OTHER failure mode —
+        # never log raw exception text.
         logger.error("RAG query_knowledge_base failed | error_type=%s", type(e).__name__)
         # Fallback to regular GPT response
         return await _fallback_response(query, conversation_history)
@@ -476,23 +573,26 @@ async def _generate_rag_response(
             "content": system_prompt.format(context=context)
         }
     ]
-    
-    # Add conversation history if available
-    if conversation_history:
-        # Limit history to avoid token limits
-        recent_history = conversation_history[-6:]  # Last 3 exchanges
-        messages.extend(recent_history)
-    
+
+    # Stage 7A-1 second corrective pass: _fresh_history_messages() builds
+    # brand-new message dicts every call — never a dict shared with
+    # `conversation_history` itself, and never one shared with
+    # _fallback_response()'s own, separately-built attempt below (see that
+    # helper's own docstring for the full attempt-isolation rationale).
+    messages.extend(_fresh_history_messages(conversation_history))
+
     # Add current query
     messages.append({
         "role": "user",
         "content": query
     })
-    
-    # Generate response
-    response = await text_llm.generate_text_response(messages)
-    
-    return response
+
+    # Generate response — validated IMMEDIATELY, before any caller of this
+    # function ever decorates/concatenates it (Stage 7A-1 second corrective
+    # pass; see _validate_raw_generation_text()'s own docstring).
+    raw_response = await text_llm.generate_text_response(messages)
+
+    return _validate_raw_generation_text(raw_response)
 
 
 async def _fallback_response(
@@ -517,17 +617,27 @@ async def _fallback_response(
     }
     
     messages = [system_message]
-    
-    if conversation_history:
-        messages.extend(conversation_history[-6:])
-    
+
+    # Stage 7A-1 second corrective pass: same fresh-dict isolation as
+    # _generate_rag_response() above — this is a genuinely SEPARATE
+    # provider attempt (reached either because retrieval found nothing, or
+    # because query_knowledge_base()'s own broad except fell back after
+    # the primary attempt failed), so it must never receive a message dict
+    # a primary attempt's fake/adversarial provider could have mutated.
+    messages.extend(_fresh_history_messages(conversation_history))
+
     messages.append({
         "role": "user",
         "content": query
     })
-    
-    response = await text_llm.generate_text_response(messages)
-    
+
+    # Validated IMMEDIATELY, before it is ever interpolated into the
+    # warning string below — an invalid raw result (e.g. None) must never
+    # become a non-empty, apparently-successful response merely by being
+    # decorated (Stage 7A-1 second corrective pass).
+    raw_response = await text_llm.generate_text_response(messages)
+    response = _validate_raw_generation_text(raw_response)
+
     return f"⚠️ База знаний не содержит информации по этому вопросу.\n\n{response}"
 
 

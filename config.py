@@ -103,6 +103,13 @@ class BotMode:
     VOICE = "voice"
     VISION = "vision"
     RAG = "rag"
+    # Stage 7A-1 corrective pass: the single canonical allowlist of every
+    # recognized mode value, so callers that need to validate a mode
+    # (app/text_chat.py's request-boundary validation, handlers/text.py's
+    # Telegram /mode command) all check against this ONE tuple instead of
+    # each maintaining their own local list that could silently drift out
+    # of sync with this class's own attributes.
+    ALL = (TEXT, VOICE, VISION, RAG)
 
 DEFAULT_MODE = os.getenv("BOT_MODE", BotMode.TEXT)
 
@@ -208,4 +215,31 @@ MAX_TOKENS = 1500
 
 # User session settings
 MAX_HISTORY_LENGTH = 10  # Maximum number of messages to keep in history
+
+# Text-chat core bounds (Stage 7A-1): shared, adapter-independent request
+# validation applied by app/text_chat.py — the SAME bounds apply whether
+# the caller is the Telegram adapter (via app/tutor.py's delegation) or a
+# future authenticated HTTP adapter, so client-supplied conversation shape/
+# size can never grow unbounded regardless of which adapter it arrives
+# through. Telegram's own history (app/session.py's UserSession, trimmed to
+# MAX_HISTORY_LENGTH * 2 = 20 messages above) already satisfies the message-
+# count bound below without any change to that trimming policy.
+TEXT_CHAT_MAX_MESSAGE_LENGTH = 4000  # current message, characters
+TEXT_CHAT_MAX_HISTORY_MESSAGES = 20  # explicit bounded history entries
+TEXT_CHAT_MAX_HISTORY_TOTAL_CHARS = 20000  # combined history content, characters
+
+# Generation timeout (Stage 7A-1): centralized wall-clock bound on a single
+# provider text-generation call (services/text_llm.py), applied uniformly
+# to both providers (Anthropic/OpenAI) and to both plain-chat and RAG
+# answer generation — never relies on the provider SDK's own default
+# timeout alone (see services/text_llm.py's own docstring).
+TEXT_GENERATION_TIMEOUT_SECONDS = 90
+
+# Generation admission control (Stage 7A-1): process-local concurrency caps
+# enforced by app/generation_limits.py — bounds how many text generations
+# may run at once, both per canonical user and globally in this process,
+# before a new request is rejected as busy rather than left to queue
+# unboundedly. In-process only — no Redis, no PostgreSQL table.
+TEXT_GENERATION_MAX_PER_USER = 1
+TEXT_GENERATION_MAX_GLOBAL = 4
 

@@ -31,9 +31,8 @@ async def callback_mode(callback: types.CallbackQuery):
     """Обработка нажатия кнопки режима — автоматическое переключение."""
     telegram_user_id = callback.from_user.id
     mode = callback.data.replace("mode_", "")
-    valid = [BotMode.TEXT, BotMode.VOICE, BotMode.VISION, BotMode.RAG]
     logger.info("Callback mode | telegram_user_id=%s, callback_data=%s, mode=%s", telegram_user_id, callback.data, mode)
-    if mode not in valid:
+    if mode not in BotMode.ALL:
         logger.warning("Callback mode invalid | telegram_user_id=%s, mode=%s", telegram_user_id, mode)
         await bot.answer_callback_query(callback.id, "Неизвестный режим")
         return
@@ -64,8 +63,7 @@ async def cmd_mode(message: types.Message):
     if len(args) >= 2:
         # /mode text и т.д. — переключение из текста
         new_mode = args[1].lower()
-        valid_modes = [BotMode.TEXT, BotMode.VOICE, BotMode.VISION, BotMode.RAG]
-        if new_mode not in valid_modes:
+        if new_mode not in BotMode.ALL:
             await bot.send_message(
                 message.chat.id,
                 f"❌ Неизвестный режим: {new_mode}\n\nДоступные: text, voice, vision, rag",

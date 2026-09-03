@@ -1013,20 +1013,31 @@ def test_invalid_provider_at_facade_dispatch_fails_closed(monkeypatch):
         asyncio.run(text_llm.generate_text_response([{"role": "user", "content": "hi"}]))
 
 
-def test_text_llm_facade_has_no_exception_handling():
-    """Structural no-fallback proof: the facade module contains no
-    try/except statement at all, so a provider failure has no path to be
-    caught and retried through the other provider inside this file.
-
-    Checks for the actual `except`/`try:` Python keywords as statements
-    (a stripped line starting with them), not merely the substring
-    "except" — which also occurs inside ordinary prose words like
-    "exception" in this module's own docstrings.
+def test_text_llm_facade_has_no_cross_provider_fallback_in_its_exception_handling():
+    """Structural no-fallback proof (updated Stage 7A-1): the facade now
+    DOES catch one specific exception — asyncio.TimeoutError, converted to
+    TextGenerationTimeoutError by the centralized generation-timeout wrapper
+    (see services/text_llm.py's own docstring) — but this must never become
+    a path for one provider's failure to be silently retried through the
+    other. Checks the actual source rather than merely re-asserting "no
+    try/except at all", which stopped being true once the timeout wrapper
+    was added:
+      - the except clause names asyncio.TimeoutError specifically, never a
+        bare `except Exception`/`except:` that could swallow and retry
+        anything else;
+      - each provider's generate_text_response is called exactly ONCE in
+        the whole file (the initial if/elif dispatch that builds
+        `provider_call`) — never a second time from inside the try/except
+        block, which would be a retry.
     """
     content = (PROJECT_ROOT / "services" / "text_llm.py").read_text(encoding="utf-8")
     lines = [line.strip() for line in content.splitlines()]
-    assert not any(line.startswith("except") for line in lines)
-    assert not any(line == "try:" or line.startswith("try:") for line in lines)
+
+    assert "except asyncio.TimeoutError:" in content
+    assert not any(line == "except:" or line.startswith("except Exception") for line in lines)
+
+    assert content.count("anthropic_client.generate_text_response(") == 1
+    assert content.count("openai_client.generate_text_response(") == 1
 
 
 # ============================================================================

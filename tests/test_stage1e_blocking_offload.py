@@ -356,8 +356,11 @@ async def test_event_loop_stays_responsive_during_offloaded_rag_query(monkeypatc
 async def test_worker_thread_never_mutates_user_session(monkeypatch):
     """route_text_request() in RAG mode exercises the offloaded similarity
     search on a worker thread and then mutates UserSession on completion.
-    Every UserSession.add_message() call must happen on the event-loop
-    (caller's) thread — never from inside the offloaded worker thread."""
+    The UserSession.add_exchange() atomic commit (Stage 7A-1 corrective
+    pass: route_text_request() now records the completed user/assistant
+    pair as ONE call, never two independently observable add_message()
+    calls) must happen on the event-loop (caller's) thread — never from
+    inside the offloaded worker thread."""
     import app.tutor as router_module
     from app.tutor import route_text_request
     from app.session import user_sessions
@@ -398,14 +401,14 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
         AsyncMock(return_value={"needs_generation": False, "confidence": 0.0}),
     )
 
-    add_message_call_threads = []
-    real_add_message = user_sessions.add_message
+    add_exchange_call_threads = []
+    real_add_exchange = user_sessions.add_exchange
 
-    def spy_add_message(uid, role, content):
-        add_message_call_threads.append(threading.get_ident())
-        return real_add_message(uid, role, content)
+    def spy_add_exchange(uid, user_text, assistant_text):
+        add_exchange_call_threads.append(threading.get_ident())
+        return real_add_exchange(uid, user_text, assistant_text)
 
-    monkeypatch.setattr(user_sessions, "add_message", spy_add_message)
+    monkeypatch.setattr(user_sessions, "add_exchange", spy_add_exchange)
 
     try:
         await route_text_request(user_id, "What is a Python decorator?")
@@ -413,9 +416,9 @@ async def test_worker_thread_never_mutates_user_session(monkeypatch):
         user_sessions.sessions.pop(user_id, None)
 
     assert search_thread_id["id"] != caller_thread_id  # the blocking work really was offloaded
-    assert len(add_message_call_threads) == 2  # user message + assistant response
-    assert all(t == caller_thread_id for t in add_message_call_threads), \
-        "UserSession.add_message() must only ever be called on the event-loop thread"
+    assert len(add_exchange_call_threads) == 1  # ONE atomic user+assistant commit
+    assert all(t == caller_thread_id for t in add_exchange_call_threads), \
+        "UserSession.add_exchange() must only ever be called on the event-loop thread"
 
 
 # ---------------------------------------------------------------------------
