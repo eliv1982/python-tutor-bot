@@ -107,11 +107,50 @@ private `_save_file_sync()`/`_write_image_bytes_sync()` seam:
     own independent storage-worker boundary (Section 6: its filename
     convention differs from save_file_async()'s, so it keeps its own
     _write_image_bytes_sync() rather than reusing save_file_async()).
+
+Clean-shutdown corrective pass additions (manually reproduced bug: a normal
+operator Ctrl+C shut every adapter down correctly, then ended with
+UnifiedServiceAdapterExited and exit code 1 — uvicorn's own `capture_
+signals()` handler consumes the SIGINT, so the composition root's own
+"asked to stop" flag was never set; see service_main.py's "Clean-shutdown
+corrective pass" docstring section):
+  - test_coordinated_shutdown_telegram_returning_normally_* /
+    test_coordinated_shutdown_uvicorn_returning_normally_* — A/B: a normal
+    adapter return during a coordinated shutdown (caller cancellation, or
+    an operator signal uvicorn itself consumed) is expected, fake adapters.
+  - test_operator_signal_racing_caller_cancellation_* — the exact
+    production ordering (adapter returns in the same event-loop step the
+    re-raised SIGINT cancels the service task) -> CancelledError.
+  - test_ctrl_c_race_settles_owned_work_before_close_resources_* — E: the
+    transitive-ownership invariant on the new path, incl. a second Ctrl+C
+    mid-settlement.
+  - test_uvicorn_returning_on_its_own_* /
+    test_telegram_returning_on_its_own_* — C: an exit BEFORE any shutdown
+    request is still UnifiedServiceAdapterExited (per adapter).
+  - test_uvicorn_failure_during_a_requested_shutdown_* /
+    test_adapter_failure_before_shutdown_wins_* — D: real adapter failures
+    still propagate with the accepted precedence.
+  - test_real_uvicorn_operator_* — the REAL installed uvicorn.Server's own
+    `capture_signals()`/`handle_exit()` with the production
+    `_build_uvicorn_adapter()` (loopback ephemeral port only; only the OS
+    signal re-raise is a recorder).
+  - test_production_wiring_operator_shutdown_* — the accepted cleanup order
+    (bot session, then Qdrant singleton, then DB engine) through the full
+    production default wiring.
+  - test_main_* — F/G: `_main()`'s exception -> exit-code mapping.
+  - test_process_level_* — F/G: a real subprocess, real asyncio.run(), real
+    SIGINT delivery, real exit code.
 """
 
 import asyncio
 import gc
 import importlib.metadata
+import logging
+import os
+import signal
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 
@@ -652,7 +691,7 @@ async def test_uvicorn_forced_cancellation_during_hanging_lifespan_startup_settl
     )
 
     baseline = set(asyncio.all_tasks())
-    run, stop = service_main._build_uvicorn_adapter()
+    run, stop, _shutdown_requested = service_main._build_uvicorn_adapter()
 
     run_task = asyncio.create_task(run())
     # Let Server.serve() actually reach and get stuck inside
@@ -909,7 +948,7 @@ def test_build_uvicorn_adapter_wires_env_host_port_and_owns_db_lifecycle_false(m
     monkeypatch.setattr(service_main.uvicorn, "Config", FakeConfig)
     monkeypatch.setattr(service_main.uvicorn, "Server", FakeServer)
 
-    run, stop = service_main._build_uvicorn_adapter()
+    run, stop, shutdown_requested = service_main._build_uvicorn_adapter()
 
     assert create_app_calls == [False]
     assert len(config_calls) == 1
@@ -925,9 +964,14 @@ def test_build_uvicorn_adapter_wires_env_host_port_and_owns_db_lifecycle_false(m
     assert config_instances[0].lifespan_class is service_main._TrackedLifespanOn
     assert len(server_instances) == 1
     assert server_instances[0].should_exit is False
+    # Clean-shutdown corrective pass: the predicate reports the SAME
+    # server's own cooperative-exit flag — False until something (this
+    # module's own stop(), or uvicorn's operator-signal handler) sets it.
+    assert shutdown_requested() is False
 
     stop()
     assert server_instances[0].should_exit is True
+    assert shutdown_requested() is True
 
 
 # --- no duplicate Qdrant owner, production defaults end-to-end -----------
@@ -2593,3 +2637,709 @@ async def test_download_image_storage_worker_cannot_outlive_caller_cancellation(
         if captured_path.get("path") is not None:
             from utils.helpers import cleanup_file
             cleanup_file(captured_path["path"])
+
+
+# --- Clean-shutdown corrective pass: an operator Ctrl+C that uvicorn's OWN
+# --- signal handler consumed is a REQUESTED shutdown, not an adapter exit --
+#
+# Manually reproduced bug: `Server.serve()` runs inside `capture_signals()`,
+# which replaces the process's SIGINT handler, so a real Ctrl+C is consumed
+# by uvicorn (`handle_exit()` sets `server.should_exit`; `serve()` returns
+# normally) instead of reaching this composition root. See service_main.py's
+# "Clean-shutdown corrective pass" docstring section for the full sequence.
+
+
+class _FakeOperatorUvicorn:
+    """
+    Stands in for `_build_uvicorn_adapter()`'s `(run, stop, shutdown_
+    requested)` triple with the exact observable behavior of a real
+    `uvicorn.Server` that owns the process's SIGINT/SIGTERM handlers:
+    `operator_signal()` sets the server's OWN `should_exit` flag and lets
+    `run()` return normally — never through `stop()`, which is only ever
+    the composition root's own request. `on_returned` (if set) runs
+    synchronously just before `run()` returns, with no `await` in between
+    — exactly where real `capture_signals()` re-raises the captured signal
+    into `asyncio.run()`'s own SIGINT handler.
+    """
+
+    def __init__(self, *, returns_immediately=False, signalled=False, raises=None) -> None:
+        self.should_exit = signalled
+        self.stop_calls = 0
+        self.started = asyncio.Event()
+        self.on_returned = None
+        self._returns_immediately = returns_immediately
+        self._raises = raises
+        self._wake = asyncio.Event()
+
+    async def run(self) -> None:
+        self.started.set()
+        if not self._returns_immediately:
+            await self._wake.wait()
+        if self.on_returned is not None:
+            self.on_returned()
+        if self._raises is not None:
+            raise self._raises
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self.should_exit = True
+        self._wake.set()
+
+    def shutdown_requested(self) -> bool:
+        return self.should_exit
+
+    def operator_signal(self) -> None:
+        self.should_exit = True
+        self._wake.set()
+
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            service_main, "_build_uvicorn_adapter", lambda: (self.run, self.stop, self.shutdown_requested)
+        )
+
+
+class _ShutdownHarness:
+    """A traced fake Telegram adapter (optionally with one owned child task
+    it must settle before returning, and a slow settle) plus a
+    `_FakeOperatorUvicorn`, driven through the REAL `run_unified_service()`
+    — the default-Uvicorn-adapter selection path — via a monkeypatched
+    `_build_uvicorn_adapter`."""
+
+    def __init__(self, monkeypatch, uvicorn_fake=None, *, telegram_settle_delay=0.0, owned_child=False) -> None:
+        self.trace: list = []
+        self.close_calls: list = []
+        self.uvicorn = uvicorn_fake if uvicorn_fake is not None else _FakeOperatorUvicorn()
+        self.uvicorn.install(monkeypatch)
+        self.baseline = set(asyncio.all_tasks())
+        self.task = None
+        self._telegram_stop = asyncio.Event()
+        self._telegram_settle_delay = telegram_settle_delay
+        self._owned_child = owned_child
+
+    async def _run_telegram(self) -> None:
+        self.trace.append("telegram: started")
+        child = asyncio.create_task(asyncio.Event().wait()) if self._owned_child else None
+        try:
+            await self._telegram_stop.wait()
+            await asyncio.sleep(self._telegram_settle_delay)
+        finally:
+            if child is not None:
+                child.cancel()
+                await asyncio.wait([child])
+                self.trace.append("telegram: owned child settled")
+        self.trace.append("telegram: returned normally")
+
+    def _stop_telegram(self) -> None:
+        self.trace.append("telegram: stop requested")
+        self._telegram_stop.set()
+
+    async def _close_resources(self) -> None:
+        self.trace.append("close_resources: begin")
+        self.close_calls.append(1)
+
+    async def start(self) -> None:
+        self.task = asyncio.create_task(
+            service_main.run_unified_service(
+                run_telegram=self._run_telegram,
+                stop_telegram=self._stop_telegram,
+                close_resources=self._close_resources,
+                shutdown_grace_seconds=2.0,
+            )
+        )
+        await asyncio.wait_for(self.uvicorn.started.wait(), timeout=2.0)
+        await _wait_until(lambda: "telegram: started" in self.trace)
+
+
+@pytest.mark.parametrize("trigger", ["caller_cancellation", "uvicorn_operator_signal"])
+async def test_coordinated_shutdown_telegram_returning_normally_is_expected(monkeypatch, trigger):
+    """A. Coordinated shutdown + the Telegram adapter returns normally
+    (after its own stop_polling()-style cooperative stop) -> accepted, no
+    UnifiedServiceAdapterExited — whether the shutdown reached the
+    supervisor as caller cancellation or via uvicorn's own operator-signal
+    handler."""
+    harness = _ShutdownHarness(monkeypatch)
+    await harness.start()
+
+    if trigger == "caller_cancellation":
+        harness.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await harness.task
+        assert harness.uvicorn.stop_calls == 1  # the composition root asked uvicorn to stop
+    else:
+        harness.uvicorn.operator_signal()
+        assert await harness.task is None  # clean return, nothing raised
+        assert harness.uvicorn.stop_calls == 0  # uvicorn was NEVER asked by the composition root
+
+    assert "telegram: stop requested" in harness.trace
+    assert "telegram: returned normally" in harness.trace
+    assert harness.close_calls == [1]
+    assert _leaked_tasks(harness.baseline) == set()
+
+
+@pytest.mark.parametrize("trigger", ["caller_cancellation", "uvicorn_operator_signal"])
+async def test_coordinated_shutdown_uvicorn_returning_normally_is_expected(monkeypatch, trigger):
+    """B. Coordinated shutdown + the Uvicorn adapter returns normally ->
+    accepted, no fatal classification — after the composition root's own
+    `stop_uvicorn()`, or on its own after uvicorn's own operator-signal
+    handler already requested the shutdown (the manually reproduced bug)."""
+    uv = _FakeOperatorUvicorn()
+    returned = []
+    uv.on_returned = lambda: returned.append(True)
+    harness = _ShutdownHarness(monkeypatch, uv)
+    await harness.start()
+
+    if trigger == "caller_cancellation":
+        harness.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await harness.task
+    else:
+        uv.operator_signal()
+        assert await harness.task is None
+
+    assert returned == [True]  # uvicorn's adapter itself returned normally
+    assert harness.close_calls == [1]
+    assert _leaked_tasks(harness.baseline) == set()
+
+
+async def test_operator_signal_racing_caller_cancellation_is_cancellation_not_adapter_exited(monkeypatch):
+    """The exact production ordering, with fakes: uvicorn's adapter returns
+    normally in the SAME uninterrupted event-loop step in which
+    `capture_signals()`'s re-raised SIGINT reaches `asyncio.run()`'s own
+    handler and cancels the service task (`on_returned` cancels it
+    synchronously, then `run()` returns — no `await` in between). The
+    supervisor therefore sees `done={uvicorn}` AND a cancelled wait at once;
+    the outcome must be CancelledError (what `asyncio.run()` converts to
+    KeyboardInterrupt -> exit 0), never UnifiedServiceAdapterExited."""
+    uv = _FakeOperatorUvicorn()
+    harness = _ShutdownHarness(monkeypatch, uv)
+    await harness.start()
+    uv.on_returned = harness.task.cancel
+
+    uv.operator_signal()
+    with pytest.raises(asyncio.CancelledError):
+        await harness.task
+
+    assert uv.stop_calls == 0
+    assert "telegram: returned normally" in harness.trace
+    assert harness.close_calls == [1]
+    assert _leaked_tasks(harness.baseline) == set()
+
+
+async def test_ctrl_c_race_settles_owned_work_before_close_resources_even_under_repeated_cancellation(monkeypatch):
+    """E. The accepted transitive-ownership invariant still holds on the
+    new Ctrl+C path: the Telegram adapter's own owned child task settles,
+    THEN the adapter itself settles, THEN close_resources() begins — even
+    when a second Ctrl+C (cancellation) lands while that settlement is
+    already in progress."""
+    uv = _FakeOperatorUvicorn()
+    harness = _ShutdownHarness(monkeypatch, uv, telegram_settle_delay=0.05, owned_child=True)
+    await harness.start()
+    uv.on_returned = harness.task.cancel
+
+    uv.operator_signal()
+    await _wait_until(lambda: "telegram: stop requested" in harness.trace)
+    assert "close_resources: begin" not in harness.trace  # settlement is genuinely in progress
+    harness.task.cancel()  # second Ctrl+C, mid-settlement
+
+    with pytest.raises(asyncio.CancelledError):
+        await harness.task
+
+    trace = harness.trace
+    assert (
+        trace.index("telegram: owned child settled")
+        < trace.index("telegram: returned normally")
+        < trace.index("close_resources: begin")
+    )
+    assert harness.close_calls == [1]
+    assert _leaked_tasks(harness.baseline) == set()
+
+
+async def test_uvicorn_returning_on_its_own_without_any_shutdown_request_is_still_an_unexpected_exit(monkeypatch):
+    """C. An adapter that returns BEFORE any shutdown was requested is still
+    fatal — the new predicate is False (should_exit never set), so nothing
+    about fail-fast supervision is weakened."""
+    harness = _ShutdownHarness(monkeypatch, _FakeOperatorUvicorn(returns_immediately=True))
+
+    with pytest.raises(service_main.UnifiedServiceAdapterExited, match="uvicorn adapter task exited unexpectedly"):
+        await harness.start()
+        await harness.task
+
+    assert harness.uvicorn.stop_calls == 0  # it exited before anyone asked
+    assert "telegram: stop requested" in harness.trace  # the SIBLING was still torn down
+    assert harness.close_calls == [1]
+    assert _leaked_tasks(harness.baseline) == set()
+
+
+async def test_telegram_returning_on_its_own_is_still_unexpected_even_if_uvicorn_saw_an_operator_signal(monkeypatch):
+    """C. The Uvicorn-only predicate never excuses the OTHER adapter: a
+    Telegram adapter that returns without being asked is still an
+    unexpected exit, even when uvicorn's own signal handler already
+    requested a shutdown."""
+
+    async def exiting_telegram() -> None:
+        return  # returns without ever being asked to stop
+
+    uv = _FakeOperatorUvicorn(returns_immediately=True, signalled=True)
+    uv.install(monkeypatch)
+    close_calls = []
+
+    async def close_resources() -> None:
+        close_calls.append(1)
+
+    with pytest.raises(service_main.UnifiedServiceAdapterExited, match="telegram adapter task exited unexpectedly"):
+        await service_main.run_unified_service(
+            run_telegram=exiting_telegram,
+            stop_telegram=lambda: None,
+            close_resources=close_resources,
+            shutdown_grace_seconds=1.0,
+        )
+
+    assert close_calls == [1]
+
+
+async def test_uvicorn_failure_during_a_requested_shutdown_still_propagates(monkeypatch):
+    """D/semantic 3. A REAL exception from an adapter is never excused by
+    a requested shutdown: uvicorn's own operator-signal handler already set
+    should_exit, but `run()` then raises — that failure (not a clean exit)
+    is what propagates."""
+    uv = _FakeOperatorUvicorn(raises=_UvicornSentinelError("failed while shutting down"))
+    harness = _ShutdownHarness(monkeypatch, uv)
+    await harness.start()
+
+    uv.operator_signal()
+    with pytest.raises(_UvicornSentinelError):
+        await harness.task
+
+    assert "telegram: returned normally" in harness.trace
+    assert harness.close_calls == [1]
+    assert _leaked_tasks(harness.baseline) == set()
+
+
+async def test_adapter_failure_before_shutdown_wins_over_the_later_expected_uvicorn_exit(monkeypatch):
+    """D. Telegram fails BEFORE any shutdown; the composition root then
+    stops uvicorn, which returns normally with should_exit True (now an
+    expected exit). The original Telegram failure is still what
+    propagates, per the accepted precedence."""
+
+    async def failing_telegram() -> None:
+        raise _TelegramSentinelError("telegram runtime failure")
+
+    uv = _FakeOperatorUvicorn()
+    uv.install(monkeypatch)
+    close_calls = []
+
+    async def close_resources() -> None:
+        close_calls.append(1)
+
+    with pytest.raises(_TelegramSentinelError):
+        await service_main.run_unified_service(
+            run_telegram=failing_telegram,
+            stop_telegram=lambda: None,
+            close_resources=close_resources,
+            shutdown_grace_seconds=1.0,
+        )
+
+    assert uv.stop_calls == 1
+    assert close_calls == [1]
+
+
+# --- the REAL uvicorn.Server: its own capture_signals()/handle_exit() -----
+
+
+async def _run_real_uvicorn_operator_shutdown(monkeypatch, *, reraised_signal_cancels_service_task: bool):
+    """Runs the real `run_unified_service()` with the PRODUCTION
+    `_build_uvicorn_adapter()` (real `uvicorn.Server` on a loopback,
+    OS-assigned ephemeral port; real `_TrackedLifespanOn`; real
+    `capture_signals()`/`handle_exit()`) — only Telegram, `create_app()`
+    and the OS-level signal re-raise are faked.
+
+    An operator Ctrl+C is delivered by calling the installed
+    `server.handle_exit(SIGINT, None)` directly — the exact bound method
+    `capture_signals()` registers with `signal.signal()`, without sending a
+    real OS signal into the pytest process. `signal.raise_signal` (which
+    `capture_signals()` calls once `serve()` has finished, after restoring
+    the previous handlers) is replaced by a recorder that, when
+    `reraised_signal_cancels_service_task` is set, does what
+    `asyncio.run()`'s own `Runner._on_sigint` does on the first SIGINT:
+    cancel the main task, synchronously, inside the uvicorn adapter task's
+    own step. Returns (outcome, trace, recorded_signals, close_calls)."""
+    monkeypatch.setenv("WEB_HOST", "127.0.0.1")
+    monkeypatch.setenv("WEB_PORT", "0")
+    monkeypatch.setattr(service_main, "create_app", lambda *, owns_db_lifecycle=True: FastAPI())
+
+    servers = []
+    real_server_cls = uvicorn.Server
+
+    class _RecordingServer(real_server_cls):
+        def __init__(self, config) -> None:
+            super().__init__(config)
+            servers.append(self)
+
+    monkeypatch.setattr(service_main.uvicorn, "Server", _RecordingServer)
+
+    trace: list = []
+    recorded_signals: list = []
+    service_task_holder: list = []
+
+    def fake_raise_signal(sig: int) -> None:
+        recorded_signals.append(sig)
+        if reraised_signal_cancels_service_task and len(recorded_signals) == 1:
+            service_task_holder[0].cancel()
+
+    monkeypatch.setattr(signal, "raise_signal", fake_raise_signal)
+
+    telegram_stop = asyncio.Event()
+
+    async def run_telegram() -> None:
+        trace.append("telegram: started")
+        await telegram_stop.wait()
+        trace.append("telegram: returned normally")
+
+    def stop_telegram() -> None:
+        trace.append("telegram: stop requested")
+        telegram_stop.set()
+
+    close_calls: list = []
+
+    async def close_resources() -> None:
+        trace.append("close_resources: begin")
+        close_calls.append(1)
+
+    baseline = set(asyncio.all_tasks())
+    service_task = asyncio.create_task(
+        service_main.run_unified_service(
+            run_telegram=run_telegram,
+            stop_telegram=stop_telegram,
+            close_resources=close_resources,
+            shutdown_grace_seconds=5.0,
+        )
+    )
+    service_task_holder.append(service_task)
+
+    await _wait_until(lambda: bool(servers) and servers[0].started and "telegram: started" in trace)
+    servers[0].handle_exit(signal.SIGINT, None)
+
+    done, _ = await asyncio.wait({service_task}, timeout=10.0)
+    if not done:
+        service_task.cancel()
+        await asyncio.gather(service_task, return_exceptions=True)
+        raise AssertionError("run_unified_service() never finished after the operator shutdown")
+    # Retrieves the outcome without re-raising it: None (clean return), a
+    # CancelledError (cancelled), or the exception the service raised.
+    outcome = asyncio.CancelledError() if service_task.cancelled() else service_task.exception()
+    assert _leaked_tasks(baseline) == set()
+    return outcome, trace, recorded_signals, close_calls
+
+
+async def test_real_uvicorn_operator_ctrl_c_followed_by_reraised_sigint_is_cancellation_not_adapter_exited(
+    monkeypatch,
+):
+    """The decisive regression, against the real installed uvicorn: an
+    operator Ctrl+C consumed by uvicorn's OWN handler, followed by
+    `capture_signals()` re-raising SIGINT into `asyncio.run()`'s handler
+    (which cancels the service task). Must surface as CancelledError —
+    which `asyncio.run()` turns into KeyboardInterrupt and a clean exit 0
+    — and NEVER as UnifiedServiceAdapterExited (the manually reproduced
+    bug)."""
+    outcome, trace, recorded_signals, close_calls = await _run_real_uvicorn_operator_shutdown(
+        monkeypatch, reraised_signal_cancels_service_task=True
+    )
+
+    assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+    assert not isinstance(outcome, service_main.UnifiedServiceAdapterExited)
+    assert recorded_signals == [signal.SIGINT]  # uvicorn did re-raise the captured signal
+    assert trace == ["telegram: started", "telegram: stop requested", "telegram: returned normally", "close_resources: begin"]
+    assert close_calls == [1]
+
+
+async def test_real_uvicorn_operator_signal_without_a_cancelling_reraise_returns_cleanly(monkeypatch):
+    """Same real-uvicorn operator shutdown, but nothing cancels the service
+    task afterwards (e.g. a process supervisor's signal that
+    `asyncio.run()` does not itself convert): a clean, successful return —
+    no exception at all."""
+    outcome, trace, recorded_signals, close_calls = await _run_real_uvicorn_operator_shutdown(
+        monkeypatch, reraised_signal_cancels_service_task=False
+    )
+
+    assert outcome is None, repr(outcome)
+    assert recorded_signals == [signal.SIGINT]
+    assert trace == ["telegram: started", "telegram: stop requested", "telegram: returned normally", "close_resources: begin"]
+    assert close_calls == [1]
+
+
+async def test_production_wiring_operator_shutdown_closes_shared_resources_once_in_accepted_order(monkeypatch):
+    """Resource ownership. The FULL production default wiring (no injected
+    adapters or cleanup — `_default_run_telegram`, `_build_uvicorn_adapter`'s
+    real `run`/`shutdown_requested` closures, `main.shutdown_bot`) with only
+    the Telegram/socket/Qdrant/DB I/O boundaries faked. An operator
+    shutdown seen only by the uvicorn server (its own `should_exit` flag —
+    never `stop()`) must end in a clean return, with the accepted cleanup
+    order intact: Telegram polling and uvicorn's serve() both finish BEFORE
+    the bot session closes, then the shared Qdrant singleton, then the
+    shared DB engine — each exactly once."""
+    monkeypatch.setenv("WEB_HOST", "127.0.0.1")
+    monkeypatch.setenv("WEB_PORT", "8000")
+
+    trace: list = []
+
+    async def fake_setup_bot() -> None:
+        trace.append("telegram: setup")
+
+    async def fake_infinity_polling(*, timeout=None, skip_pending=None) -> None:
+        service_main.bot._polling = True
+        trace.append("telegram: polling started")
+        while service_main.bot._polling:
+            await asyncio.sleep(0.01)
+        trace.append("telegram: polling exited")
+
+    async def fake_close_session() -> None:
+        trace.append("close: bot session")
+
+    monkeypatch.setattr(service_main, "setup_bot", fake_setup_bot)
+    monkeypatch.setattr(service_main.bot, "infinity_polling", fake_infinity_polling)
+    monkeypatch.setattr(service_main.bot, "close_session", fake_close_session)
+    monkeypatch.setattr(rag.index, "close_vector_index", lambda: trace.append("close: qdrant"))
+    monkeypatch.setattr(db.engine, "close_db", lambda: trace.append("close: db"))
+
+    class FakeConfig:
+        def __init__(self, app, **kwargs) -> None:
+            self.loaded = False
+            self.lifespan_class = None
+
+        def load(self) -> None:
+            self.loaded = True
+
+    server_instances: list = []
+
+    class FakeServer:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.should_exit = False
+            server_instances.append(self)
+
+        async def serve(self) -> None:
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+            trace.append("uvicorn: serve returned")
+
+    monkeypatch.setattr(service_main, "create_app", lambda *, owns_db_lifecycle=True: object())
+    monkeypatch.setattr(service_main.uvicorn, "Config", FakeConfig)
+    monkeypatch.setattr(service_main.uvicorn, "Server", FakeServer)
+
+    baseline = set(asyncio.all_tasks())
+    task = asyncio.create_task(service_main.run_unified_service(shutdown_grace_seconds=2.0))
+    await _wait_until(lambda: "telegram: polling started" in trace and bool(server_instances))
+
+    # What uvicorn's own operator-signal handler does — never stop().
+    server_instances[0].should_exit = True
+
+    assert await asyncio.wait_for(task, timeout=5.0) is None
+
+    for finished in ("telegram: polling exited", "uvicorn: serve returned"):
+        assert trace.index(finished) < trace.index("close: bot session")
+    assert trace.index("close: bot session") < trace.index("close: qdrant") < trace.index("close: db")
+    for once in ("close: bot session", "close: qdrant", "close: db"):
+        assert trace.count(once) == 1
+    assert _leaked_tasks(baseline) == set()
+
+
+# --- the top-level exception -> exit-code mapping --------------------------
+
+
+def _fatal_error_records(caplog) -> list:
+    return [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_main_maps_a_normal_return_to_exit_code_0(caplog):
+    async def service() -> None:
+        return None
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        assert service_main._main(service) == 0
+    assert _fatal_error_records(caplog) == []
+
+
+def test_main_maps_keyboard_interrupt_to_exit_code_0_without_a_fatal_error(caplog):
+    """F. What `asyncio.run()` raises after an operator Ctrl+C cancels the
+    main task (see the subprocess test below for the real thing)."""
+
+    async def service() -> None:
+        raise KeyboardInterrupt
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        assert service_main._main(service) == 0
+    assert _fatal_error_records(caplog) == []
+    assert any("stopped by user" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        service_main.UnifiedServiceAdapterExited("uvicorn adapter task exited unexpectedly"),
+        service_main.UnifiedServiceAdapterCancelled("telegram adapter task was cancelled unexpectedly"),
+        RuntimeError("secret-token-in-exception-text"),
+    ],
+)
+def test_main_maps_every_unexpected_failure_to_exit_code_1_logging_only_the_type(caplog, exc):
+    """G. Fail-fast supervision still ends in a non-zero exit, logged by
+    exception type only — never its raw text."""
+
+    async def service() -> None:
+        raise exc
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        assert service_main._main(service) == 1
+    errors = _fatal_error_records(caplog)
+    assert len(errors) == 1
+    assert f"error_type={type(exc).__name__}" in errors[0].getMessage()
+    assert "secret-token" not in caplog.text
+
+
+def test_main_does_not_swallow_system_exit():
+    async def service() -> None:
+        raise SystemExit(7)
+
+    with pytest.raises(SystemExit) as excinfo:
+        service_main._main(service)
+    assert excinfo.value.code == 7
+
+
+# --- real process, real asyncio.run(), real SIGINT delivery ----------------
+#
+# Loopback-only (WEB_HOST=127.0.0.1, WEB_PORT=0: an OS-assigned ephemeral
+# port), no Telegram/provider/DB/Qdrant: Telegram and close_resources() are
+# fakes. The signal is delivered with `signal.raise_signal(SIGINT)` from
+# inside the subprocess's own event loop — the same in-process delivery
+# path a console Ctrl+C takes, without sending a console event to (and
+# thereby risking) the pytest process itself.
+
+_SUBPROCESS_ENV_NAMES = (
+    "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE",
+    "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DATABASE_URL", "SESSION_SECRET_KEY",
+    "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_REDIRECT_URI", "LLM_PROVIDER",
+)
+
+_CLEAN_SHUTDOWN_SUBPROCESS_SCRIPT = textwrap.dedent(
+    """
+    import asyncio
+    import os
+    import signal
+    import sys
+
+    sys.path.insert(0, sys.argv[1])
+    scenario = sys.argv[2]
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    import service_main
+
+    trace = []
+    servers = []
+    _RealServer = uvicorn.Server
+
+
+    class _RecordingServer(_RealServer):
+        def __init__(self, config):
+            super().__init__(config)
+            servers.append(self)
+
+
+    uvicorn.Server = _RecordingServer
+    service_main.create_app = lambda *, owns_db_lifecycle=True: FastAPI()
+
+
+    async def service():
+        telegram_stop = asyncio.Event()
+
+        async def run_telegram():
+            if scenario == "unexpected_adapter_exit":
+                trace.append("telegram: returned on its own")
+                return
+            await telegram_stop.wait()
+            trace.append("telegram: returned after stop")
+
+        def stop_telegram():
+            trace.append("telegram: stop requested")
+            telegram_stop.set()
+
+        async def close_resources():
+            trace.append("close_resources")
+
+        async def operator():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 30
+            while not (servers and servers[0].started):
+                if loop.time() > deadline:
+                    print("TRACE operator: uvicorn never started", flush=True)
+                    os._exit(99)
+                await asyncio.sleep(0.01)
+            trace.append("operator: SIGINT")
+            signal.raise_signal(signal.SIGINT)
+
+        operator_task = asyncio.create_task(operator()) if scenario == "operator_ctrl_c" else None
+        try:
+            await service_main.run_unified_service(
+                run_telegram=run_telegram,
+                stop_telegram=stop_telegram,
+                close_resources=close_resources,
+                shutdown_grace_seconds=5.0,
+            )
+        finally:
+            if operator_task is not None:
+                await asyncio.gather(operator_task, return_exceptions=True)
+
+
+    exit_code = service_main._main(service)
+    for line in trace:
+        print("TRACE " + line, flush=True)
+    sys.exit(exit_code)
+    """
+)
+
+
+def _run_service_subprocess(scenario: str) -> "subprocess.CompletedProcess":
+    env = {name: os.environ[name] for name in _SUBPROCESS_ENV_NAMES if name in os.environ}
+    env["WEB_HOST"] = "127.0.0.1"
+    env["WEB_PORT"] = "0"
+    return subprocess.run(
+        [sys.executable, "-c", _CLEAN_SHUTDOWN_SUBPROCESS_SCRIPT, str(_PROJECT_ROOT), scenario],
+        capture_output=True, text=True, timeout=90, env=env, cwd=str(_PROJECT_ROOT),
+    )
+
+
+def _trace_lines(proc: "subprocess.CompletedProcess") -> list:
+    return [line[len("TRACE "):] for line in proc.stdout.splitlines() if line.startswith("TRACE ")]
+
+
+def test_process_level_operator_ctrl_c_exits_with_code_0_and_no_fatal_error():
+    """F. A real process, real `asyncio.run()`, real SIGINT consumed by the
+    real uvicorn server's own handler: shuts down in order and exits 0 —
+    never UnifiedServiceAdapterExited, never a fatal-error log line."""
+    proc = _run_service_subprocess("operator_ctrl_c")
+    diagnostics = f"exit={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+
+    assert proc.returncode == 0, diagnostics
+    assert _trace_lines(proc) == [
+        "operator: SIGINT",
+        "telegram: stop requested",
+        "telegram: returned after stop",
+        "close_resources",
+    ], diagnostics
+    assert "UnifiedServiceAdapterExited" not in proc.stdout + proc.stderr, diagnostics
+    assert "fatal error" not in proc.stdout + proc.stderr, diagnostics
+
+
+def test_process_level_unexpected_adapter_exit_still_exits_non_zero():
+    """G. Fail-fast supervision is intact end to end: a Telegram adapter
+    that returns on its own (nothing asked it to) still ends the process
+    with UnifiedServiceAdapterExited and exit code 1, after uvicorn and
+    shared cleanup have still been shut down."""
+    proc = _run_service_subprocess("unexpected_adapter_exit")
+    diagnostics = f"exit={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+
+    assert proc.returncode == 1, diagnostics
+    assert "error_type=UnifiedServiceAdapterExited" in proc.stdout + proc.stderr, diagnostics
+    trace = _trace_lines(proc)
+    assert trace[0] == "telegram: returned on its own", diagnostics
+    assert trace[-1] == "close_resources", diagnostics

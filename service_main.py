@@ -202,6 +202,44 @@ is not transitive to reachable worker/request descendants"):
    uvicorn_lifespan_task()`, mirroring installed `Server.shutdown()`'s own
    ordering) every time `run()` ends for any reason — see that function's
    own docstring for the exact mechanism.
+
+Clean-shutdown corrective pass (manually reproduced bug: a normal operator
+Ctrl+C on `python service_main.py` shut every adapter down correctly and
+then ended with `UnifiedServiceAdapterExited` / exit code 1):
+
+`uvicorn.Server.serve()` runs inside `Server.capture_signals()`
+(venv/Lib/site-packages/uvicorn/server.py), which REPLACES the process's
+SIGINT/SIGTERM handlers for as long as it runs. A real Ctrl+C therefore
+never reaches `asyncio.run()`'s own SIGINT handler (which would cancel this
+call's task) first — uvicorn's `handle_exit()` consumes it, sets
+`server.should_exit` itself, drains, and `serve()` returns NORMALLY. This
+composition root's own `_stop_uvicorn` closure was never involved, so
+`stopped["uvicorn"]` stayed False and `_supervised_adapter()` correctly-by-
+its-old-rules classified a normal return "without being asked" as
+`UnifiedServiceAdapterExited`. Only afterwards does `capture_signals()`
+restore the previous handlers and re-raise the captured signal, which DOES
+reach `asyncio.run()`'s handler and cancels this call's task — but uvicorn's
+adapter task completes in that same, uninterrupted event-loop step, so by
+the time `_supervise()` observes that cancellation the adapter is already in
+`done` with `UnifiedServiceAdapterExited`, and precedence (1) (a genuine
+adapter outcome) outranks precedence (2) (external cancellation). The
+`CancelledError` that `asyncio.run()` would have turned into a clean
+`KeyboardInterrupt` (exit 0) was therefore discarded in favor of a fatal
+error (exit 1).
+
+The fix keeps every fail-fast rule as-is and only corrects what counts as
+"asked to stop": `_build_uvicorn_adapter()` now also returns a
+`shutdown_requested()` predicate over `server.should_exit` — a flag only two
+things ever set, this module's own `stop()` and uvicorn's own operator-signal
+handler (a lifespan/bind failure raises SystemExit instead and a
+`limit_max_requests` exit never sets it, so neither can be mistaken for a
+requested shutdown). `run_unified_service()` treats the Uvicorn adapter as
+asked-to-stop when EITHER its own `stopped` flag OR that predicate is set.
+An adapter returning normally with neither set is still an unexpected exit,
+and a genuine adapter exception is still never consulted against either.
+The former `__main__` block is now `_main()` so the exit-code mapping
+(operator shutdown -> 0, any other unexpected outcome -> 1) is directly
+testable.
 """
 
 import asyncio
@@ -231,6 +269,7 @@ DEFAULT_SHUTDOWN_GRACE_SECONDS = 15.0
 
 _AsyncCallable = Callable[[], Awaitable[None]]
 _SyncCallable = Callable[[], None]
+_PredicateCallable = Callable[[], bool]
 
 
 class UnifiedServiceAdapterExited(RuntimeError):
@@ -316,11 +355,14 @@ class _Adapter:
 async def _supervised_adapter(run: _AsyncCallable, label: str, was_asked_to_stop: Callable[[], bool]) -> None:
     """
     Runs one adapter. A genuine exception from `run()` always propagates
-    unchanged. A NORMAL return is only benign if the composition root
-    itself requested this adapter stop (`was_asked_to_stop()` is checked
-    AFTER `run()` returns, so it reflects the state at completion time,
-    not at call time) — otherwise it is itself an unexpected termination
-    (neither adapter may just quietly finish on its own).
+    unchanged. A NORMAL return is only benign if a shutdown was requested
+    of this adapter — by the composition root itself, or (Uvicorn only) by
+    an operator signal uvicorn's own handler consumed, see this module's
+    "Clean-shutdown corrective pass" docstring section (`was_asked_to_stop()`
+    is checked AFTER `run()` returns, so it reflects the state at
+    completion time, not at call time) — otherwise it is itself an
+    unexpected termination (neither adapter may just quietly finish on its
+    own).
 
     SystemExit/KeyboardInterrupt are caught and re-raised wrapped (see
     `_AdapterBaseExceptionWrapper`'s own docstring) — letting either
@@ -586,16 +628,26 @@ async def _settle_uvicorn_lifespan_task(server: "uvicorn.Server") -> None:
         await task
 
 
-def _build_uvicorn_adapter() -> Tuple[_AsyncCallable, _SyncCallable]:
+def _build_uvicorn_adapter() -> Tuple[_AsyncCallable, _SyncCallable, _PredicateCallable]:
     """
     Builds ONE uvicorn.Server bound to web.app.create_app(owns_db_
     lifecycle=False) (the web adapter never closes the shared DB engine
-    itself in unified mode) and returns (run, stop) closures scoped to
-    that exact instance. `stop()` sets uvicorn's own cooperative
-    `should_exit` flag — see this module's docstring for why that, not
-    `Task.cancel()`, is what lets `Server.serve()` run its own graceful
-    shutdown path (closing sockets, then the FastAPI lifespan's
+    itself in unified mode) and returns (run, stop, shutdown_requested)
+    closures scoped to that exact instance. `stop()` sets uvicorn's own
+    cooperative `should_exit` flag — see this module's docstring for why
+    that, not `Task.cancel()`, is what lets `Server.serve()` run its own
+    graceful shutdown path (closing sockets, then the FastAPI lifespan's
     shutdown).
+
+    `shutdown_requested()` reports that same flag. `stop()` is not the only
+    thing that sets it: `Server.serve()`'s own `capture_signals()` installs
+    a SIGINT/SIGTERM handler that sets it too, so a real operator Ctrl+C is
+    consumed by uvicorn (never by this module's own supervisor) — see this
+    module's "Clean-shutdown corrective pass" docstring section. Reading
+    `should_exit` after `serve()` has returned is what lets the supervisor
+    tell "uvicorn exited because a shutdown was requested" apart from
+    "uvicorn exited on its own"; it is never set by a lifespan/bind failure
+    (those raise SystemExit) or by `limit_max_requests`.
 
     `config.load()` is called explicitly, BEFORE `config.lifespan_class`
     is overridden to `_TrackedLifespanOn` and BEFORE `uvicorn.Server(...)`
@@ -625,7 +677,10 @@ def _build_uvicorn_adapter() -> Tuple[_AsyncCallable, _SyncCallable]:
     def stop() -> None:
         server.should_exit = True
 
-    return run, stop
+    def shutdown_requested() -> bool:
+        return server.should_exit
+
+    return run, stop, shutdown_requested
 
 
 class _ProtectedOutcome:
@@ -911,17 +966,26 @@ async def run_unified_service(
     Raises whatever exception caused termination (never converts an
     unexpected exit into a successful return), or
     UnifiedServiceAdapterExited if an adapter simply returned without
-    being asked to. Propagates asyncio.CancelledError unchanged on
-    external cancellation, after gracefully stopping both adapters first.
+    being asked to (the Uvicorn adapter counts as asked once its own
+    operator-signal handler requested shutdown, not only via `stop_uvicorn`
+    — see this module's "Clean-shutdown corrective pass" docstring
+    section). Propagates asyncio.CancelledError unchanged on external
+    cancellation, after gracefully stopping both adapters first.
     """
     if run_telegram is None:
         run_telegram = _default_run_telegram
     if stop_telegram is None:
         stop_telegram = _default_stop_telegram
+    # An injected `run_uvicorn` never signals an operator shutdown on its
+    # own — only the default adapter's real uvicorn.Server can (see
+    # _build_uvicorn_adapter()'s docstring), so its predicate is adopted
+    # only together with that server's own `run`.
+    uvicorn_shutdown_requested: _PredicateCallable = lambda: False
     if run_uvicorn is None or stop_uvicorn is None:
-        default_run, default_stop = _build_uvicorn_adapter()
+        default_run, default_stop, default_shutdown_requested = _build_uvicorn_adapter()
         if run_uvicorn is None:
             run_uvicorn = default_run
+            uvicorn_shutdown_requested = default_shutdown_requested
         if stop_uvicorn is None:
             stop_uvicorn = default_stop
     if close_resources is None:
@@ -946,7 +1010,10 @@ async def run_unified_service(
         _supervised_adapter(run_telegram, "telegram", lambda: stopped["telegram"]), name="unified-telegram"
     )
     uvicorn_task = asyncio.create_task(
-        _supervised_adapter(run_uvicorn, "uvicorn", lambda: stopped["uvicorn"]), name="unified-uvicorn"
+        _supervised_adapter(
+            run_uvicorn, "uvicorn", lambda: stopped["uvicorn"] or uvicorn_shutdown_requested()
+        ),
+        name="unified-uvicorn",
     )
     adapters = [
         _Adapter(label="telegram", task=telegram_task, stop=_stop_telegram),
@@ -956,21 +1023,41 @@ async def run_unified_service(
     await _supervise(adapters, shutdown_grace_seconds, close_resources)
 
 
-if __name__ == "__main__":
-    # Real application startup/composition root — same "exactly once,
-    # never from a reusable library module" rule utils/logging.py
-    # documents for main.py's own call.
-    configure_logging()
+def _main(run_service: Optional[_AsyncCallable] = None) -> int:
+    """
+    The process's top-level exception-to-exit-code mapping — the former
+    `__main__` block, extracted unchanged so it is directly testable.
+    Returns the process exit code instead of calling `sys.exit()` itself.
+
+    - Normal return, or `KeyboardInterrupt` (what `asyncio.run()` turns a
+      cancelled main task into after an operator Ctrl+C — see this module's
+      "Clean-shutdown corrective pass" docstring section) -> 0.
+    - Any other `Exception` (including `UnifiedServiceAdapterExited`/
+      `UnifiedServiceAdapterCancelled`) -> 1.
+    - `SystemExit` is not caught here and propagates with its own code.
+    """
+    if run_service is None:
+        run_service = run_unified_service
     try:
         logger.info("=" * 60)
         logger.info("Personal Python Tutor Bot - Unified Service Starting")
         logger.info("=" * 60)
-        asyncio.run(run_unified_service())
+        asyncio.run(run_service())
     except KeyboardInterrupt:
         logger.info("Unified service stopped by user (Ctrl+C)")
+        return 0
     except Exception as e:
         # Mirrors main.py's own top-level handler: an exception here can
         # originate from a live Telegram/provider call somewhere in either
         # adapter — never log raw exception text or a traceback.
         logger.error("Unified service: fatal error | error_type=%s", type(e).__name__)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    # Real application startup/composition root — same "exactly once,
+    # never from a reusable library module" rule utils/logging.py
+    # documents for main.py's own call.
+    configure_logging()
+    sys.exit(_main())
