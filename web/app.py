@@ -73,17 +73,33 @@ value to another origin or otherwise let an attacker origin construct a
 valid authenticated state-changing request; whoever adds CORS here must
 preserve that invariant explicitly, not merely default `allow_credentials`
 to true alongside a wide `allow_origins`.
+
+Stage 7A-2: web.body_limit.RequestBodyLimitMiddleware caps the ACTUAL
+request body of the small mutating JSON routes (POST /api/chat, PATCH
+/api/settings — and only those) at web_config.MAX_JSON_BODY_BYTES, before
+FastAPI parses anything. FastAPI's default RequestValidationError response
+(which can echo submitted input back) is replaced by a sanitized, fixed
+422 {"detail": "Invalid request"}; only the error count is logged, never
+the Pydantic error payload.
 """
 
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 import web_config
+from web.body_limit import RequestBodyLimitMiddleware
 from web.github_oauth import router as github_oauth_router
-from web.routes import router
+from web.routes import INVALID_REQUEST_DETAIL, router
+
+logger = logging.getLogger(__name__)
+
+# Stage 7A-2: the only routes web_config.MAX_JSON_BODY_BYTES applies to.
+JSON_BODY_LIMITED_ROUTES = frozenset({("POST", "/api/chat"), ("PATCH", "/api/settings")})
 
 
 @asynccontextmanager
@@ -129,9 +145,27 @@ def _disable_uvicorn_access_logging() -> None:
     access_logger.propagate = False
 
 
+async def _sanitized_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Never log or return exc.errors()/exc.body — both can carry submitted
+    # input. The error count is safe metadata.
+    logger.info(
+        "request validation failed | method=%s, path=%s, error_count=%s",
+        request.method, request.url.path, len(exc.errors()),
+    )
+    return JSONResponse(
+        {"detail": INVALID_REQUEST_DETAIL}, status_code=422, headers={"Cache-Control": "no-store"}
+    )
+
+
 def create_app() -> FastAPI:
     _disable_uvicorn_access_logging()
     app = FastAPI(title="Python Tutor Bot — Web API", lifespan=_lifespan)
+    app.add_exception_handler(RequestValidationError, _sanitized_validation_error_handler)
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=web_config.MAX_JSON_BODY_BYTES,
+        limited_routes=JSON_BODY_LIMITED_ROUTES,
+    )
     app.include_router(router)
     app.include_router(github_oauth_router)
     return app

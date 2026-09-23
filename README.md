@@ -276,6 +276,33 @@ cron/воркера и даже при нескольких процессах w
   logout: `POST /api/link/telegram/start` в этом случае просто отвечает
   общим HTTP 503.
 
+### Web-чат и настройки (Stage 7A-2)
+
+Все эндпоинты требуют валидную серверную сессию (иначе HTTP 401);
+изменяющие запросы (`POST`/`PATCH`) дополнительно требуют CSRF-заголовок
+`X-CSRF-Token` (иначе HTTP 403). Идентификатор пользователя никогда не
+принимается от клиента — только из сессии.
+
+- `POST /api/chat` — тело `{"message": "...", "history": [{"role":
+  "user"|"assistant", "content": "..."}]}`, ответ `{"text": "..."}`
+  (`Cache-Control: no-store`). Web-чат в этой стадии **только текстовый**:
+  режим фиксируется на сервере (`text`), клиент не может его передать;
+  RAG/поиск по документам для web отложены до Stage 7A-3. История диалога
+  **не сохраняется** на сервере — клиент сам присылает свою ограниченную
+  историю (лимиты те же, что в прикладном ядре: сообщение ≤ 4000 символов,
+  история ≤ 20 сообщений и ≤ 20 000 символов суммарно). Ответы об ошибках —
+  фиксированные: 422 (некорректный запрос), 429 (генерация уже идёт —
+  не более одной на пользователя и четырёх на процесс), 504 (таймаут),
+  502 (сбой генерации).
+- `GET /api/settings` → `{"mode": "..."}` — эффективный режим (без
+  сохранённого значения — `text`); чтение ничего не записывает.
+- `PATCH /api/settings` — тело `{"mode": "text"|"voice"|"vision"|"rag"}`;
+  сохраняет тот же durable-режим, что и Telegram `/mode`.
+- Тела `POST /api/chat` и `PATCH /api/settings` ограничены 64 KiB
+  фактически полученных байт (HTTP 413) — ограничение применяется только к
+  этим двум маршрутам. Любой невалидный запрос получает обезличенный ответ
+  422 `{"detail": "Invalid request"}` без эха введённых данных.
+
 ## Режимы
 
 | Команда        | Описание |
@@ -360,8 +387,8 @@ cron/воркера и даже при нескольких процессах w
 - `config.py` — настройки, пути, режимы (без Telegram-credential — см. `telegram_config.py`)
 - `telegram_config.py` — валидация `TELEGRAM_BOT_TOKEN`, импортируется только Telegram-адаптером (`bot.py`)
 - `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры; резолвят внутренний UUID сразу после проверки доступа)
-- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
-- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв, включая GitHub-race-safe выпуск — Stage 6A/6C), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B), telegram_link (генерация/хеширование bearer-секрета связывания, старт/redemption/отвязка — Stage 6C; сырой секрет никогда не покидает этот модуль и `web/routes.py`/`handlers/start.py`)
+- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) + `POST /api/chat`/`GET`/`PATCH /api/settings` и body_limit (64 KiB-лимит тела этих запросов, Stage 7A-2) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
+- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв, включая GitHub-race-safe выпуск — Stage 6A/6C), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B), text_chat (stateless текстовое ядро, Stage 7A-1), preferences (чтение/запись durable-режима для web без `user_sessions`, Stage 7A-2), telegram_link (генерация/хеширование bearer-секрета связывания, старт/redemption/отвязка — Stage 6C; сырой секрет никогда не покидает этот модуль и `web/routes.py`/`handlers/start.py`)
 - `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID, проверка наличия Telegram-привязки), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, включая race-safe GitHub-выпуск сессии — Stage 6A/6C), github_identity (race-safe резолв/создание пользователя по GitHub id, Stage 6B), oauth_transactions (короткоживущая одноразовая OAuth-транзакция + database-authoritative admission control/rate limit, Stage 6B), telegram_link (создание/redemption/отвязка попытки связывания под скорректированным порядком блокировок — Stage 6C)
 - `github_oauth_config.py` — настройки только для GitHub-логина (`GITHUB_CLIENT_ID`/`SECRET`/`REDIRECT_URI` и др., Stage 6B), не требуется для Telegram-бота
 - `telegram_link_config.py` — настройки только для связывания Telegram/GitHub (`TELEGRAM_BOT_USERNAME` и др., Stage 6C); никогда не импортирует `TELEGRAM_BOT_TOKEN`; отсутствие/некорректность значения не ломает запуск web-адаптера

@@ -135,6 +135,14 @@ if WEB_ENV == "production" and not COOKIE_SECURE:
     )
 
 
+# Stage 7A-2: maximum ACTUAL request-body size, in bytes, for the small
+# mutating JSON endpoints (POST /api/chat, PATCH /api/settings) — enforced
+# per route by web/body_limit.py, never globally (future document uploads
+# have their own, larger limit). Not an environment variable: a fixed
+# hardening bound, not a deployment knob.
+MAX_JSON_BODY_BYTES = 64 * 1024
+
+
 def session_cookie_name(secure: bool | None = None) -> str:
     """`__Host-` prefix requires Secure + Path=/ + no Domain attribute
     (browsers enforce this; see web/cookies.py) — only usable when
