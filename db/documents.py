@@ -18,7 +18,8 @@ being called fresh at each use site rather than passed around.
 
 import uuid
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from datetime import datetime
+from typing import Dict, List, Optional, Sequence
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
@@ -60,6 +61,7 @@ class DocumentRecord:
     display_name: str
     content_sha256: str
     status: str
+    created_at: datetime
 
 
 def _record_from_row(row: Optional[Document]) -> Optional[DocumentRecord]:
@@ -72,6 +74,7 @@ def _record_from_row(row: Optional[Document]) -> Optional[DocumentRecord]:
         display_name=row.display_name,
         content_sha256=row.content_sha256,
         status=row.status,
+        created_at=row.created_at,
     )
 
 
@@ -258,7 +261,91 @@ def delete_sync(*, document_id: uuid.UUID) -> None:
     never created (same "safe to call unconditionally" contract as
     utils.helpers.cleanup_file()). Used by app/documents.py's
     _cleanup_new_upload() alongside its existing Qdrant/physical-file/
-    sidecar cleanup."""
+    sidecar cleanup, and (Stage 7A-3) as the final step of authenticated
+    document deletion — idempotent either way, so a retry after a partial
+    failure, or a concurrent request that already removed the row, is
+    never itself an error."""
     with Session(get_sync_engine()) as session:
         session.execute(delete(Document).where(Document.id == document_id))
         session.commit()
+
+
+def list_active_by_owner_sync(*, owner_user_id: uuid.UUID, limit: int, offset: int) -> List[DocumentRecord]:
+    """Page through `owner_user_id`'s own ACTIVE documents only (Stage
+    7A-3) — 'pending'/'deleting' rows are never catalog-listable. Stable
+    ordering (created_at DESC, id DESC as a deterministic tie-breaker for
+    same-instant rows) so pagination never skips/repeats a row across
+    calls."""
+    with Session(get_sync_engine()) as session:
+        rows = session.execute(
+            select(Document)
+            .where(Document.owner_user_id == owner_user_id, Document.status == "active")
+            .order_by(Document.created_at.desc(), Document.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).scalars().all()
+    return [_record_from_row(row) for row in rows]
+
+
+def begin_or_resume_delete_sync(*, document_id: uuid.UUID, owner_user_id: uuid.UUID) -> Optional[str]:
+    """
+    Race-safe entry point into document deletion (Stage 7A-3) — ownership/
+    status authorization, the 'active' -> 'deleting' mutation, AND capture
+    of the `stored_name` the caller's cleanup needs are ONE atomic
+    `UPDATE ... RETURNING` statement, never a separate SELECT-then-UPDATE
+    and never an UPDATE followed by any later authorization read, for the
+    identical reason reconcile_ambiguous_create_pending_sync() above gives:
+    a plain SELECT takes no row lock, so a concurrent transaction could
+    change (or fully delete) the row between a Python-level check and a
+    later read/write.
+
+    Stage 7A-3 corrective pass: an independent audit reproduced the exact
+    gap the previous shape had — `UPDATE ... WHERE status='active'` (zero
+    rows, because a concurrent request A had already flipped this row to
+    'deleting') -> A finishes its cleanup and removes the catalog row ->
+    this call's follow-up SELECT (which was the only thing that could
+    recognize an own 'deleting' row) finds nothing -> spurious 404 for a
+    caller that reached the row while it still existed as own 'deleting'.
+    The WHERE clause below authorizes BOTH own states — 'active' (this
+    call becomes the one to flip it) and 'deleting' (a previous/concurrent
+    delete of the SAME owner's row; the SET is then an idempotent no-op on
+    `status`) — so there is no zero-rows-then-look-again step left to have
+    a window in at all. The row's own `stored_name`, captured by the same
+    statement's RETURNING, is what the caller uses for cleanup: no later
+    read of the catalog row is ever needed to recover it (which would
+    recreate the same disappearance window).
+
+    Returns:
+      - the row's `stored_name` (a str) if, at the instant this single
+        statement ran, a row with this exact id, owned by `owner_user_id`,
+        existed in status 'active' or 'deleting' — the caller is now an
+        authorized party proceeding with (or resuming) idempotent cleanup.
+        Callers do not need to distinguish "started" from "resumed".
+      - None otherwise — covers a nonexistent id (including one whose
+        deletion had already completed before this statement began), a
+        foreign owner, and an owned 'pending' row alike. These cases are
+        DELIBERATELY indistinguishable to the caller (and therefore to the
+        HTTP layer, which maps None to a single generic 404): a foreign
+        document's mere existence must never be disclosed by a different
+        response for "belongs to someone else" versus "does not exist".
+
+    Concurrency note (PostgreSQL READ COMMITTED): if a concurrent request's
+    own final catalog DELETE is still in flight when this statement reaches
+    the row, this statement waits for that DELETE and then re-evaluates
+    against the now-removed row (returning None). That is a correct
+    linearization — this request's authorization statement is ordered after
+    the row's complete removal — not a lost authorization.
+    """
+    with Session(get_sync_engine()) as session:
+        row = session.execute(
+            update(Document)
+            .where(
+                Document.id == document_id,
+                Document.owner_user_id == owner_user_id,
+                Document.status.in_(("active", "deleting")),
+            )
+            .values(status="deleting")
+            .returning(Document.stored_name)
+        ).first()
+        session.commit()
+        return row.stored_name if row is not None else None

@@ -418,6 +418,24 @@ def _validated_similarity_search(
     return validated
 
 
+def search_documents(query: str, requesting_user_uuid: str, k: int) -> List[Tuple["object", float]]:
+    """
+    Public, generation-free wrapper around _validated_similarity_search()
+    (Stage 7A-3) — for a caller (the authenticated retrieval API) that
+    wants only raw, fully validated similarity results, never an LLM
+    answer. Deliberately does not go through query_knowledge_base(): that
+    function always calls a text-generation provider (primary answer, or a
+    _fallback_response() attempt when retrieval is empty/fails), which a
+    pure retrieval endpoint must never trigger. Same security/isolation
+    guarantees as query_knowledge_base() itself — this changes none of
+    them, it only skips everything after retrieval. Sync (like
+    _validated_similarity_search() itself); callers on the event loop must
+    offload it via utils.helpers.submit_worker()/await_worker(), exactly as
+    query_knowledge_base() does below.
+    """
+    return _validated_similarity_search(query, requesting_user_uuid, k)
+
+
 async def query_knowledge_base(
     query: str,
     requesting_user_uuid: str,

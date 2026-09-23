@@ -108,14 +108,32 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 import web_config
+from config import MAX_DOCUMENT_SIZE_BYTES
 from web.body_limit import RequestBodyLimitMiddleware
 from web.github_oauth import router as github_oauth_router
 from web.routes import INVALID_REQUEST_DETAIL, router
 
 logger = logging.getLogger(__name__)
 
-# Stage 7A-2: the only routes web_config.MAX_JSON_BODY_BYTES applies to.
-JSON_BODY_LIMITED_ROUTES = frozenset({("POST", "/api/chat"), ("PATCH", "/api/settings")})
+# Stage 7A-2/7A-3: the only routes web_config.MAX_JSON_BODY_BYTES applies
+# to — small JSON bodies only. POST /api/documents (a file upload) is
+# deliberately never in this set; it has its own, much larger limit below.
+JSON_BODY_LIMITED_ROUTES = frozenset(
+    {("POST", "/api/chat"), ("PATCH", "/api/settings"), ("POST", "/api/retrieval/search")}
+)
+
+# Stage 7A-3: a coarse multipart-envelope bound for the one document-upload
+# route, applied by a SECOND, independent instance of the same middleware
+# class (never a new buffering framework) — the semantic file-size limit
+# (MAX_DOCUMENT_SIZE_BYTES exactly) is enforced precisely, after multipart
+# parsing, by app.documents.ingest_document() itself; this is only a coarse
+# bound on the whole request body (file + multipart boundary/headers/the
+# bounded display filename), so a client can never force unbounded
+# buffering merely by omitting or lying about Content-Length. 16 KiB is
+# ample bounded overhead: only one upload field is supported, and the
+# filename is itself capped at 255 Unicode code points.
+DOCUMENT_BODY_LIMITED_ROUTES = frozenset({("POST", "/api/documents")})
+DOCUMENT_BODY_MAX_BYTES = MAX_DOCUMENT_SIZE_BYTES + 16 * 1024
 
 
 @asynccontextmanager
@@ -196,6 +214,11 @@ def create_app(*, owns_db_lifecycle: bool = True) -> FastAPI:
         RequestBodyLimitMiddleware,
         max_body_bytes=web_config.MAX_JSON_BODY_BYTES,
         limited_routes=JSON_BODY_LIMITED_ROUTES,
+    )
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=DOCUMENT_BODY_MAX_BYTES,
+        limited_routes=DOCUMENT_BODY_LIMITED_ROUTES,
     )
     app.include_router(router)
     app.include_router(github_oauth_router)

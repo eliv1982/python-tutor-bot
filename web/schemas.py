@@ -11,7 +11,7 @@ limits and the mode allowlist stay in the application layer
 
 import uuid
 from datetime import datetime
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -84,3 +84,49 @@ class SettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     mode: str
+
+
+class DocumentSummaryResponse(BaseModel):
+    """Stage 7A-3 — the only fields ever exposed for a document: never
+    `stored_name`, `content_sha256`, or `status` (see
+    app.documents.DocumentSummary)."""
+
+    id: uuid.UUID
+    display_name: str
+    created_at: datetime
+
+
+class DocumentListResponse(BaseModel):
+    """Stage 7A-3 — catalog only. Deliberately no `total`/`has_more`/
+    `cursor`."""
+
+    items: List[DocumentSummaryResponse]
+
+
+class RetrievalRequest(BaseModel):
+    """Stage 7A-3 — `top_k`'s allowed range (1-10) is application-layer
+    validation (app/retrieval.py), not a schema constraint, matching this
+    module's existing convention of keeping business-rule bounds out of
+    Pydantic."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    query: str
+    top_k: int = 3
+
+
+class RetrievalResultItem(BaseModel):
+    """Stage 7A-3 — `document_id` is a plain string, not a UUID: a
+    reference-corpus hit's id is not one (see rag.identity.
+    reference_document_id()). Never exposes score/scope/owner/stored_name/
+    a raw Qdrant point id (see app/retrieval.py's RetrievalHit)."""
+
+    document_id: str
+    source: str
+    chunk_index: int
+    page: Optional[int] = None
+    content: str
+
+
+class RetrievalResponse(BaseModel):
+    results: List[RetrievalResultItem]

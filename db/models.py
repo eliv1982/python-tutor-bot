@@ -82,17 +82,24 @@ class Document(Base):
     no separate id-mapping table needed.
 
     `status`: 'pending' (physical file + sidecar durable, indexing not yet
-    confirmed) -> 'active' (indexing confirmed). A row stuck at 'pending'
-    indicates an interrupted ingest (e.g. a process crash) — the same
-    category of orphan a crash can already leave in the physical
-    file/sidecar/Qdrant layers today, with no automatic recovery daemon
-    (documented as a known follow-up, not implemented here). This table is
-    NOT the document content store — the physical file + sidecar remain
-    the durable content source (see rag/sidecar.py); this is ownership/
-    catalog metadata only."""
+    confirmed) -> 'active' (indexing confirmed) -> 'deleting' (Stage 7A-3:
+    an authenticated owner-initiated delete has begun; physical/index/
+    catalog cleanup may still be in flight or may have failed partway and
+    be awaiting a retry). A row stuck at 'pending' indicates an interrupted
+    ingest (e.g. a process crash) — the same category of orphan a crash can
+    already leave in the physical file/sidecar/Qdrant layers today, with no
+    automatic recovery daemon (documented as a known follow-up, not
+    implemented here); a row stuck at 'deleting' is the identical category
+    of orphan for an interrupted delete. This table is NOT the document
+    content store — the physical file + sidecar remain the durable content
+    source (see rag/sidecar.py); this is ownership/catalog metadata only.
+
+    `ACTIVE_STATUSES` (db/documents.py) is exactly `{'active'}` — both
+    'pending' and 'deleting' are therefore never retrieval/list/detail
+    visible, with no separate visibility flag needed."""
 
     __tablename__ = "documents"
-    __table_args__ = (CheckConstraint("status IN ('pending', 'active')", name="status_valid"),)
+    __table_args__ = (CheckConstraint("status IN ('pending', 'active', 'deleting')", name="status_valid"),)
 
     id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     owner_user_id: Mapped[uuid.UUID] = mapped_column(

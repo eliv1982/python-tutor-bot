@@ -12,31 +12,50 @@ state-changing (or generation-triggering) authenticated routes and all
 require both a valid session AND a valid CSRF proof.
 
 Stage 7A-2: POST /api/chat calls app/text_chat.py's run_text_chat() directly
-with a server-fixed mode=BotMode.TEXT (web retrieval/RAG is deferred), with
-an explicit client-supplied history — never app.session.user_sessions,
-never a Telegram handler. Application exceptions are mapped to fixed public
-details only; an unexpected exception is left to propagate as a 500.
+with a server-fixed mode=BotMode.TEXT, with an explicit client-supplied
+history — never app.session.user_sessions, never a Telegram handler.
+Application exceptions are mapped to fixed public details only; an
+unexpected exception is left to propagate as a 500.
+
+Stage 7A-3: the web-deferred RAG/document surface above has arrived —
+POST/GET/DELETE /api/documents(/{id}) and POST /api/retrieval/search
+delegate to app/documents.py and app/retrieval.py, which themselves reach
+rag/index.py + rag/query.py (Qdrant) and db/documents.py (the PostgreSQL
+catalog). Importing this module therefore now transitively imports the
+whole RAG/Qdrant stack (even for a request that only hits /api/chat) —
+still never anything Telegram-specific (app.session, app.tutor, handlers,
+telebot, telegram_config), which remains a hard boundary.
 """
 
 import uuid
+from pathlib import Path
+from typing import Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 
 import app.auth_session as auth_session
+import app.documents as app_documents
 import app.identity as identity
 import app.preferences as preferences
+import app.retrieval as retrieval
 import app.telegram_link as telegram_link
 import app.text_chat as text_chat
 import telegram_link_config
 from config import BotMode
+from rag.loader import SUPPORTED_EXTENSIONS
 from web.cookies import clear_session_cookie
 from web.dependencies import get_current_user_id, get_session_token, require_csrf
 from web.schemas import (
     ChatRequest,
     ChatResponse,
     CurrentUserResponse,
+    DocumentListResponse,
+    DocumentSummaryResponse,
     HealthResponse,
     LinkTelegramStartResponse,
+    RetrievalRequest,
+    RetrievalResponse,
+    RetrievalResultItem,
     SettingsResponse,
     SettingsUpdateRequest,
     UnlinkGithubResponse,
@@ -60,6 +79,55 @@ INVALID_REQUEST_DETAIL = "Invalid request"
 _GENERATION_BUSY_DETAIL = "Generation is busy, try again shortly"
 _GENERATION_TIMEOUT_DETAIL = "Generation timed out"
 _GENERATION_FAILED_DETAIL = "Generation failed"
+
+# Stage 7A-3: fixed public details for documents/retrieval — same posture,
+# never exception text/attributes.
+_DOCUMENT_NOT_FOUND_DETAIL = "Document not found"
+_UNSUPPORTED_FILE_TYPE_DETAIL = "Unsupported file type"
+_FILE_TOO_LARGE_DETAIL = "File too large"
+_DOCUMENT_PROCESSING_FAILED_DETAIL = "Document processing failed"
+_DOCUMENT_DELETION_FAILED_DETAIL = "Document deletion failed"
+_KNOWLEDGE_BASE_UNAVAILABLE_DETAIL = "Knowledge base unavailable"
+
+_MAX_DISPLAY_NAME_LENGTH = 255
+_DEFAULT_LIST_LIMIT = 20
+_MAX_LIST_LIMIT = 100
+
+
+class _InvalidUploadFilename(Exception):
+    """`UploadFile.filename` missing/empty, path-only, or over the display-
+    name length bound — maps to 422 INVALID_REQUEST_DETAIL."""
+
+
+class _UnsupportedUploadExtension(Exception):
+    """A syntactically valid filename whose extension isn't supported —
+    maps to 422 _UNSUPPORTED_FILE_TYPE_DETAIL (a distinct detail from the
+    one above, so the two 422s stay distinguishable to a client)."""
+
+
+def _parse_upload_filename(filename: Optional[str]) -> Tuple[str, str]:
+    """
+    Derive (display_name, extension) from a raw, client-supplied
+    `UploadFile.filename` (Stage 7A-3) — internal storage stays opaque
+    UUID-based regardless (see app.documents._store_document_exclusively());
+    this only decides the safe, user-facing display name and which
+    extension gate to apply. Both `/` and `\\` are treated as path
+    separators (Windows-authored filenames commonly arrive with the
+    latter) — only the final leaf component is ever used, never a client-
+    supplied directory. Unicode is preserved as-is: no case-folding or
+    normalization beyond the case-insensitive extension check below.
+    """
+    if not filename:
+        raise _InvalidUploadFilename()
+    leaf = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    if not leaf:
+        raise _InvalidUploadFilename()
+    if len(leaf) > _MAX_DISPLAY_NAME_LENGTH:
+        raise _InvalidUploadFilename()
+    extension = Path(leaf).suffix.lower()
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise _UnsupportedUploadExtension()
+    return leaf, extension
 
 
 @router.get("/healthz", response_model=HealthResponse)
@@ -218,3 +286,134 @@ async def update_settings(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=INVALID_REQUEST_DETAIL
         ) from None
     return SettingsResponse(mode=mode)
+
+
+def _to_document_summary_response(summary: "app_documents.DocumentSummary") -> DocumentSummaryResponse:
+    return DocumentSummaryResponse(id=summary.id, display_name=summary.display_name, created_at=summary.created_at)
+
+
+@router.post(
+    "/api/documents",
+    response_model=DocumentSummaryResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_csrf)],
+)
+async def upload_document(
+    file: UploadFile = File(...), user_id: uuid.UUID = Depends(get_current_user_id)
+) -> DocumentSummaryResponse:
+    """Stage 7A-3. Reuses app.documents.ingest_document() unchanged — this
+    is not a second upload transaction, only filename-policy parsing and
+    result-code mapping around the existing one. Success is only ever
+    reported once ingestion has reached 'active'."""
+    try:
+        display_name, extension = _parse_upload_filename(file.filename)
+    except _InvalidUploadFilename:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=INVALID_REQUEST_DETAIL) from None
+    except _UnsupportedUploadExtension:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_UNSUPPORTED_FILE_TYPE_DETAIL
+        ) from None
+
+    file_bytes = await file.read()
+    result = await app_documents.ingest_document(
+        file_bytes=file_bytes, extension=extension, display_name=display_name, owner_user_id=user_id
+    )
+    if not result.success:
+        if result.rejected_reason == "oversized":
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=_FILE_TOO_LARGE_DETAIL) from None
+        if result.rejected_reason == "unsupported_extension":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_UNSUPPORTED_FILE_TYPE_DETAIL
+            ) from None
+        if result.failure_reason == app_documents.INGEST_FAILURE_KNOWLEDGE_BASE_UNAVAILABLE:
+            # Genuine Qdrant/index availability failure only (see
+            # rag.index.is_index_unavailable_error()); every other
+            # storage/parse/embedding/catalog failure stays the generic 500
+            # below. Ingestion has already rolled back either way.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_KNOWLEDGE_BASE_UNAVAILABLE_DETAIL
+            ) from None
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=_DOCUMENT_PROCESSING_FAILED_DETAIL
+        ) from None
+
+    summary = await app_documents.get_document(user_id, result.stored.document_uuid)
+    if summary is None:
+        # Not expected to be reachable (ingestion just committed this exact
+        # row as 'active' under this exact owner) — fails closed rather
+        # than ever fabricating a response from unverified local state.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=_DOCUMENT_PROCESSING_FAILED_DETAIL
+        )
+    return _to_document_summary_response(summary)
+
+
+@router.get("/api/documents", response_model=DocumentListResponse)
+async def list_documents(
+    limit: int = Query(default=_DEFAULT_LIST_LIMIT, ge=1, le=_MAX_LIST_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    user_id: uuid.UUID = Depends(get_current_user_id),
+) -> DocumentListResponse:
+    """Stage 7A-3. Catalog only — never touches Qdrant/the filesystem.
+    Only this session's own ACTIVE documents are ever returned."""
+    summaries = await app_documents.list_documents(user_id, limit=limit, offset=offset)
+    return DocumentListResponse(items=[_to_document_summary_response(s) for s in summaries])
+
+
+@router.get("/api/documents/{document_id}", response_model=DocumentSummaryResponse)
+async def get_document(document_id: uuid.UUID, user_id: uuid.UUID = Depends(get_current_user_id)) -> DocumentSummaryResponse:
+    """Stage 7A-3. A missing id, a foreign owner, a 'pending' row, and a
+    'deleting' row all produce the identical public 404 — see
+    app.documents.get_document()'s own docstring."""
+    summary = await app_documents.get_document(user_id, document_id)
+    if summary is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_DOCUMENT_NOT_FOUND_DETAIL)
+    return _to_document_summary_response(summary)
+
+
+@router.delete("/api/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_csrf)])
+async def delete_document(document_id: uuid.UUID, user_id: uuid.UUID = Depends(get_current_user_id)) -> None:
+    """Stage 7A-3. See app.documents.delete_document()'s own docstring for
+    the full active -> deleting -> cleanup state machine and its concurrent-
+    delete convergence semantics."""
+    try:
+        found = await app_documents.delete_document(user_id, document_id)
+    except app_documents.KnowledgeBaseUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_KNOWLEDGE_BASE_UNAVAILABLE_DETAIL
+        ) from None
+    except app_documents.DocumentDeletionError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=_DOCUMENT_DELETION_FAILED_DETAIL
+        ) from None
+    if not found:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_DOCUMENT_NOT_FOUND_DETAIL)
+
+
+@router.post("/api/retrieval/search", response_model=RetrievalResponse, dependencies=[Depends(require_csrf)])
+async def search_retrieval(
+    body: RetrievalRequest, user_id: uuid.UUID = Depends(get_current_user_id)
+) -> RetrievalResponse:
+    """Stage 7A-3. Raw validated similarity search only — no text
+    generation is ever triggered from this route (see
+    rag.query.search_documents())."""
+    try:
+        hits = await retrieval.search(owner_user_id=user_id, query=body.query, top_k=body.top_k)
+    except retrieval.RetrievalValidationError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=INVALID_REQUEST_DETAIL) from None
+    except retrieval.RetrievalUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_KNOWLEDGE_BASE_UNAVAILABLE_DETAIL
+        ) from None
+    return RetrievalResponse(
+        results=[
+            RetrievalResultItem(
+                document_id=hit.document_id,
+                source=hit.source,
+                chunk_index=hit.chunk_index,
+                page=hit.page,
+                content=hit.content,
+            )
+            for hit in hits
+        ]
+    )

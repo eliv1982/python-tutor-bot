@@ -23,8 +23,9 @@ handlers/document_upload.py) for the specific threat/invariant it closes.
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 import db.documents as db_documents
 from config import MANAGED_UPLOADS_DIR, MAX_DOCUMENT_SIZE_BYTES
@@ -42,12 +43,13 @@ from rag.sidecar import (
     SidecarError,
     build_sidecar,
     parse_sidecar_bytes,
+    resolve_managed_upload_path,
     resolve_sidecar_path,
     secure_read_sidecar_bytes,
     sidecar_path_for,
     write_sidecar_atomic,
 )
-from rag.index import SourceMutatedError, get_vector_index
+from rag.index import SourceMutatedError, get_vector_index, is_index_unavailable_error
 from utils.logging import logger
 from utils.helpers import cleanup_file, submit_worker, await_worker
 
@@ -142,6 +144,12 @@ class DocumentIngestResult:
       before this extraction — cleanup_complete reports whether every
       cleanup component (Qdrant delete, physical file, sidecar) actually
       completed (see _cleanup_new_upload()).
+      failure_reason (Stage 7A-3 corrective pass) is
+      INGEST_FAILURE_KNOWLEDGE_BASE_UNAVAILABLE ONLY when the underlying
+      exception was a genuine Qdrant/index availability failure (see
+      rag.index.is_index_unavailable_error() for the exact, narrow
+      taxonomy) — None for every other storage/parse/embedding/catalog
+      failure, which an adapter must treat as a generic processing failure.
     """
     success: bool
     chunk_count: Optional[int] = None
@@ -150,6 +158,13 @@ class DocumentIngestResult:
     rejected_reason: Optional[str] = None
     error_type: Optional[str] = None
     cleanup_complete: Optional[bool] = None
+    failure_reason: Optional[str] = None
+
+
+# DocumentIngestResult.failure_reason value for a genuine Qdrant/index
+# availability failure during ingestion (Stage 7A-3 corrective pass) — a
+# fixed, safe structured code, never exception text.
+INGEST_FAILURE_KNOWLEDGE_BASE_UNAVAILABLE = "knowledge_base_unavailable"
 
 
 def _store_document_exclusively(
@@ -792,8 +807,17 @@ async def ingest_document(
                 cleanup_complete = partial_cleanup_complete
                 if not cleanup_complete:
                     logger.warning("Document upload: cleanup incomplete after partial storage failure | user_id=%s", owner_user_id)
+        # Stage 7A-3 corrective pass: classified from the ORIGINAL exception
+        # by TYPE only (never its text), after rollback has already run above
+        # — the compensating cleanup is identical for every failure kind.
+        failure_reason = (
+            INGEST_FAILURE_KNOWLEDGE_BASE_UNAVAILABLE if is_index_unavailable_error(e) else None
+        )
         return DocumentIngestResult(
-            success=False, error_type=type(e).__name__, cleanup_complete=cleanup_complete
+            success=False,
+            error_type=type(e).__name__,
+            cleanup_complete=cleanup_complete,
+            failure_reason=failure_reason,
         )
 
     # Ingestion has already committed (file + sidecar stored, chunks
@@ -802,3 +826,188 @@ async def ingest_document(
     return DocumentIngestResult(
         success=True, chunk_count=chunk_count, stored=stored, file_size_bytes=len(file_bytes)
     )
+
+
+# =============================================================================
+# Stage 7A-3: catalog-only list/detail, and owner-initiated delete.
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DocumentSummary:
+    """The only document fields ever exposed to an HTTP caller (Stage
+    7A-3) — never `stored_name`, `content_sha256`, or `status` (an active
+    document's status is implied by it being visible at all; see
+    db.documents.ACTIVE_STATUSES)."""
+    id: uuid.UUID
+    display_name: str
+    created_at: datetime
+
+
+class KnowledgeBaseUnavailableError(RuntimeError):
+    """Raised by delete_document() when the Qdrant deletion step itself
+    fails (Stage 7A-3) — the catalog row is left at 'deleting' (never
+    rolled back to 'active': the delete was genuinely authorized and must
+    still complete) for a caller to map to a fixed, safe 503 and retry."""
+
+
+class DocumentDeletionError(RuntimeError):
+    """Raised by delete_document() when physical/sidecar cleanup or the
+    final catalog-row removal fails (Stage 7A-3), after Qdrant cleanup has
+    already succeeded — the row is left at 'deleting' for a caller to map
+    to a fixed, safe 500 and retry. Every step this wraps is idempotent, so
+    a retry may safely re-run the whole sequence."""
+
+
+async def list_documents(owner_user_id: uuid.UUID, *, limit: int, offset: int) -> List[DocumentSummary]:
+    """Catalog-only, paginated list of `owner_user_id`'s own ACTIVE
+    documents (Stage 7A-3) — never touches Qdrant or the filesystem."""
+    records = await await_worker(
+        submit_worker(db_documents.list_active_by_owner_sync, owner_user_id=owner_user_id, limit=limit, offset=offset)
+    )
+    return [DocumentSummary(id=r.id, display_name=r.display_name, created_at=r.created_at) for r in records]
+
+
+async def get_document(owner_user_id: uuid.UUID, document_id: uuid.UUID) -> Optional[DocumentSummary]:
+    """Catalog-only single-document lookup (Stage 7A-3). Returns None —
+    never a distinguishable error — for a missing id, a foreign owner, a
+    'pending' row, or a 'deleting' row alike: only an ACTIVE document owned
+    by `owner_user_id` is ever returned, and every other case must produce
+    an identical public 404 from the caller."""
+    record = await await_worker(submit_worker(db_documents.get_sync, document_id=document_id))
+    if record is None or record.status not in db_documents.ACTIVE_STATUSES or record.owner_user_id != owner_user_id:
+        return None
+    return DocumentSummary(id=record.id, display_name=record.display_name, created_at=record.created_at)
+
+
+def _resolve_delete_targets(document_id: uuid.UUID, stored_name: str) -> Tuple[Path, Path]:
+    """
+    Validate a catalog row's `stored_name` as this document's own managed
+    upload identity and return (physical_path, sidecar_path) — the ONLY two
+    paths a delete may ever unlink (Stage 7A-3 corrective pass: an
+    independent audit found deletion concatenating `MANAGED_UPLOADS_DIR /
+    stored_name` directly, so a corrupted/hand-edited catalog value such as
+    `..\\..\\outside.pdf` could point cleanup outside managed storage).
+
+    `stored_name` is internal catalog data, never client input — but the
+    catalog is still only a database column, so it is treated exactly like
+    the sidecar-declared stored_name every other lifecycle path (rebuild,
+    migration) already re-validates: the existing authoritative resolver
+    rag.sidecar.resolve_managed_upload_path() enforces a bare basename (no
+    separator, absolute path, or `.`/`..` segment), a supported managed-
+    upload extension, and that the fully resolved path — following any
+    symlink — remains inside MANAGED_UPLOADS_DIR. On top of that, this
+    document's own identity is bound to the name: the resolved leaf must be
+    exactly the declared `stored_name` (a symlinked leaf resolving to some
+    OTHER in-directory file is rejected, never followed to and unlinked)
+    and its stem must be exactly `document_id.hex` (the storage UUID this
+    row's primary key and the RAG document_id are both derived from), so a
+    catalog value naming any other managed file — even one that is
+    perfectly contained — can never delete someone else's upload.
+
+    The sidecar path is derived only from the successfully validated
+    physical path via the one and only naming rule (rag.sidecar.
+    sidecar_path_for()) — never built from unvalidated catalog text.
+
+    Raises PathContainmentError (fixed, safe message; never the offending
+    value) on any violation; performs no unlink and no Qdrant/DB call.
+    """
+    physical_path = resolve_managed_upload_path(MANAGED_UPLOADS_DIR, stored_name)
+    if physical_path.name != stored_name or physical_path.stem != document_id.hex:
+        raise PathContainmentError("stored_name does not correspond to this document's managed upload")
+    return physical_path, sidecar_path_for(physical_path)
+
+
+def _perform_delete_cleanup_sync(document_id: uuid.UUID, stored_name: str) -> None:
+    """
+    Idempotent cleanup for a catalog row already durably transitioned to
+    'deleting' under the caller's ownership (Stage 7A-3) — mirrors
+    _cleanup_new_upload()'s own ordering and idempotency contract (every
+    step is safe to repeat: Qdrant delete_document() is itself a best-
+    effort points-by-filter delete, cleanup_file() no-ops if the file is
+    already gone, and db_documents.delete_sync() no-ops if the row is
+    already gone), so a retry after ANY partial failure below may safely
+    re-run the entire sequence rather than needing its own resume logic.
+
+    Order (Section 6 of the Stage 7A-3 spec): Qdrant points, then the
+    physical upload, then its sidecar, then the catalog row itself, last —
+    never derived from anything client-supplied (`stored_name` comes from
+    the catalog row, never a request body/path parameter), and validated
+    against managed-storage containment by _resolve_delete_targets() BEFORE
+    any side effect at all: a catalog storage identity that fails validation
+    performs no Qdrant call, no unlink, and no catalog delete — the row is
+    left at 'deleting' and DocumentDeletionError (fixed message, never the
+    offending value or reason) is raised, so a retry remains possible after
+    administrative/data correction.
+    """
+    try:
+        physical_path, sidecar_path = _resolve_delete_targets(document_id, stored_name)
+    except (ValueError, OSError) as e:
+        # PathContainmentError is a ValueError; a NUL byte in the value makes
+        # Path.resolve() raise a plain ValueError, an unresolvable one OSError.
+        logger.warning(
+            "Document delete: catalog storage identity failed validation | document_id=%s, error_type=%s",
+            document_id, type(e).__name__,
+        )
+        raise DocumentDeletionError("Document deletion failed") from e
+
+    rag_document_id = upload_document_id(document_id.hex)
+    try:
+        get_vector_index().delete_document(rag_document_id)
+    except Exception as e:
+        logger.warning("Document delete: Qdrant delete_document failed | error_type=%s", type(e).__name__)
+        raise KnowledgeBaseUnavailableError("Knowledge base unavailable") from e
+
+    physical_removed = cleanup_file(physical_path)
+    sidecar_removed = cleanup_file(sidecar_path)
+    if not (physical_removed and sidecar_removed):
+        logger.warning("Document delete: physical/sidecar cleanup incomplete | document_id=%s", document_id)
+        raise DocumentDeletionError("Document deletion failed")
+
+    try:
+        db_documents.delete_sync(document_id=document_id)
+    except Exception as e:
+        logger.warning("Document delete: catalog row delete failed | error_type=%s", type(e).__name__)
+        raise DocumentDeletionError("Document deletion failed") from e
+
+
+async def delete_document(owner_user_id: uuid.UUID, document_id: uuid.UUID) -> bool:
+    """
+    Owner-initiated document delete (Stage 7A-3): atomically establish or
+    resume authorized deletion, then run idempotent cleanup.
+
+    Returns False — never a distinguishable error — for a missing id, a
+    foreign owner, or an owned 'pending' row alike (see
+    db_documents.begin_or_resume_delete_sync()'s own docstring for why
+    these three must stay indistinguishable).
+
+    Authorization and the row's `stored_name` come from ONE atomic
+    `UPDATE ... RETURNING` (begin_or_resume_delete_sync()): it authorizes
+    both an own 'active' row (flipped to 'deleting' by that same statement)
+    and an own 'deleting' row (resumed), and hands back the `stored_name`
+    cleanup needs. There is deliberately NO later catalog read here — a
+    follow-up SELECT (to recover stored_name, or to recognize an own
+    'deleting' row) is exactly the disappearance window an audit found:
+    a concurrent request could complete the whole cleanup and remove the
+    row between the two, turning a request that WAS authorized into a
+    spurious 404. If this request's own authorization statement ran while
+    the row still existed, it is authorized to completion: the cleanup
+    steps are all idempotent, so a concurrent DELETE that finishes first
+    (including the final catalog-row removal, a zero-row DELETE here) just
+    means both requests converge to success (Section 8 of the Stage 7A-3
+    spec). A request whose authorization statement only runs after the row
+    is already fully gone gets None -> False -> 404.
+
+    Raises KnowledgeBaseUnavailableError / DocumentDeletionError for the
+    two genuine failure modes below — the row is left at 'deleting' either
+    way, so a caller mapping either to a 503/500 and retrying later will
+    resume cleanup from wherever it left off.
+    """
+    stored_name = await await_worker(
+        submit_worker(db_documents.begin_or_resume_delete_sync, document_id=document_id, owner_user_id=owner_user_id)
+    )
+    if stored_name is None:
+        return False
+
+    await await_worker(submit_worker(_perform_delete_cleanup_sync, document_id, stored_name))
+    return True

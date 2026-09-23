@@ -37,8 +37,16 @@ def test_limit_is_64_kib():
     assert LIMIT == 65536
 
 
-def test_limited_routes_are_exactly_the_stage_7a2_mutating_json_routes():
-    assert JSON_BODY_LIMITED_ROUTES == frozenset({("POST", "/api/chat"), ("PATCH", "/api/settings")})
+def test_limited_routes_are_exactly_the_small_json_routes():
+    """Stage 7A-3 added POST /api/retrieval/search to this same 64 KiB
+    cap (a small JSON query, not a file upload) — see
+    tests/test_stage7a3_retrieval_api.py for that route's own behavior;
+    POST /api/documents deliberately stays OUT of this set (it has its
+    own, much larger DOCUMENT_BODY_LIMITED_ROUTES cap instead — see
+    web/app.py)."""
+    assert JSON_BODY_LIMITED_ROUTES == frozenset(
+        {("POST", "/api/chat"), ("PATCH", "/api/settings"), ("POST", "/api/retrieval/search")}
+    )
 
 
 # ============================================================================
@@ -350,14 +358,19 @@ def test_other_existing_api_routes_are_not_capped():
 
 
 def test_a_future_non_target_api_route_is_not_capped():
-    """Stand-in for a future upload endpoint registered on the same app."""
+    """Stand-in for a future endpoint registered on the same app that is
+    scoped into NEITHER body-limit middleware instance. (Stage 7A-3 gave
+    POST /api/documents its own, much larger, dedicated limit — see
+    test_stage7a3_documents_api.py's own body-size tests for that route's
+    actual behavior — so this stand-in now uses a path neither middleware
+    instance has ever heard of.)"""
     app = create_app()
 
-    @app.post("/api/documents")
-    async def _upload(request: Request):
+    @app.post("/api/not-a-real-route")
+    async def _stand_in(request: Request):
         return {"size": len(await request.body())}
 
     size = LIMIT * 4
-    response = TestClient(app).post("/api/documents", content=b"x" * size)
+    response = TestClient(app).post("/api/not-a-real-route", content=b"x" * size)
     assert response.status_code == 200
     assert response.json() == {"size": size}

@@ -446,12 +446,16 @@ class TestRealSessionAuthentication:
 
 
 # ============================================================================
-# G. Structural boundary: the web text-chat path never loads RAG/Qdrant or
-#    Telegram modules.
+# G. Structural boundary: the web text-chat path never loads Telegram
+#    modules. (Stage 7A-3 gave the SAME FastAPI app real document/retrieval
+#    routes that legitimately need rag.query/rag.index/qdrant_client —
+#    building the app at all now transitively imports that stack, so
+#    those three are no longer part of this boundary; see web/routes.py's
+#    own module docstring.)
 # ============================================================================
 
 
-def test_web_chat_path_never_loads_rag_qdrant_or_telegram_modules():
+def test_web_chat_path_never_loads_telegram_modules():
     """Fresh subprocess (inherits this suite's dummy credentials): build the
     app, perform a real chat request against a fake provider, then inspect
     sys.modules."""
@@ -475,8 +479,7 @@ def test_web_chat_path_never_loads_rag_qdrant_or_telegram_modules():
             "client.cookies.set(web_config.session_cookie_name(), 'tok')",
             "r = client.post('/api/chat', json={'message': 'q'}, headers={CSRF_HEADER_NAME: derive_csrf_token('tok')})",
             "assert r.status_code == 200, r.status_code",
-            "forbidden = ('rag.query', 'rag.index', 'rag.loader', 'qdrant_client', 'app.session', 'app.tutor', "
-            "'handlers', 'telebot', 'telegram_config')",
+            "forbidden = ('app.session', 'app.tutor', 'handlers', 'telebot', 'telegram_config')",
             "loaded = [m for m in sys.modules if any(m == f or m.startswith(f + '.') for f in forbidden)]",
             "assert not loaded, loaded",
             "print('BOUNDARY_OK')",

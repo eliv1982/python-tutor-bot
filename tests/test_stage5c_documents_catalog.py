@@ -24,13 +24,14 @@ DeterministicFakeEmbeddings for the local Qdrant double (still real local-
 persistent Qdrant, never a real OpenAI/Qdrant network call).
 """
 
+import contextlib
 import json
 import threading
 import time
 import uuid
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -972,3 +973,284 @@ async def test_sidecar_rewritten_with_identical_content_still_succeeds(postgres_
     row = _catalog_row(result.stored.document_uuid)
     assert row is not None
     assert row.status == "active"
+
+
+# ---------------------------------------------------------------------------
+# H. Stage 7A-3: 'deleting' as a third legal status, list_active_by_owner_sync(),
+# and the atomic active -> deleting transition primitive.
+# ---------------------------------------------------------------------------
+
+def _make_active_document(owner_user_id: uuid.UUID, *, display_name: str = "notes.txt") -> uuid.UUID:
+    doc_id = uuid.uuid4()
+    db_documents.create_pending_sync(
+        document_id=doc_id, owner_user_id=owner_user_id,
+        stored_name=f"{doc_id.hex}.txt", display_name=display_name, content_sha256="d" * 64,
+    )
+    db_documents.mark_active_sync(document_id=doc_id)
+    return doc_id
+
+
+def test_deleting_is_now_a_legal_status(postgres_db, owner_uuid):
+    """Companion to test_status_check_constraint_rejects_an_invalid_status()
+    above (which proves 'deleted' is still rejected) — 'deleting' must now
+    be accepted by the live CHECK constraint."""
+    doc_id = _make_active_document(owner_uuid)
+    with Session(get_sync_engine()) as session:
+        session.execute(Document.__table__.update().where(Document.id == doc_id).values(status="deleting"))
+        session.commit()
+    assert _catalog_row(doc_id).status == "deleting"
+
+
+def test_pending_and_active_remain_legal_statuses(postgres_db, owner_uuid):
+    doc_id = uuid.uuid4()
+    db_documents.create_pending_sync(
+        document_id=doc_id, owner_user_id=owner_uuid,
+        stored_name=f"{doc_id.hex}.txt", display_name="notes.txt", content_sha256="f" * 64,
+    )
+    assert _catalog_row(doc_id).status == "pending"
+    db_documents.mark_active_sync(document_id=doc_id)
+    assert _catalog_row(doc_id).status == "active"
+
+
+def test_unknown_status_still_rejected_after_adding_deleting(postgres_db, owner_uuid):
+    doc_id = _make_active_document(owner_uuid)
+    with Session(get_sync_engine()) as session:
+        with pytest.raises(IntegrityError):
+            session.execute(Document.__table__.update().where(Document.id == doc_id).values(status="deleted"))
+
+
+def test_list_active_by_owner_sync_returns_only_active_rows_for_the_owner(postgres_db, owner_uuid):
+    other_owner = db_identity.resolve_or_create_user_by_telegram_id_sync(770000201)
+    active_id = _make_active_document(owner_uuid, display_name="active.txt")
+
+    pending_id = uuid.uuid4()
+    db_documents.create_pending_sync(
+        document_id=pending_id, owner_user_id=owner_uuid,
+        stored_name=f"{pending_id.hex}.txt", display_name="pending.txt", content_sha256="1" * 64,
+    )
+    deleting_id = _make_active_document(owner_uuid, display_name="deleting.txt")
+    with Session(get_sync_engine()) as session:
+        session.execute(Document.__table__.update().where(Document.id == deleting_id).values(status="deleting"))
+        session.commit()
+    _make_active_document(other_owner, display_name="someone-elses.txt")
+
+    results = db_documents.list_active_by_owner_sync(owner_user_id=owner_uuid, limit=20, offset=0)
+    assert [r.id for r in results] == [active_id]
+    assert results[0].display_name == "active.txt"
+    assert results[0].created_at == _catalog_row(active_id).created_at
+
+
+def test_list_active_by_owner_sync_orders_newest_first_with_deterministic_pagination(postgres_db, owner_uuid):
+    ids = [_make_active_document(owner_uuid, display_name=f"doc-{i}.txt") for i in range(5)]
+
+    # Force an identical created_at across every row (one UPDATE, one
+    # transaction -> one now()) so ordering is driven entirely by the
+    # documented deterministic tie-breaker (id DESC), never by incidental
+    # timing between the inserts above.
+    with Session(get_sync_engine()) as session:
+        session.execute(
+            Document.__table__.update().where(Document.owner_user_id == owner_uuid).values(created_at=text("now()"))
+        )
+        session.commit()
+
+    expected_order = sorted(ids, reverse=True)
+
+    page1 = db_documents.list_active_by_owner_sync(owner_user_id=owner_uuid, limit=2, offset=0)
+    page2 = db_documents.list_active_by_owner_sync(owner_user_id=owner_uuid, limit=2, offset=2)
+    page3 = db_documents.list_active_by_owner_sync(owner_user_id=owner_uuid, limit=2, offset=4)
+
+    assert [r.id for r in page1] == expected_order[0:2]
+    assert [r.id for r in page2] == expected_order[2:4]
+    assert [r.id for r in page3] == expected_order[4:5]
+
+
+def test_begin_or_resume_delete_sync_transitions_active_to_deleting_and_returns_stored_name(postgres_db, owner_uuid):
+    doc_id = _make_active_document(owner_uuid)
+    stored_name = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid)
+    assert stored_name == f"{doc_id.hex}.txt"  # the catalog row's own stored_name, from the same statement
+    assert _catalog_row(doc_id).status == "deleting"
+
+
+def test_begin_or_resume_delete_sync_resumes_an_existing_deleting_row(postgres_db, owner_uuid):
+    doc_id = _make_active_document(owner_uuid)
+    first = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid)
+    assert first == f"{doc_id.hex}.txt"
+
+    # Own 'deleting' row: still authorized, still returns stored_name — the
+    # caller never needs to distinguish "started" from "resumed".
+    second = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid)
+    assert second == first
+    assert _catalog_row(doc_id).status == "deleting"
+
+
+def test_begin_or_resume_delete_sync_foreign_owner_cannot_transition(postgres_db, owner_uuid):
+    other_owner = db_identity.resolve_or_create_user_by_telegram_id_sync(770000202)
+    doc_id = _make_active_document(owner_uuid)
+
+    result = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=other_owner)
+    assert result is None
+    assert _catalog_row(doc_id).status == "active"  # untouched
+
+
+def test_begin_or_resume_delete_sync_foreign_already_deleting_row_cannot_be_resumed(postgres_db, owner_uuid):
+    """A foreign owner must not be able to resume (or even observe) someone
+    else's in-flight deletion: None, and the row is not written at all
+    (updated_at unchanged)."""
+    other_owner = db_identity.resolve_or_create_user_by_telegram_id_sync(770000203)
+    doc_id = _make_active_document(owner_uuid)
+    assert db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid) is not None
+    before = _catalog_row(doc_id)
+
+    result = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=other_owner)
+
+    assert result is None
+    after = _catalog_row(doc_id)
+    assert after.status == "deleting"
+    assert after.updated_at == before.updated_at
+
+
+def test_begin_or_resume_delete_sync_pending_row_cannot_transition(postgres_db, owner_uuid):
+    doc_id = uuid.uuid4()
+    db_documents.create_pending_sync(
+        document_id=doc_id, owner_user_id=owner_uuid,
+        stored_name=f"{doc_id.hex}.txt", display_name="notes.txt", content_sha256="2" * 64,
+    )
+    result = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid)
+    assert result is None
+    assert _catalog_row(doc_id).status == "pending"
+
+
+def test_begin_or_resume_delete_sync_nonexistent_row_is_none(postgres_db, owner_uuid):
+    assert db_documents.begin_or_resume_delete_sync(document_id=uuid.uuid4(), owner_user_id=owner_uuid) is None
+
+
+def test_begin_or_resume_delete_sync_is_race_safe_against_concurrent_delete_attempts(postgres_db, owner_uuid):
+    """Real-thread proof: two concurrent delete attempts by the SAME owner
+    against the same active row are BOTH authorized (both receive the row's
+    stored_name — one flips active->deleting, the other resumes the
+    now-deleting row or blocks on the first's row lock and then sees it) —
+    never one authorized and one spuriously refused. The status ends
+    'deleting' either way."""
+    doc_id = _make_active_document(owner_uuid)
+    results = []
+    barrier = threading.Barrier(2)
+
+    def attempt():
+        barrier.wait(timeout=5)
+        results.append(db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid))
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert results == [f"{doc_id.hex}.txt", f"{doc_id.hex}.txt"]
+    assert _catalog_row(doc_id).status == "deleting"
+
+
+# ---------------------------------------------------------------------------
+# Stage 7A-3 corrective pass, Finding 1: the exact UPDATE-zero-rows ->
+# row-disappears -> follow-up-SELECT gap.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _row_vanishes_right_after_first_transaction_ends(document_id: uuid.UUID):
+    """Deterministically stands in for a concurrent request A finishing its
+    ENTIRE deletion (final catalog-row removal included) at the exact
+    instant the request under test's FIRST database transaction has ended
+    and before it does anything else — no threads, no sleeps.
+
+    Fires exactly once, on the first Session commit-or-rollback observed
+    after arming: SQLAlchemy Session `after_commit`/`after_rollback` events
+    run AFTER the real DBAPI commit/rollback (so the request under test no
+    longer holds any row lock and the removal below cannot deadlock against
+    it), and the removal itself uses a separate Core connection (never a
+    Session, so it cannot re-trigger these events)."""
+    engine = get_sync_engine()
+    fired: list = []
+
+    def remove_row(_session):
+        if fired:
+            return
+        fired.append(True)
+        with engine.begin() as conn:
+            conn.execute(Document.__table__.delete().where(Document.id == document_id))
+
+    event.listen(Session, "after_commit", remove_row)
+    event.listen(Session, "after_rollback", remove_row)
+    try:
+        yield fired
+    finally:
+        event.remove(Session, "after_commit", remove_row)
+        event.remove(Session, "after_rollback", remove_row)
+
+
+def _legacy_two_step_begin_or_resume_delete(document_id: uuid.UUID, owner_user_id: uuid.UUID) -> str:
+    """The PRE-corrective-pass implementation, reproduced (test-only
+    control): conditional UPDATE active->deleting, then — only when it
+    matched zero rows — a SEPARATE SELECT to recognize an own 'deleting'
+    row. Exists solely to prove the harness above actually reproduces the
+    audited gap (a harness that cannot fail the old design proves nothing
+    about the new one)."""
+    with Session(get_sync_engine()) as session:
+        result = session.execute(
+            Document.__table__.update()
+            .where(Document.id == document_id, Document.owner_user_id == owner_user_id, Document.status == "active")
+            .values(status="deleting")
+        )
+        if result.rowcount == 1:
+            session.commit()
+            return "started"
+        session.rollback()
+        row = session.execute(
+            select(Document.id).where(
+                Document.id == document_id, Document.owner_user_id == owner_user_id, Document.status == "deleting"
+            )
+        ).first()
+        return "resumed" if row is not None else "not_found"
+
+
+def test_harness_reproduces_the_audited_gap_against_the_legacy_two_step_shape(postgres_db, owner_uuid):
+    """CONTROL: against the old UPDATE-then-SELECT shape, an own 'deleting'
+    row that vanishes between the two statements is reported not_found (the
+    spurious 404 the audit reproduced). Proves the regression below is
+    sensitive to exactly this window."""
+    doc_id = _make_active_document(owner_uuid)
+    assert db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid) is not None  # request A
+
+    with _row_vanishes_right_after_first_transaction_ends(doc_id) as fired:
+        legacy_outcome = _legacy_two_step_begin_or_resume_delete(doc_id, owner_uuid)  # request B, old shape
+
+    assert fired
+    assert legacy_outcome == "not_found"  # the spurious-404 window, reproduced
+    assert _catalog_row(doc_id) is None
+
+
+def test_begin_or_resume_delete_sync_has_no_zero_rows_then_reselect_window(postgres_db, owner_uuid):
+    """Finding 1 regression: request B reaches an own 'deleting' row (A already
+    flipped it); A then completes the ENTIRE deletion, removing the catalog
+    row, immediately after B's first transaction ends. B's authorization
+    was established by that ONE atomic statement while the row existed, so B
+    still holds stored_name — there is no follow-up authorization SELECT
+    left to come back empty."""
+    doc_id = _make_active_document(owner_uuid)
+    assert db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid) is not None  # request A
+
+    with _row_vanishes_right_after_first_transaction_ends(doc_id) as fired:
+        result = db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid)  # request B
+
+    assert fired
+    assert result == f"{doc_id.hex}.txt"
+    assert _catalog_row(doc_id) is None
+
+
+def test_begin_or_resume_delete_sync_after_the_row_is_fully_gone_is_none(postgres_db, owner_uuid):
+    """The other side of the same contract: a request whose FIRST statement
+    only runs after the row is already fully removed is not authorized."""
+    doc_id = _make_active_document(owner_uuid)
+    assert db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid) is not None
+    db_documents.delete_sync(document_id=doc_id)
+
+    assert db_documents.begin_or_resume_delete_sync(document_id=doc_id, owner_user_id=owner_uuid) is None

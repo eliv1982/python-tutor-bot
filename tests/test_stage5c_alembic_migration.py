@@ -79,7 +79,15 @@ def _table_names(dsn: str) -> set:
 # A. Upgrade from an empty database
 # ---------------------------------------------------------------------------
 
-def test_migration_upgrades_cleanly_from_an_empty_database(postgres_container):
+def test_migration_upgrades_cleanly_from_an_empty_database(postgres_container, postgres_db):
+    """Takes `postgres_db` (in addition to `postgres_container`) purely for
+    its TRUNCATE-all-tables side effect: a 'deleting' row left behind by an
+    unrelated test earlier in this session would otherwise make the
+    downgrade below fail (revision 0004's narrower CHECK constraint
+    genuinely rejects it) — a real cross-test-isolation concern once any
+    status value exists that isn't legal at every revision, never merely a
+    quirk of this test itself. Both fixtures resolve to the identical
+    session-scoped DSN string."""
     cfg = _alembic_config(postgres_container)
 
     # Guarantee a genuinely empty starting point regardless of what any
@@ -97,7 +105,9 @@ def test_migration_upgrades_cleanly_from_an_empty_database(postgres_container):
 # B. Downgrade and re-upgrade
 # ---------------------------------------------------------------------------
 
-def test_migration_downgrade_then_reupgrade_reproduces_a_working_schema(postgres_container):
+def test_migration_downgrade_then_reupgrade_reproduces_a_working_schema(postgres_container, postgres_db):
+    """See test_migration_upgrades_cleanly_from_an_empty_database()'s own
+    comment on why `postgres_db` is taken here too."""
     cfg = _alembic_config(postgres_container)
     command.upgrade(cfg, "head")
     assert _EXPECTED_TABLES <= _table_names(postgres_container)
@@ -358,6 +368,59 @@ def test_alembic_downgrade_then_reupgrade_succeeds_with_encoded_dsn(special_char
 
     command.upgrade(cfg, "head")
     assert _EXPECTED_TABLES <= _table_names(dsn)
+
+
+# ---------------------------------------------------------------------------
+# F. Stage 7A-3: revision 0005 adds 'deleting' to documents.status's CHECK
+# constraint — proved as a genuine schema change, not merely "doesn't crash".
+# ---------------------------------------------------------------------------
+
+def test_migration_0005_adds_deleting_status_and_downgrade_removes_it(postgres_container, postgres_db):
+    from sqlalchemy.exc import IntegrityError
+
+    import db.engine as db_engine
+    import db.identity as db_identity
+    import db.documents as db_documents
+
+    engine = db_engine.get_sync_engine()
+
+    def _set_status(doc_id, status_value):
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE documents SET status = :status WHERE id = :id"),
+                {"status": status_value, "id": doc_id},
+            )
+
+    owner = db_identity.resolve_or_create_user_by_telegram_id_sync(770000301)
+    doc_id = uuid_module.uuid4()
+    db_documents.create_pending_sync(
+        document_id=doc_id, owner_user_id=owner,
+        stored_name=f"{doc_id.hex}.txt", display_name="notes.txt", content_sha256="9" * 64,
+    )
+    db_documents.mark_active_sync(document_id=doc_id)
+
+    # At head (0005 applied): 'deleting' is accepted.
+    _set_status(doc_id, "deleting")
+
+    # Reset back to a legal-under-both-revisions value BEFORE downgrading:
+    # PostgreSQL validates existing rows against a newly (re-)added CHECK
+    # constraint unless declared NOT VALID, so a row still holding
+    # 'deleting' would make the downgrade's own ADD CONSTRAINT fail — a
+    # real but different concern from what this test is proving.
+    _set_status(doc_id, "active")
+
+    cfg = _alembic_config(postgres_container)
+    command.downgrade(cfg, "0004")
+    try:
+        # The SAME value now rejected by the live (narrowed) constraint —
+        # proves downgrade() genuinely reverses the change, not merely that
+        # it runs without error.
+        with pytest.raises(IntegrityError):
+            _set_status(doc_id, "deleting")
+    finally:
+        # Restore head so the shared session-scoped container is left ready
+        # for whichever test runs next (mirrors this file's other tests).
+        command.upgrade(cfg, "head")
 
 
 def test_alembic_check_style_metadata_comparison_works_with_encoded_dsn(special_char_postgres_container):

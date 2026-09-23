@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -237,6 +238,13 @@ def _install_fake_documents_catalog(monkeypatch) -> None:
             "display_name": display_name,
             "content_sha256": content_sha256,
             "status": "pending",
+            # Stage 7A-3: db_documents.DocumentRecord now carries created_at
+            # (needed for the documents-list/detail API's DTO) — a plain
+            # datetime.now() is a faithful enough stand-in for this fake's
+            # purpose (nothing offline compares it against real elapsed
+            # time), never the real server_default=func.now() a genuine
+            # PostgreSQL row would carry.
+            "created_at": datetime.now(),
         }
 
     def fake_mark_active(*, document_id):
@@ -281,6 +289,7 @@ def _install_fake_documents_catalog(monkeypatch) -> None:
             display_name=row["display_name"],
             content_sha256=row["content_sha256"],
             status=row["status"],
+            created_at=row["created_at"],
         )
 
     def fake_get_active_owners(document_ids):

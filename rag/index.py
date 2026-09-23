@@ -15,10 +15,13 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import httpx
 import openai
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from qdrant_client import QdrantClient
+from qdrant_client.common.client_exceptions import ResourceExhaustedResponse
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.http.models import (
     Distance,
     FieldCondition,
@@ -93,6 +96,61 @@ class SourceMutatedError(RuntimeError):
     raised. Deliberately a fixed, safe message — never embeds the file
     path.
     """
+
+
+class VectorIndexUnavailableError(RuntimeError):
+    """
+    Raised (Stage 7A-3 corrective pass) when the Qdrant index itself cannot
+    be opened because its local storage is held by another client instance/
+    process (see VectorIndex._connect_and_ensure_collection()) — the one
+    genuine availability failure the embedded (`path=`) client raises as a
+    bare, otherwise-indistinguishable RuntimeError. Deliberately a fixed,
+    safe message; never embeds the storage path. Recognized, together with
+    the remote-client transport/service failures below, by
+    is_index_unavailable_error().
+    """
+
+
+def is_index_unavailable_error(exc: BaseException) -> bool:
+    """
+    True ONLY for a genuine Qdrant/index availability failure (Stage 7A-3
+    corrective pass) — so a caller (app/documents.py's ingest_document())
+    can tell "the knowledge base could not be reached" apart from every
+    other reason an indexing call can fail, without ever inspecting
+    exception text.
+
+    Classified as unavailable, and nothing else:
+      - VectorIndexUnavailableError (embedded storage held by another
+        client — see above);
+      - qdrant_client.http.exceptions.ResponseHandlingException whose
+        wrapped `.source` is an `httpx.TransportError` (connect/read/write
+        timeout, network, protocol failures — the remote client wraps every
+        transport error this way). A ResponseHandlingException wrapping
+        anything else (notably a pydantic ValidationError from a
+        successfully-received but malformed 200 response) is NOT
+        availability and is left unclassified;
+      - qdrant_client.common.client_exceptions.ResourceExhaustedResponse
+        (the server's own 429 + Retry-After backpressure signal);
+      - qdrant_client.http.exceptions.UnexpectedResponse with HTTP status
+        429 or >= 500 (server overloaded/erroring). A 4xx client error (bad
+        request, collection not found, ...) is a request/config problem,
+        not availability.
+
+    Deliberately NOT classified: parser/loader errors, OpenAI/embedding
+    provider errors (a different service entirely — not the index), local
+    file/storage errors, PostgreSQL catalog errors, SourceMutatedError,
+    ValueError/RuntimeError raised by application code, or any other
+    unrecognized exception. Classification is by exception TYPE only.
+    """
+    if isinstance(exc, VectorIndexUnavailableError):
+        return True
+    if isinstance(exc, ResponseHandlingException):
+        return isinstance(exc.source, httpx.TransportError)
+    if isinstance(exc, ResourceExhaustedResponse):
+        return True
+    if isinstance(exc, UnexpectedResponse):
+        return exc.status_code is not None and (exc.status_code == 429 or exc.status_code >= 500)
+    return False
 
 
 class VectorIndex:
@@ -198,10 +256,20 @@ class VectorIndex:
             # docstring above — this application's own RLock is what
             # serializes cross-thread access, not qdrant-client's built-in
             # guard.
-            self.client = QdrantClient(
-                path=str(self.persist_directory),
-                force_disable_check_same_thread=True,
-            )
+            try:
+                self.client = QdrantClient(
+                    path=str(self.persist_directory),
+                    force_disable_check_same_thread=True,
+                )
+            except RuntimeError as e:
+                # The embedded client raises a bare RuntimeError from this
+                # constructor ONLY when its storage folder is already held
+                # by another client instance/process (portalocker lock) —
+                # the one genuine local availability failure it has. Only
+                # this single constructor call is inside the try, so no
+                # unrelated RuntimeError can be reclassified here.
+                logger.error("RAG index: Qdrant storage unavailable | error_type=%s", type(e).__name__)
+                raise VectorIndexUnavailableError("Vector index unavailable") from e
             self._ensure_collection()
         # persist_directory is an absolute filesystem path (can reveal the
         # deployment's OS username/layout) — never logged.

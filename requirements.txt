@@ -123,3 +123,9 @@ uvicorn==0.52.4
 # that file's existing floor exactly so the two never disagree about the
 # minimum installable version.
 httpx>=0.27.0,<1.0.0
+
+# Multipart form parsing (Stage 7A-3): FastAPI's own UploadFile/File()
+# support requires this at runtime (it raises at route-registration time
+# otherwise) — needed for POST /api/documents, the one multipart/form-data
+# route in this application.
+python-multipart>=0.0.9,<1.0.0
