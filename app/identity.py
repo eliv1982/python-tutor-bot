@@ -11,22 +11,26 @@ this function is never itself an authorization decision (see
 db/identity.py's own docstring for the same point from the persistence
 side).
 
-A thin asyncio.to_thread() wrapper around the sync db.identity call — see
-db/engine.py's module docstring for why DB access here is sync-in-thread
-rather than a native async driver (psycopg's async mode is incompatible
-with Windows' default ProactorEventLoop, which this application's own
-asyncio.run() uses). This is the same offload idiom already used for
-Qdrant reads (rag/query.py, handlers/start.py's /stats command).
+A thin async wrapper around the sync db.identity call, offloaded via
+utils.helpers.submit_worker()/await_worker() — see db/engine.py's module
+docstring for why DB access here is sync-in-thread rather than a native
+async driver (psycopg's async mode is incompatible with Windows' default
+ProactorEventLoop, which this application's own asyncio.run() uses), and
+for why this is submit_worker()/await_worker() rather than a plain
+asyncio.to_thread() (Stage 7A-3 unified-runtime corrective pass:
+resolve_user_uuid() runs on every Telegram update, so its Task must not be
+able to report itself "settled" to service_main.py's shutdown sequence
+while its worker thread is still using the shared DB engine).
 """
 
-import asyncio
 import uuid
 
 import db.identity as db_identity
+from utils.helpers import await_worker, submit_worker
 
 
 async def resolve_user_uuid(telegram_user_id: int) -> uuid.UUID:
-    return await asyncio.to_thread(db_identity.resolve_or_create_user_by_telegram_id_sync, telegram_user_id)
+    return await await_worker(submit_worker(db_identity.resolve_or_create_user_by_telegram_id_sync, telegram_user_id))
 
 
 async def is_telegram_linked(user_id: uuid.UUID) -> bool:
@@ -34,4 +38,4 @@ async def is_telegram_linked(user_id: uuid.UUID) -> bool:
     db.identity.has_telegram_account_sync(), used by web/routes.py's
     `/api/me` to expose a safe boolean without ever leaking the Telegram
     numeric id itself."""
-    return await asyncio.to_thread(db_identity.has_telegram_account_sync, user_id)
+    return await await_worker(submit_worker(db_identity.has_telegram_account_sync, user_id))

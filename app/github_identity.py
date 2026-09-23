@@ -23,22 +23,24 @@ authenticated the browser IS the authorization decision (unlike the
 Telegram adapter's separate allowlist gate), and by the time either is
 called, that has already happened.
 
-A thin asyncio.to_thread() wrapper around the sync db.github_identity
-calls — see db/engine.py's module docstring for why DB access here is
-sync-in-thread rather than a native async driver, and
-app/identity.py's own docstring for the same offload idiom already used
-for Telegram identity resolution.
+A thin async wrapper around the sync db.github_identity calls, offloaded
+via utils.helpers.submit_worker()/await_worker() — see db/engine.py's
+module docstring for why DB access here is sync-in-thread rather than a
+native async driver (and why this is submit_worker()/await_worker()
+rather than a plain asyncio.to_thread() as of the Stage 7A-3
+unified-runtime corrective pass), and app/identity.py's own docstring for
+the same offload idiom already used for Telegram identity resolution.
 """
 
-import asyncio
 import uuid
 from typing import Optional
 
 import db.github_identity as db_github_identity
+from utils.helpers import await_worker, submit_worker
 
 
 async def resolve_user_uuid(github_user_id: int) -> uuid.UUID:
-    return await asyncio.to_thread(db_github_identity.resolve_or_create_user_by_github_id_sync, github_user_id)
+    return await await_worker(submit_worker(db_github_identity.resolve_or_create_user_by_github_id_sync, github_user_id))
 
 
 async def resolve_user_uuid_for_oauth(*, github_user_id: int, auth_generation: int) -> Optional[uuid.UUID]:
@@ -54,8 +56,8 @@ async def resolve_user_uuid_for_oauth(*, github_user_id: int, auth_generation: i
     must be restarted" response, the OAuth-binding cookie cleared, and no
     session minted.
     """
-    return await asyncio.to_thread(
+    return await await_worker(submit_worker(
         db_github_identity.resolve_or_create_user_by_github_id_for_oauth_sync,
         github_user_id=github_user_id,
         auth_generation=auth_generation,
-    )
+    ))

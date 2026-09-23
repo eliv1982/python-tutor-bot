@@ -8,12 +8,22 @@ import functools
 import os
 import re
 import uuid
-import aiofiles
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-from config import DATA_DIR
 from utils.logging import logger
+
+# `config` (and therefore `rag.constants`, and config.py's own credential
+# validation) is deliberately NOT imported at module level here (Stage
+# 7A-3 unified-runtime corrective pass): submit_worker()/await_worker()
+# below are imported by app-layer boundary modules (app/auth_session.py,
+# app/telegram_link.py, app/github_identity.py, app/oauth_transaction.py)
+# whose own tests prove they stay importable with no credentials
+# configured and without pulling `rag`/`qdrant_client` into sys.modules
+# merely by being imported (tests/test_stage6a_corrective1_lifecycle.py,
+# tests/test_stage6c_qdrant_preservation.py). Only save_file_async() below
+# actually needs DATA_DIR, so it is imported lazily, inside that one
+# function, instead.
 
 
 def submit_worker(func, *args, **kwargs) -> "asyncio.Future":
@@ -202,25 +212,49 @@ def strip_markdown(text: str) -> str:
     return t.strip()
 
 
+def _save_file_sync(filepath: Path, file_content: bytes) -> Path:
+    """
+    Complete synchronous file write, run inside a single submit_worker()
+    executor thread by save_file_async() below (Stage 7A-3 unified-runtime
+    corrective pass #2). Previously this was `aiofiles.open()`/`.write()`,
+    which itself just delegates to this same executor machinery underneath
+    — but as a bare `await`, not through submit_worker()/await_worker(), so
+    a cancelled caller (e.g. a Telegram handler task settled by
+    `_settle_telegram_pending_tasks()`) could return before this write
+    actually finished, leaving a worker thread still writing into
+    `DATA_DIR` after service_main.py's shared close_resources() begins.
+    Routing the exact same `open(..., 'wb').write(...)` call through
+    submit_worker()/await_worker() instead makes the caller's Task unable
+    to settle until this write genuinely has, with no other behavior
+    change (same path, same binary mode, same overwrite/truncate and
+    permissions semantics as plain `open()` — aiofiles.open() was only a
+    thin wrapper around it to begin with).
+    """
+    with open(filepath, "wb") as f:
+        f.write(file_content)
+    return filepath
+
+
 async def save_file_async(file_content: bytes, extension: str = "tmp") -> Path:
     """
     Save file content asynchronously to a temporary file.
-    
+
     Args:
         file_content: Binary content of the file
         extension: File extension (without dot)
-    
+
     Returns:
         Path to the saved file
     """
+    from config import DATA_DIR
+
     filename = f"{uuid.uuid4()}.{extension}"
     filepath = DATA_DIR / filename
-    
+
     try:
-        async with aiofiles.open(filepath, 'wb') as f:
-            await f.write(file_content)
+        result = await await_worker(submit_worker(_save_file_sync, filepath, file_content))
         logger.debug("File saved | name=%s", filepath.name)
-        return filepath
+        return result
     except Exception as e:
         # OSError messages commonly embed the full path (and therefore the
         # deployment's absolute directory structure) — log only the type.

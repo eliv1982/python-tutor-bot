@@ -3,10 +3,11 @@ Canonical identity resolution for the GitHub OAuth provider (Stage 6B) —
 mirrors db/identity.py's Telegram equivalent exactly: GitHub is only ever
 an EXTERNAL identity, never itself the primary key of anything else in
 this schema (see db/models.py's User docstring). app/github_identity.py
-wraps this in asyncio.to_thread() the same way app/identity.py wraps
-db/identity.py's Telegram functions — see db/engine.py's module docstring
-for why DB access here is sync-in-thread rather than a native async
-driver.
+wraps this via utils.helpers.submit_worker()/await_worker() the same way
+app/identity.py wraps db/identity.py's Telegram functions — see
+db/engine.py's module docstring for why DB access here is sync-in-thread
+rather than a native async driver, and (Stage 7A-3 unified-runtime
+corrective pass) why this is no longer a plain `asyncio.to_thread()`.
 
 resolve_or_create_user_by_github_id_sync() is called ONLY after
 web/github_oauth.py's callback has already completed a successful GitHub

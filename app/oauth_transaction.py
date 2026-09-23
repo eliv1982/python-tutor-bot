@@ -22,7 +22,6 @@ straight to services/github_oauth_client.py's token exchange. Neither is
 ever logged.
 """
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -34,6 +33,7 @@ from typing import Optional
 
 import db.oauth_transactions as db_oauth_transactions
 import github_oauth_config
+from utils.helpers import await_worker, submit_worker
 
 # 256 bits of CSPRNG entropy for `state` — matches app/auth_session.py's
 # own _TOKEN_BYTES rationale (comfortably beyond brute-force feasibility
@@ -171,7 +171,7 @@ async def create_transaction() -> IssuedTransaction:
     expires_at = datetime.now(timezone.utc) + timedelta(
         seconds=github_oauth_config.OAUTH_TRANSACTION_TTL_SECONDS
     )
-    admitted = await asyncio.to_thread(
+    admitted = await await_worker(submit_worker(
         db_oauth_transactions.create_sync,
         state_hash=_hash_state(raw_state),
         code_verifier=code_verifier,
@@ -179,7 +179,7 @@ async def create_transaction() -> IssuedTransaction:
         max_starts_per_window=github_oauth_config.OAUTH_MAX_STARTS_PER_MINUTE,
         max_outstanding=github_oauth_config.OAUTH_MAX_OUTSTANDING_TRANSACTIONS,
         window_seconds=github_oauth_config.OAUTH_RATE_WINDOW_SECONDS,
-    )
+    ))
     if not admitted:
         raise OAuthAdmissionRejected("GitHub OAuth login admission control rejected this request")
     return IssuedTransaction(state=raw_state, code_challenge=code_challenge_for(code_verifier))
@@ -199,7 +199,7 @@ async def claim_transaction(raw_state: Optional[str]) -> Optional[ClaimedOAuthTr
     """
     if not raw_state or not is_canonical_state(raw_state):
         return None
-    claimed = await asyncio.to_thread(db_oauth_transactions.claim_sync, state_hash=_hash_state(raw_state))
+    claimed = await await_worker(submit_worker(db_oauth_transactions.claim_sync, state_hash=_hash_state(raw_state)))
     if claimed is None:
         return None
     return ClaimedOAuthTransaction(code_verifier=claimed.code_verifier, auth_generation=claimed.auth_generation)

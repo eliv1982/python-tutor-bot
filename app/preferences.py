@@ -21,12 +21,12 @@ db.preferences import ...`) so tests can monkeypatch its functions, the
 same convention app/session.py uses.
 """
 
-import asyncio
 import uuid
 from typing import Any
 
 import db.preferences as db_preferences
 from config import BotMode
+from utils.helpers import await_worker, submit_worker
 
 __all__ = ["PreferenceValidationError", "get_effective_mode", "set_mode"]
 
@@ -53,9 +53,15 @@ def _is_canonical_mode(mode: Any) -> bool:
 
 
 async def get_effective_mode(user_id: uuid.UUID) -> str:
-    """Returns the user's effective mode. Never creates a row."""
+    """Returns the user's effective mode. Never creates a row. Offloaded
+    via utils.helpers.submit_worker()/await_worker() — see db/engine.py's
+    module docstring (Stage 7A-3 unified-runtime corrective pass) for why
+    this is no longer a plain asyncio.to_thread(): this is called on every
+    GET /api/settings request, so its Task must not report itself
+    "settled" to service_main.py's shutdown sequence while its worker
+    thread is still using the shared DB engine."""
     _validate_user_id(user_id)
-    stored_mode, _voice = await asyncio.to_thread(db_preferences.get_preferences_sync, user_id)
+    stored_mode, _voice = await await_worker(submit_worker(db_preferences.get_preferences_sync, user_id))
     if _is_canonical_mode(stored_mode):
         return stored_mode
     return DEFAULT_EFFECTIVE_MODE
@@ -67,5 +73,5 @@ async def set_mode(user_id: uuid.UUID, mode: str) -> str:
     _validate_user_id(user_id)
     if not _is_canonical_mode(mode):
         raise PreferenceValidationError("mode must be one of the canonical BotMode values")
-    await asyncio.to_thread(db_preferences.set_mode_sync, user_id, mode)
+    await await_worker(submit_worker(db_preferences.set_mode_sync, user_id, mode))
     return mode

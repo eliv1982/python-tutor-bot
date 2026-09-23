@@ -1,8 +1,11 @@
 """
 Server-side Telegram <-> GitHub/web identity-linking persistence (Stage
-6C) — SYNC, deliberately (see db/engine.py's module docstring). Wrapped in
-asyncio.to_thread() by app/telegram_link.py, the same idiom every other
-db/*.py module in this codebase uses for its blocking-I/O boundary.
+6C) — SYNC, deliberately (see db/engine.py's module docstring). Wrapped
+via utils.helpers.submit_worker()/await_worker() by app/telegram_link.py,
+the same idiom every other db/*.py module in this codebase uses for its
+blocking-I/O boundary — see db/engine.py's own docstring (Stage 7A-3
+unified-runtime corrective pass) for why this is no longer a plain
+`asyncio.to_thread()`.
 
 Corrected lock order (Stage 6C corrective pass, independent-audit MAJOR 2
 — mandatory for every function in this module that touches more than one

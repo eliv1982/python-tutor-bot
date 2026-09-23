@@ -44,12 +44,12 @@ get_voice/set_voice are unaffected (durable PostgreSQL state via
 db.preferences, not `self.sessions`).
 """
 
-import asyncio
 import threading
 import uuid
 from typing import Optional
 
 import db.preferences as db_preferences
+from utils.helpers import await_worker, submit_worker
 
 
 class UserSession:
@@ -138,23 +138,26 @@ class UserSession:
                 del self.sessions[user_id]
 
     async def get_mode(self, user_id: uuid.UUID) -> str:
-        """Get current mode for a user (durable — PostgreSQL)."""
-        mode, _voice = await asyncio.to_thread(db_preferences.get_preferences_sync, user_id)
+        """Get current mode for a user (durable — PostgreSQL). Offloaded via
+        utils.helpers.submit_worker()/await_worker() — see db/engine.py's
+        module docstring (Stage 7A-3 unified-runtime corrective pass) for
+        why this is no longer a plain asyncio.to_thread()."""
+        mode, _voice = await await_worker(submit_worker(db_preferences.get_preferences_sync, user_id))
         return mode if mode is not None else "text"
 
     async def set_mode(self, user_id: uuid.UUID, mode: str):
         """Set mode for a user (durable — PostgreSQL)."""
-        await asyncio.to_thread(db_preferences.set_mode_sync, user_id, mode)
+        await await_worker(submit_worker(db_preferences.set_mode_sync, user_id, mode))
 
     async def get_voice(self, user_id: uuid.UUID) -> str:
         """Get current voice setting for a user (durable — PostgreSQL)."""
         from config import DEFAULT_VOICE
-        _mode, voice = await asyncio.to_thread(db_preferences.get_preferences_sync, user_id)
+        _mode, voice = await await_worker(submit_worker(db_preferences.get_preferences_sync, user_id))
         return voice if voice is not None else DEFAULT_VOICE
 
     async def set_voice(self, user_id: uuid.UUID, voice: str):
         """Set voice for a user (durable — PostgreSQL)."""
-        await asyncio.to_thread(db_preferences.set_voice_sync, user_id, voice)
+        await await_worker(submit_worker(db_preferences.set_voice_sync, user_id, voice))
 
     def set_pending_image(self, user_id: uuid.UUID, image_data_url: str):
         """Сохранить base64 data URL изображения в ожидании вопроса от пользователя."""

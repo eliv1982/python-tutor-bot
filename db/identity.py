@@ -1,9 +1,10 @@
 """
 Canonical identity resolution (Stage 5C) — SYNC (see db/engine.py's
 module docstring for why: psycopg async mode is incompatible with
-Windows' default ProactorEventLoop). app/identity.py wraps this in
-asyncio.to_thread() so callers still `await` it, matching the codebase's
-existing idiom for blocking-I/O boundaries (rag/query.py, handlers/start.py).
+Windows' default ProactorEventLoop). app/identity.py wraps this via
+utils.helpers.submit_worker()/await_worker() so callers still `await` it
+— see db/engine.py's own docstring (Stage 7A-3 unified-runtime corrective
+pass) for why this is no longer a plain `asyncio.to_thread()`.
 
 resolve_or_create_user_by_telegram_id_sync() is called by the Telegram
 adapter (app/identity.py) ONLY AFTER utils.access_control.require_authorized()

@@ -3,10 +3,9 @@ Start and Help Command Handlers.
 Handles /start and /help commands using pyTelegramBotAPI.
 """
 
-import asyncio
-
 from telebot import types
 from bot import bot
+from utils.helpers import await_worker, submit_worker
 from utils.logging import logger
 from app.session import user_sessions
 from app.identity import resolve_user_uuid
@@ -158,15 +157,23 @@ async def cmd_stats(message: types.Message):
         # which a concurrent upload/RAG query may hold for a while — call it
         # off the event loop so /stats can't stall on that contention.
         #
-        # Stage 1E.1 cancellation review: same reasoning as rag/query.py's
-        # similarity search — deliberately unshielded. It's a read-only
-        # `collection.count()`, mutates nothing, and its result is simply
-        # discarded if the caller is cancelled — no cleanup/ownership race.
+        # Stage 1E.1 cancellation review: it's a read-only `collection.
+        # count()`, mutates nothing, and its result is simply discarded if
+        # the caller is cancelled — no cleanup/ownership race. That
+        # business-level reasoning is unchanged. Stage 7A-3 unified-runtime
+        # corrective pass: offloaded via utils.helpers.submit_worker()/
+        # await_worker() rather than a plain `asyncio.to_thread()`
+        # regardless — same rationale as rag/query.py's similarity search
+        # (see that module's own comment, and db/engine.py's docstring):
+        # this reads the SAME shared Qdrant singleton service_main.py's
+        # close_resources() disposes on shutdown, and a cancelled Task
+        # awaiting plain asyncio.to_thread() does not stop or await this
+        # worker thread.
         #
         # Stage 3A: scoped to this user — reference corpus + this user's
         # own private documents only, never a global count that would
         # reveal another user's private upload activity.
-        stats = await asyncio.to_thread(get_knowledge_base_stats, str(user_uuid))
+        stats = await await_worker(submit_worker(get_knowledge_base_stats, str(user_uuid)))
         logger.debug("Command /stats | stats=%s", stats)
         if "error" in stats:
             await bot.send_message(

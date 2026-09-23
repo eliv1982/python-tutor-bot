@@ -21,25 +21,48 @@ security-critical, already-reviewed test infrastructure, for no benefit
 this stage actually needs.
 
 Instead: ONE sync psycopg engine, used everywhere (db/identity.py,
-db/preferences.py, db/documents.py), offloaded to a worker thread at
-whichever async boundary calls it:
-  - db/documents.py is called from INSIDE the existing executor-thread
-    functions in app/documents.py (via utils.helpers.submit_worker()/
-    await_worker()) — the same cancellation-safety mechanism already used
-    for physical-file/sidecar writes and Qdrant reconciliation. A real OS
-    thread survives asyncio cancellation of the awaiting Task.
-  - db/identity.py/db/preferences.py are called via plain
-    asyncio.to_thread() from app/identity.py/app/session.py — the exact
-    idiom rag/query.py's similarity search and handlers/start.py's
-    /stats command already use for read-mostly/idempotent blocking calls,
-    where an ordinary (unshielded) await is already the accepted pattern:
-    on cancellation, at worst nothing was created/updated and the
-    caller's request simply fails and can be retried.
+db/preferences.py, db/documents.py, db/auth_sessions.py,
+db/telegram_link.py, db/github_identity.py, db/oauth_transactions.py),
+offloaded to a worker thread at whichever async boundary calls it, via
+utils.helpers.submit_worker()/await_worker() — see that module's own
+docstring for the exact mechanism.
 
-This is a smaller, more consistent design than a two-engine split would
-have been, not a compromise — it reuses ONE existing concurrency idiom
-(asyncio.to_thread()/submit_worker()) for every blocking-I/O boundary in
-this codebase, sync DB access included.
+Stage 7A-3 unified-runtime corrective pass (independent-audit MAJOR — a
+cancelled Task awaiting plain `asyncio.to_thread()` does not stop or await
+the worker thread): every one of these call sites used to be split into
+two idioms — db/documents.py's multi-step physical-file/sidecar/Qdrant
+writes went through submit_worker()/await_worker(), while every other
+db/*.py module (identity, preferences, auth_sessions, telegram_link,
+github_identity, oauth_transactions) went through a plain, unshielded
+`asyncio.to_thread()`, reasoned about purely at the BUSINESS level: each
+of those calls is a single, idempotent-enough statement, so on ordinary
+per-request cancellation "at worst nothing was created/updated and the
+caller's request simply fails and can be retried" — a reasoning that
+remains true today and is NOT what this pass changes.
+
+What that reasoning never accounted for is PROCESS-SHUTDOWN-level
+resource lifecycle safety: service_main.py's unified composition root
+settles every adapter-owned Task (Telegram's polling + its
+`_pending_tasks`, Uvicorn's `serve()` + its lifespan task + its
+`server_state.tasks`) and only THEN calls `close_resources()` (this
+module's own `close_db()`, plus `rag.index.close_vector_index()`). A
+plain `asyncio.to_thread()` call lets its owning Task report itself
+"settled" (cancelled) the instant cancellation is requested, regardless of
+whether the underlying OS thread is still actually running the sync DB
+call against `get_sync_engine()` — so `close_db()` could begin disposing
+the shared engine while one of these threads is still using a connection
+checked out from its pool. Every blocking-I/O boundary in this codebase
+now goes through the SAME submit_worker()/await_worker() primitive
+specifically so that never happens: the owning Task cannot settle until
+the thread genuinely has, which is exactly the property `_settle_
+telegram_pending_tasks()`/the Uvicorn request-task equivalent in
+service_main.py rely on to make "adapter settled" transitively imply "its
+resource-sensitive worker descendants settled" too.
+
+This is a smaller, more consistent design than a two-primitive split
+would have been, not a compromise — ONE concurrency idiom
+(submit_worker()/await_worker()) for every blocking-I/O boundary in this
+codebase, sync DB access included.
 
 DATABASE_URL is read as a FRESH module-attribute access
 (db_settings.DATABASE_URL) inside get_sync_engine(), never bound at this

@@ -8,7 +8,16 @@
 # constraint change.
 
 # Telegram Bot (pyTelegramBotAPI, imported as `telebot`)
-pyTelegramBotAPI>=4.36.1,<5.0.0
+#
+# Pinned EXACTLY (not a bounded range): service_main.py's unified-runtime
+# Telegram adapter (Stage 7A-3 prerequisite) relies on this exact
+# version's private `AsyncTeleBot._pending_tasks` implementation to settle
+# handler child tasks before shared Qdrant/DB cleanup begins — see
+# service_main._settle_telegram_pending_tasks()'s own docstring. Re-verify
+# that function against the new installed
+# venv/Lib/site-packages/telebot/async_telebot.py before ever bumping
+# this pin.
+pyTelegramBotAPI==4.36.1
 python-dotenv>=1.0.0,<2.0.0
 
 # OpenAI
@@ -91,7 +100,18 @@ numpy>=1.26.0; python_version >= '3.13'
 # fastapi 0.141.1 / starlette 1.6.0 against the already-pinned
 # pydantic 2.x this repo's other dependencies already bring in).
 fastapi>=0.121.0,<1.0.0
-uvicorn>=0.34.0,<1.0.0
+#
+# uvicorn is pinned EXACTLY (not a bounded range): service_main.py's
+# unified-runtime web adapter (Stage 7A-3 prerequisite) subclasses this
+# exact version's private `uvicorn.lifespan.on.LifespanOn.startup()`
+# implementation line-for-line (`service_main._TrackedLifespanOn`) so a
+# force-cancelled adapter can still reach and settle uvicorn's own
+# lifespan child task. A bounded range previously allowed a future 0.x
+# release to silently change that private method out from under the
+# override. Re-verify _TrackedLifespanOn against the new installed
+# venv/Lib/site-packages/uvicorn/lifespan/on.py before ever bumping this
+# pin.
+uvicorn==0.52.4
 
 # GitHub OAuth HTTP client (Stage 6B): services/github_oauth_client.py
 # imports httpx directly and is production code, not test-only — so this

@@ -2,9 +2,11 @@
 Server-side web-session persistence (Stage 6A) — SYNC, deliberately (see
 db/engine.py's module docstring for why: psycopg async mode is
 incompatible with Windows' default ProactorEventLoop). app/auth_session.py
-wraps every function here in asyncio.to_thread(), the same idiom
-db/identity.py and db/preferences.py already use for this codebase's other
-blocking-I/O boundaries.
+wraps every function here via utils.helpers.submit_worker()/await_worker(),
+the same idiom every other db/*.py module in this codebase now uses for
+its blocking-I/O boundary — see db/engine.py's own docstring (Stage 7A-3
+unified-runtime corrective pass) for why this is no longer a plain
+`asyncio.to_thread()`.
 
 Only a SHA-256 digest of the browser's bearer session token
 (`session_token_hash`) is ever persisted here — never the raw token

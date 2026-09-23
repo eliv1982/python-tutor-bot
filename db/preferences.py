@@ -1,8 +1,10 @@
 """
 Durable mode/voice preferences (Stage 5C) — SYNC (see db/engine.py's
-module docstring). app/session.py wraps each of these in
-asyncio.to_thread() so its own get_mode/set_mode/get_voice/set_voice stay
-`async def` for callers.
+module docstring). app/session.py/app/preferences.py wrap each of these
+via utils.helpers.submit_worker()/await_worker() so their own async
+get/set methods stay `async def` for callers — see db/engine.py's own
+docstring (Stage 7A-3 unified-runtime corrective pass) for why this is no
+longer a plain `asyncio.to_thread()`.
 
 get_preferences_sync() returns (None, None) for a user with no row yet —
 it deliberately does NOT apply BotMode/DEFAULT_VOICE fallback defaults

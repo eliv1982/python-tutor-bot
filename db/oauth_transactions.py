@@ -2,9 +2,12 @@
 Server-side GitHub OAuth transaction persistence (Stage 6B) — replay-
 resistant, short-lived state for the Authorization Code + PKCE flow
 (web/github_oauth.py). SYNC, deliberately (see db/engine.py's module
-docstring for why), wrapped in asyncio.to_thread() by
-app/oauth_transaction.py, the same idiom db/identity.py/db/auth_sessions.py
-already use for this codebase's other blocking-I/O boundaries.
+docstring for why), wrapped via utils.helpers.submit_worker()/
+await_worker() by app/oauth_transaction.py, the same idiom
+db/identity.py/db/auth_sessions.py already use for this codebase's other
+blocking-I/O boundaries — see db/engine.py's own docstring (Stage 7A-3
+unified-runtime corrective pass) for why this is no longer a plain
+`asyncio.to_thread()`.
 
 Only a SHA-256 digest of the random `state` value is ever persisted
 (`state_hash`, the PK) — never the raw state itself — mirroring

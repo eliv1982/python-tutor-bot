@@ -11,13 +11,14 @@ redeem_link()'s own stack frame while it is validated and hashed. It is
 never persisted anywhere, never appears in any exception text, and this
 module never logs it (Section F).
 
-Every function here is a thin asyncio.to_thread() wrapper around
-db/telegram_link.py's sync functions, the same offload idiom every other
-app/*.py module in this codebase uses for its blocking-I/O boundary (see
-db/engine.py's module docstring).
+Every function here is a thin async wrapper around db/telegram_link.py's
+sync functions, offloaded via utils.helpers.submit_worker()/await_worker()
+— the same offload idiom every other app/*.py module in this codebase
+uses for its blocking-I/O boundary (see db/engine.py's module docstring,
+including why this is submit_worker()/await_worker() rather than a plain
+asyncio.to_thread() as of the Stage 7A-3 unified-runtime corrective pass).
 """
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -33,6 +34,7 @@ from typing import Optional
 import db.telegram_link as db_telegram_link
 import telegram_link_config
 from db.telegram_link import CreateAttemptOutcome, RedemptionOutcome, UnlinkOutcome
+from utils.helpers import await_worker, submit_worker
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +145,7 @@ async def start_link(user_id: uuid.UUID) -> Optional[LinkStartResult]:
     concern, never a precondition for issuing a bearer.
     """
     try:
-        await asyncio.to_thread(db_telegram_link.cleanup_expired_attempts_sync)
+        await await_worker(submit_worker(db_telegram_link.cleanup_expired_attempts_sync))
     except Exception:
         logger.warning("telegram_link: expired-attempt cleanup pass failed; continuing", exc_info=True)
 
@@ -152,12 +154,12 @@ async def start_link(user_id: uuid.UUID) -> Optional[LinkStartResult]:
     assert len(payload) <= MAX_START_PAYLOAD_LENGTH, "link payload exceeds Telegram's /start payload limit"
 
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=telegram_link_config.LINK_ATTEMPT_TTL_SECONDS)
-    outcome = await asyncio.to_thread(
+    outcome = await await_worker(submit_worker(
         db_telegram_link.create_attempt_sync,
         web_user_id=user_id,
         link_secret_hash=_hash_secret(raw_secret),
         expires_at=expires_at,
-    )
+    ))
     if outcome != CreateAttemptOutcome.CREATED:
         return None
 
@@ -176,11 +178,11 @@ async def redeem_link(*, telegram_user_id: int, raw_secret: str) -> RedemptionOu
     """
     if not _is_canonical_secret(raw_secret):
         return RedemptionOutcome.INVALID_OR_EXPIRED
-    result = await asyncio.to_thread(
+    result = await await_worker(submit_worker(
         db_telegram_link.redeem_attempt_sync,
         link_secret_hash=_hash_secret(raw_secret),
         telegram_user_id=telegram_user_id,
-    )
+    ))
     return result.outcome
 
 
@@ -188,4 +190,4 @@ async def unlink_github(user_id: uuid.UUID) -> UnlinkOutcome:
     """Thin wrapper around db.telegram_link.unlink_github_sync() (Section
     L) — see that function's own docstring for the three possible
     outcomes."""
-    return await asyncio.to_thread(db_telegram_link.unlink_github_sync, user_id=user_id)
+    return await await_worker(submit_worker(db_telegram_link.unlink_github_sync, user_id=user_id))

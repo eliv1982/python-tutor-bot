@@ -4,7 +4,6 @@ Uses OpenAI DALL-E API to generate images from text prompts.
 """
 
 import aiohttp
-import aiofiles
 import base64
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -12,6 +11,7 @@ from datetime import datetime
 import json
 
 from config import OPENAI_API_KEY, DALLE_MODEL, DATA_DIR
+from utils.helpers import await_worker, submit_worker
 from utils.logging import logger
 
 
@@ -212,13 +212,29 @@ async def generate_image(
         raise
 
 
+def _write_image_bytes_sync(filepath: Path, data: bytes) -> Path:
+    """
+    Complete synchronous image write, run inside a single submit_worker()
+    executor thread by download_image() below (Stage 7A-3 unified-runtime
+    corrective pass #2) — same rationale as utils.helpers._save_file_sync():
+    this replaces a bare `aiofiles.open()`/`.write()` await, which let a
+    cancelled Telegram handler task settle while its write into
+    GENERATED_IMAGES_DIR was still running on the underlying executor
+    thread. Same path, same binary mode, same overwrite/truncate/
+    permissions semantics as plain `open()`.
+    """
+    with open(filepath, "wb") as f:
+        f.write(data)
+    return filepath
+
+
 async def download_image(url: str) -> Path:
     """
     Download image from URL and save to local file.
-    
+
     Args:
         url: Image URL
-    
+
     Returns:
         Path to downloaded image
     """
@@ -227,17 +243,17 @@ async def download_image(url: str) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"generated_{timestamp}.png"
         filepath = GENERATED_IMAGES_DIR / filename
-        
+
         # Download image
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status != 200:
                     raise Exception(f"Failed to download image: {response.status}")
-                
+
                 # Save to file
-                async with aiofiles.open(filepath, 'wb') as f:
-                    await f.write(await response.read())
-        
+                data = await response.read()
+                await await_worker(submit_worker(_write_image_bytes_sync, filepath, data))
+
         logger.debug("DALL-E image downloaded | name=%s", filepath.name)
         return filepath
 

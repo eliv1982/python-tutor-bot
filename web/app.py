@@ -53,16 +53,32 @@ app/auth_session.py itself (see that module's own docstring on why).
 Lifespan shutdown (independent-audit corrective pass #1, minor finding #3):
 disposes the shared sync DB engine (db.engine.close_db()) on ASGI
 shutdown — the web adapter's own equivalent of main.py's shutdown_bot()
-call for the Telegram adapter. Safe and adapter-owned: web_main.py is
-documented as its own separate OS process from main.py (see that module's
-own docstring — "running this does not start the Telegram bot, and
-running main.py does not start this web server"), so disposing the engine
-here can never race or interfere with a Telegram process's own engine,
-which it does not share. get_sync_engine() reconstructs a fresh Engine
-lazily on the next call regardless (see db/engine.py), so this is a
-clean, idempotent, "nothing left running past shutdown" cleanup, not a
-destructive one. See tests/test_stage6a_corrective1_lifecycle.py for the
-proof.
+call for the Telegram adapter. Safe and adapter-owned when this app is
+the ONLY thing running in its process (the historical, still-supported
+`web_main.py` standalone mode — see that module's own docstring):
+disposing the engine here can never race or interfere with a Telegram
+process's own engine, which it does not share. get_sync_engine()
+reconstructs a fresh Engine lazily on the next call regardless (see
+db/engine.py), so this is a clean, idempotent, "nothing left running past
+shutdown" cleanup, not a destructive one. See
+tests/test_stage6a_corrective1_lifecycle.py for the proof.
+
+`owns_db_lifecycle` (Stage 7A-3 runtime-topology prerequisite):
+create_app()'s explicit ownership switch for the DB-close half of the
+above, defaulting to True — standalone `web_main.py` (and every existing
+test) gets EXACTLY the previous behavior unchanged. `service_main.py`
+(the new unified Telegram+web composition root) passes
+`owns_db_lifecycle=False`: in that process, `main.shutdown_bot()` is the
+SOLE owner of closing the shared sync DB engine, called exactly once
+after both adapter tasks have already stopped. Without this switch, an
+unfailing-but-idempotent `close_db()` call from BOTH this lifespan AND
+the composition root would be two unrelated lifecycle owners racing to
+close the same shared engine — the exact hazard Stage 7A-3 forbids, even
+though close_db() itself tolerates it. This lifespan never touches Qdrant
+either way (no web route in this pass calls get_vector_index()/
+close_vector_index()) — that singleton is owned exclusively by
+main.setup_bot()/shutdown_bot() in every runtime mode, standalone or
+unified.
 
 No CORS middleware is registered — Stage 6A's CSRF defense (web/csrf.py)
 relies on the browser's Same-Origin Policy to prevent a cross-site page
@@ -110,9 +126,14 @@ async def _lifespan(app: FastAPI):
 
     yield
 
-    from db.engine import close_db
+    # See create_app()'s `owns_db_lifecycle` parameter docstring above —
+    # False (unified service_main.py mode) means the composition root
+    # already owns this close exclusively; this lifespan must not also
+    # race to do it a second time.
+    if getattr(app.state, "owns_db_lifecycle", True):
+        from db.engine import close_db
 
-    await asyncio.to_thread(close_db)
+        await asyncio.to_thread(close_db)
 
 
 def _disable_uvicorn_access_logging() -> None:
@@ -157,9 +178,19 @@ async def _sanitized_validation_error_handler(request: Request, exc: RequestVali
     )
 
 
-def create_app() -> FastAPI:
+def create_app(*, owns_db_lifecycle: bool = True) -> FastAPI:
+    """
+    Args:
+        owns_db_lifecycle: whether THIS app's lifespan shutdown disposes
+            the shared sync DB engine (db.engine.close_db()) itself. True
+            (default) preserves standalone web_main.py's existing,
+            already-tested behavior exactly. service_main.py's unified
+            composition root passes False — see `_lifespan()`'s docstring
+            above for why two lifecycle owners must never both do this.
+    """
     _disable_uvicorn_access_logging()
     app = FastAPI(title="Python Tutor Bot — Web API", lifespan=_lifespan)
+    app.state.owns_db_lifecycle = owns_db_lifecycle
     app.add_exception_handler(RequestValidationError, _sanitized_validation_error_handler)
     app.add_middleware(
         RequestBodyLimitMiddleware,

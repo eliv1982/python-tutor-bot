@@ -57,7 +57,6 @@ mint attempt: this process's own web_config.COOKIE_SECURE no longer
 matches the database's authoritative posture, so no session was created.
 """
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -71,6 +70,7 @@ from typing import Optional
 import db.auth_sessions as db_auth_sessions
 import db.identity as db_identity
 import session_config
+from utils.helpers import await_worker, submit_worker
 
 # Re-exported so Stage 6B (and tests) can write
 # `except auth_session.StalePostureError:` against this module's own
@@ -192,32 +192,38 @@ async def create_session(user_id: uuid.UUID, *, issued_secure: bool) -> IssuedSe
     same value, not two independently-derived copies.
 
     Note on cancellation: if the awaiting caller is cancelled after the
-    worker thread (asyncio.to_thread below) has already committed the INSERT
-    but before this coroutine resumes and returns, the new row becomes
-    unreachable garbage — nobody ever received `raw_token`, so nothing can
-    ever resolve/revoke it; it simply sits until `expires_at` (now
-    bounded — see session_config.py's upper bound) passes. This is the same
-    accepted risk category db/engine.py's own module docstring documents
-    for db/identity.py/db/preferences.py's plain (unshielded)
-    asyncio.to_thread() usage ("at worst nothing was created/updated and
-    the caller's request simply fails and can be retried") — deliberately
-    NOT given the heavier submit_worker()/await_worker() shielding
-    app/documents.py uses, since that mechanism exists to protect
-    multi-step physical-file/sidecar/catalog consistency that a single
-    INSERT here has no equivalent of, and adding cross-thread
-    cancellation/reconciliation machinery for a bounded, unreachable,
-    already-expiring row would be disproportionate complexity for no
-    correctness gain.
+    worker thread has already committed the INSERT but before this
+    coroutine resumes and returns, the new row becomes unreachable garbage
+    — nobody ever received `raw_token`, so nothing can ever resolve/revoke
+    it; it simply sits until `expires_at` (now bounded — see
+    session_config.py's upper bound) passes. This remains true (the same
+    accepted BUSINESS-level risk category db/engine.py's own module
+    docstring documents: "at worst nothing was created/updated and the
+    caller's request simply fails and can be retried") regardless of which
+    thread-offload primitive is used below.
+
+    Offloaded via utils.helpers.submit_worker()/await_worker(), NOT a
+    plain asyncio.to_thread() (Stage 7A-3 unified-runtime corrective pass —
+    supersedes this function's own previous reasoning for staying with the
+    lighter primitive, which was scoped entirely to the business-level
+    outcome above and never considered PROCESS-SHUTDOWN lifecycle safety):
+    a cancelled Task awaiting plain asyncio.to_thread() does not stop or
+    await the worker thread, so service_main.py's shared close_resources()
+    (which disposes this exact db.engine singleton) could begin while this
+    INSERT's worker thread is still using a connection checked out from
+    it. submit_worker()/await_worker() makes the awaiting Task itself
+    unable to settle until the worker genuinely has — see db/engine.py's
+    own docstring for the full rationale.
     """
     raw_token = secrets.token_urlsafe(_TOKEN_BYTES)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=session_config.SESSION_TTL_SECONDS)
-    await asyncio.to_thread(
+    await await_worker(submit_worker(
         db_auth_sessions.create_sync,
         token_hash=_hash_token(raw_token),
         user_id=user_id,
         issued_secure=issued_secure,
         expires_at=expires_at,
-    )
+    ))
     return IssuedSession(raw_token=raw_token, expires_at=expires_at)
 
 
@@ -225,7 +231,8 @@ async def create_session_for_github(github_user_id: int, *, issued_secure: bool)
     """
     GitHub-backed session issuance (Stage 6C, Section K) — the async
     wrapper around db.auth_sessions.create_for_github_sync(), mirroring
-    create_session() above's own asyncio.to_thread() offload idiom. Unlike
+    create_session() above's own submit_worker()/await_worker() offload
+    idiom (see that function's own docstring for why). Unlike
     create_session(), this does not take an already-resolved `user_id`: it
     re-resolves `github_user_id` -> canonical UUID FRESH, under a lock, in
     the SAME transaction as the session insert, so the session is always
@@ -250,13 +257,13 @@ async def create_session_for_github(github_user_id: int, *, issued_secure: bool)
     """
     raw_token = secrets.token_urlsafe(_TOKEN_BYTES)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=session_config.SESSION_TTL_SECONDS)
-    user_id = await asyncio.to_thread(
+    user_id = await await_worker(submit_worker(
         db_auth_sessions.create_for_github_sync,
         github_user_id=github_user_id,
         token_hash=_hash_token(raw_token),
         issued_secure=issued_secure,
         expires_at=expires_at,
-    )
+    ))
     if user_id is None:
         return None
     return IssuedSession(raw_token=raw_token, expires_at=expires_at)
@@ -282,12 +289,17 @@ async def resolve_session_user_id(raw_token: Optional[str], *, expected_secure: 
     authoritative revival guarantee (apply_startup_posture() below,
     combined with create_sync()'s own transactional posture check, is).
     An unknown, expired, revoked, or wrong-posture token (still of
-    canonical shape) all resolve to None alike."""
+    canonical shape) all resolve to None alike. Offloaded via
+    utils.helpers.submit_worker()/await_worker() — this runs on EVERY
+    authenticated web request (web/dependencies.py's get_current_user_id),
+    so its Task must not report itself "settled" while its worker thread
+    is still using the shared DB engine (see db/engine.py's own docstring,
+    Stage 7A-3 unified-runtime corrective pass)."""
     if not raw_token or not _is_canonical_token(raw_token):
         return None
-    record = await asyncio.to_thread(
+    record = await await_worker(submit_worker(
         db_auth_sessions.get_active_sync, token_hash=_hash_token(raw_token), expected_secure=expected_secure
-    )
+    ))
     return record.user_id if record is not None else None
 
 
@@ -300,7 +312,7 @@ async def revoke_session(raw_token: Optional[str]) -> None:
     why revocation doesn't need one."""
     if not raw_token or not _is_canonical_token(raw_token):
         return
-    await asyncio.to_thread(db_auth_sessions.revoke_sync, token_hash=_hash_token(raw_token))
+    await await_worker(submit_worker(db_auth_sessions.revoke_sync, token_hash=_hash_token(raw_token)))
 
 
 async def apply_startup_posture(*, requested_secure: bool) -> int:
@@ -312,12 +324,16 @@ async def apply_startup_posture(*, requested_secure: bool) -> int:
     pass #3 — this is what makes create_sync()'s posture check
     authoritative against a concurrent, cross-process transition, closing
     the race pass #2's simpler, unsynchronized version left open); this
-    wrapper exists only to apply this module's usual asyncio.to_thread()
-    offload convention. Returns the number of sessions revoked
-    (informational)."""
-    return await asyncio.to_thread(
+    wrapper exists only to apply this module's usual submit_worker()/
+    await_worker() offload convention — this call runs inside uvicorn's own
+    ASGI lifespan task (service_main._TrackedLifespanOn), which
+    service_main._settle_uvicorn_lifespan_task() cancels-and-awaits on
+    forced shutdown, so it is subject to the exact same transitivity
+    requirement as every per-request call (see db/engine.py's own
+    docstring). Returns the number of sessions revoked (informational)."""
+    return await await_worker(submit_worker(
         db_auth_sessions.apply_startup_posture_sync, requested_secure=requested_secure
-    )
+    ))
 
 
 async def get_user_profile(user_id: uuid.UUID) -> Optional[UserProfile]:
@@ -325,8 +341,9 @@ async def get_user_profile(user_id: uuid.UUID) -> Optional[UserProfile]:
     adapter's "current user" endpoint. None if the row is somehow gone
     (defensive — no user-deletion path exists yet, but a resolved session
     must never be trusted blindly into a profile that turns out not to
-    exist)."""
-    row = await asyncio.to_thread(db_identity.get_user_by_id_sync, user_id)
+    exist). Offloaded via utils.helpers.submit_worker()/await_worker() —
+    see db/engine.py's own docstring for why."""
+    row = await await_worker(submit_worker(db_identity.get_user_by_id_sync, user_id))
     if row is None:
         return None
     return UserProfile(id=row.id, created_at=row.created_at)

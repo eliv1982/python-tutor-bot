@@ -3,7 +3,6 @@ RAG Query Handler.
 Handles queries against the knowledge base with context-aware responses.
 """
 
-import asyncio
 import uuid
 from typing import Any, List, Dict, Optional, Tuple
 
@@ -11,6 +10,7 @@ from rag.identity import is_canonical_reference_point, is_eligible_private_candi
 from rag.index import get_vector_index
 from rag.loader import document_loader
 from services import text_llm
+from utils.helpers import await_worker, submit_worker
 from utils.logging import logger
 from config import RAG_TOP_K
 
@@ -445,19 +445,26 @@ async def query_knowledge_base(
         # blocking (network + local vector search) — run it off the event
         # loop so one RAG query doesn't stall unrelated Telegram updates.
         #
-        # Stage 1E.1 cancellation review: deliberately left as a plain
-        # `asyncio.to_thread()` (no shielding). If the caller is cancelled
-        # while this is in flight, the worker thread may keep running to
-        # completion, but it is read-only (never mutates UserSession, the
-        # Qdrant store, or any file) and its result is simply discarded —
-        # there is no cleanup/ownership race to resolve, unlike the
-        # document-upload storage/indexing writes.
-        results = await asyncio.to_thread(
+        # Stage 1E.1 cancellation review: the worker thread is read-only
+        # (never mutates UserSession, the Qdrant store, or any file), so a
+        # cancelled caller has no result/cleanup-ownership race to resolve
+        # — that business-level reasoning is unchanged. Stage 7A-3
+        # unified-runtime corrective pass: offloaded via
+        # utils.helpers.submit_worker()/await_worker() rather than a plain
+        # `asyncio.to_thread()` regardless, because this touches the SAME
+        # shared Qdrant/DB catalog service_main.py's close_resources()
+        # disposes on shutdown — a cancelled Task awaiting plain
+        # asyncio.to_thread() does not stop or await this thread, so it
+        # could still be reading Qdrant/the DB catalog after that dispose
+        # begins. submit_worker()/await_worker() makes this coroutine's own
+        # Task unable to settle until the worker genuinely has (see
+        # db/engine.py's own docstring for the full rationale).
+        results = await await_worker(submit_worker(
             _validated_similarity_search,
             query,
             requesting_user_uuid,
             RAG_TOP_K,
-        )
+        ))
         logger.debug("RAG similarity_search | results_count=%s", len(results))
         if not results:
             logger.warning("RAG: no results, using fallback")
@@ -489,7 +496,8 @@ async def query_knowledge_base(
         # independent config.TEXT_GENERATION_TIMEOUT_SECONDS-bounded call)
         # and could turn a genuine provider-availability problem into a
         # late "success" that masks it entirely. Retrieval itself
-        # (asyncio.to_thread(_validated_similarity_search, ...) above)
+        # (submit_worker()/await_worker()-wrapped _validated_similarity_
+        # search(...) above)
         # never raises this exception type, so this clause is unambiguous
         # about which stage failed.
         raise
