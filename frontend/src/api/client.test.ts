@@ -15,6 +15,7 @@ import {
 } from "../test/http";
 import {
   ApiError,
+  DEFAULT_TIMEOUT_MS,
   FORBIDDEN_ERROR_DETAIL,
   GENERIC_ERROR_DETAIL,
   MAX_RESPONSE_BYTES,
@@ -25,6 +26,7 @@ import {
   UNAUTHORIZED_ERROR_DETAIL,
   UNEXPECTED_RESPONSE_DETAIL,
   apiGetJson,
+  apiSendJson,
   apiSendNoContent,
   isUnauthorized,
   setUnauthorizedHandler,
@@ -942,6 +944,259 @@ describe("central 401 handler", () => {
     });
 
     await failureOf(apiGetJson("/api/settings"));
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("apiSendJson (JSON request body)", () => {
+  const PAYLOAD = { message: "hello — héllo 🎉", history: [{ role: "user", content: "earlier" }] };
+
+  it("POSTs the serialized payload with JSON content type through the shared request path", async () => {
+    document.cookie = "csrf_token=dev-token; Path=/";
+    const { calls } = mockFetch(() => jsonResponse(200, { text: "ok" }));
+
+    await apiSendJson("POST", "/api/chat", PAYLOAD, 200);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("/api/chat");
+    expect(calls[0]?.init.method).toBe("POST");
+    expect(calls[0]?.init.body).toBe(JSON.stringify(PAYLOAD));
+    expect(calls[0]?.init.credentials).toBe("same-origin");
+    expect(calls[0]?.init.cache).toBe("no-store");
+    expect(calls[0]?.headers.get("content-type")).toBe("application/json");
+    expect(calls[0]?.headers.get("accept")).toBe("application/json");
+    expect(calls[0]?.headers.get("x-csrf-token")).toBe("dev-token");
+    // Nothing beyond those three request headers, and no identity of any kind.
+    expect([...(calls[0]?.headers.keys() ?? [])].sort()).toEqual(["accept", "content-type", "x-csrf-token"]);
+    expect(calls[0]?.url).not.toContain("?");
+  });
+
+  it("serializes the payload exactly once and sends that very string", async () => {
+    const stringify = vi.spyOn(JSON, "stringify");
+    const { calls } = mockFetch(() => jsonResponse(200, { text: "ok" }));
+
+    await apiSendJson("POST", "/api/chat", PAYLOAD, 200);
+
+    expect(stringify.mock.calls.filter(([value]) => value === PAYLOAD)).toHaveLength(1);
+    expect(calls[0]?.init.body).toBe(JSON.stringify(PAYLOAD));
+  });
+
+  it("re-reads the CSRF cookie for every call", async () => {
+    const { calls } = mockFetch(() => jsonResponse(200, {}));
+
+    document.cookie = "csrf_token=first; Path=/";
+    await apiSendJson("POST", "/api/chat", PAYLOAD, 200);
+    document.cookie = "csrf_token=second; Path=/";
+    await apiSendJson("POST", "/api/chat", PAYLOAD, 200);
+
+    expect(calls.map((call) => call.headers.get("x-csrf-token"))).toEqual(["first", "second"]);
+  });
+
+  it("sends no CSRF header when the cookie is absent, leaving the verdict to the server", async () => {
+    const { calls } = mockFetch(() => jsonResponse(403, { detail: "CSRF validation failed" }));
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+
+    expect(calls[0]?.headers.has("x-csrf-token")).toBe(false);
+    expect(error.status).toBe(403);
+  });
+
+  it.each(["https://evil.example/api/chat", "//evil.example/api/chat", "api/chat", "/\\evil.example", "/api/chat\n"])(
+    "refuses non same-origin or unsafe path %j without calling fetch",
+    async (path) => {
+      const { fetchMock } = mockFetch(() => jsonResponse(200, {}));
+
+      await expect(apiSendJson("POST", path, PAYLOAD, 200)).rejects.toThrow("same-origin");
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["undefined", undefined],
+    ["a function", () => 1],
+  ])("refuses a payload that has no JSON form (%s) without calling fetch", async (_label, payload) => {
+    const { fetchMock } = mockFetch(() => jsonResponse(200, {}));
+
+    await expect(apiSendJson("POST", "/api/chat", payload, 200)).rejects.toThrow(TypeError);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns the parsed JSON of a response with the expected status", async () => {
+    mockFetch(() => jsonResponse(200, { text: "hi" }));
+    await expect(apiSendJson("POST", "/api/chat", PAYLOAD, 200)).resolves.toEqual({ text: "hi" });
+
+    mockFetch(() => jsonResponse(201, { id: 1 }));
+    await expect(apiSendJson("POST", "/api/things", PAYLOAD, 201)).resolves.toEqual({ id: 1 });
+  });
+
+  it.each([
+    ["a 204 with no body", 204, 200],
+    ["a different 2xx", 202, 200],
+    ["a 200 when 201 was expected", 200, 201],
+  ])("does not accept %s as success and never reads its body", async (_label, status, expected) => {
+    const { response, stats } =
+      status === 204 ? { response: noContentResponse(), stats: null } : streamedResponse(status, ['{"text":"x"}']);
+    mockFetch(() => response);
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, expected));
+
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+    expect(stats?.pulls ?? 0).toBe(0);
+  });
+
+  it.each([400, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504])(
+    "maps HTTP %i to its fixed message and never reads the error body",
+    async (status) => {
+      const { response, stats } = streamedResponse(status, [JSON.stringify({ detail: SENSITIVE_DETAILS[0] })], {
+        "content-type": "application/json",
+      });
+      mockFetch(() => response);
+
+      const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+
+      const fixed = new Map<number, string>([
+        [401, UNAUTHORIZED_ERROR_DETAIL],
+        [403, FORBIDDEN_ERROR_DETAIL],
+        [429, RATE_LIMITED_ERROR_DETAIL],
+      ]).get(status);
+      expect(error.status).toBe(status);
+      expect(error.detail).toBe(fixed ?? (status >= 500 ? SERVER_ERROR_DETAIL : GENERIC_ERROR_DETAIL));
+      expect(error.detail).not.toContain(SENSITIVE_DETAILS[0]);
+      expect(stats.pulls).toBe(0);
+      await vi.waitFor(() => expect(stats.cancelled).toBe(true));
+    },
+  );
+
+  it.each([
+    ["malformed JSON", () => textResponse(200, "{not json", "application/json")],
+    ["an empty body", () => new Response("", { status: 200 })],
+    ["a body-less response", () => new Response(null, { status: 200 })],
+    ["an HTML page", () => textResponse(200, "<!doctype html><html></html>", "text/html")],
+    ["bytes that are not UTF-8", () => new Response(rawBytes('{"text":"', [0xff], '"}'), { status: 200 })],
+  ])("treats %s on the expected status as an unexpected response", async (_label, build) => {
+    mockFetch(build);
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+
+    expect(error.status).toBe(200);
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+  });
+
+  it("keeps the 64 KiB response bound: an oversized success body is refused after limit + 1 bytes and cancelled", async () => {
+    const { response, stats } = streamedResponse(200, chunked(jsonOfBytes(1024 * KIB), KIB));
+    mockFetch(() => response);
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+    expect(stats.bytesPulled).toBe(MAX_RESPONSE_BYTES + 1);
+    expectEveryReadBounded(stats);
+    await expectCancelledAndIdle(stats);
+  });
+
+  it("forwards caller cancellation to fetch and rethrows the abort, not an ApiError", async () => {
+    const gate = deferred<Response>();
+    const { calls } = mockFetch((call) => {
+      call.init.signal?.addEventListener("abort", () => gate.reject(new DOMException("aborted", "AbortError")));
+      return gate.promise;
+    });
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    const controller = new AbortController();
+
+    const pending = apiSendJson("POST", "/api/chat", PAYLOAD, 200, { signal: controller.signal });
+    expect(calls[0]?.init.signal?.aborted).toBe(false);
+    controller.abort();
+
+    const error: unknown = await pending.catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ name: "AbortError" });
+    expect(calls[0]?.init.signal?.aborted).toBe(true);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("cancels a stalled success body when the caller aborts", async () => {
+    const { response, stats } = stalledResponse();
+    mockFetch(() => response);
+    const controller = new AbortController();
+
+    const pending = apiSendJson("POST", "/api/chat", PAYLOAD, 200, { signal: controller.signal });
+    await vi.waitFor(() => expect(stats.pulls).toBe(2));
+    controller.abort();
+
+    const error: unknown = await pending.catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(ApiError);
+    await expectCancelledAndIdle(stats);
+  });
+
+  it("uses the generic 15 s timeout unless the caller sets one, and honours a caller-set timeout", async () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(15_000);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    mockFetch(() => jsonResponse(200, {}));
+
+    await apiSendJson("POST", "/api/x", PAYLOAD, 200);
+    await apiSendJson("POST", "/api/x", PAYLOAD, 200, { timeoutMs: 100_000 });
+    await apiGetJson("/api/x");
+
+    expect(timeout.mock.calls.map(([ms]) => ms)).toEqual([15_000, 100_000, 15_000]);
+  });
+
+  it("times out a hung request as a status-0 error", async () => {
+    mockFetch(
+      (call) =>
+        new Promise<Response>((_resolve, reject) => {
+          call.init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+    );
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200, { timeoutMs: 20 }));
+
+    expect(error.status).toBe(0);
+    expect(error.detail).toBe(TIMEOUT_ERROR_DETAIL);
+  });
+
+  it("normalizes a network failure and calls fetch exactly once (no retry)", async () => {
+    const { fetchMock } = mockFetch(() => {
+      throw new TypeError("Failed to fetch https://internal.example/secret");
+    });
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+
+    expect(error.status).toBe(0);
+    expect(error.detail).toBe(NETWORK_ERROR_DETAIL);
+    expect(error.message).not.toContain("internal.example");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls fetch exactly once for a failing HTTP response (no retry)", async () => {
+    const { fetchMock } = mockFetch(() => jsonResponse(503, { detail: "down" }));
+
+    await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the central 401 handler once and still rejects with the ApiError", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch(() => jsonResponse(401, { detail: "Not authenticated" }));
+
+    const error = await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(isUnauthorized(error)).toBe(true);
+  });
+
+  it.each([403, 422, 429, 500, 504])("does not run the 401 handler for HTTP %i", async (status) => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch(() => jsonResponse(status, { detail: "nope" }));
+
+    await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
 
     expect(handler).not.toHaveBeenCalled();
   });

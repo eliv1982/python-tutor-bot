@@ -1,5 +1,6 @@
 import type { CurrentUser } from "../api/types";
 import type { LogoutState } from "../auth/AuthContext";
+import { ChatPanel } from "./ChatPanel";
 
 function formatMemberSince(createdAt: string): string | null {
   const date = new Date(createdAt);
@@ -47,6 +48,7 @@ export function AuthenticatedShell({ user, logoutState, onLogout }: Authenticate
             <dd>{user.telegram_linked ? "Linked" : "Not linked"}</dd>
           </div>
         </dl>
+        <ChatPanel />
       </main>
     </div>
   );

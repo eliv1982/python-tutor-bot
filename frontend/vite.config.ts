@@ -33,6 +33,10 @@ export default defineConfig({
     environmentOptions: { jsdom: { url: "https://app.test/" } },
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
+    // Vitest replaces every stylesheet, `?raw` imports included, with an empty
+    // string. app.css alone is kept so ChatPanel.test.tsx can guard the rules
+    // that keep untrusted chat text literal and wrapped.
+    css: { include: [/styles\/app\.css/] },
     restoreMocks: true,
     unstubGlobals: true,
   },

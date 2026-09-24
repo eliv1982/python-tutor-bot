@@ -15,6 +15,10 @@
  * - A success body is read through a BYOB reader, each read capped to the
  *   room left under 64 KiB (plus one byte to detect overflow), and decoded as
  *   strict UTF-8.
+ * - A JSON request body (`apiSendJson`) is serialized once, sent with
+ *   `Content-Type: application/json` through the same `send` as everything
+ *   else, and its response is read only when it carries the one status the
+ *   caller expects.
  */
 import { CSRF_HEADER_NAME, readCsrfToken } from "./csrf";
 
@@ -202,22 +206,31 @@ function parseJson(text: string): unknown {
 interface RawResponse {
   status: number;
   /**
-   * The bounded text of a 2xx response when the caller asked for it; null
-   * when that body was oversized, not a readable byte stream, or not valid
-   * UTF-8; "" otherwise. Error-response bodies are never read.
+   * The bounded text of a 2xx response whose status the caller asked to read;
+   * null when that body was oversized, not a readable byte stream, or not
+   * valid UTF-8; "" otherwise. Error-response bodies are never read.
    */
   body: string | null;
 }
 
+/**
+ * `readBodyFor` names the statuses whose body is read; it is only ever
+ * consulted for 2xx responses, so an error body is unreachable by design.
+ * `jsonBody` is an already-serialized JSON document (mutations only).
+ */
 async function send(
   method: "GET" | MutatingMethod,
   path: string,
   { signal, timeoutMs = DEFAULT_TIMEOUT_MS }: RequestOptions,
-  readSuccessBody: boolean,
+  readBodyFor: (status: number) => boolean,
+  jsonBody?: string,
 ): Promise<RawResponse> {
   assertSameOriginPath(path);
 
   const headers: Record<string, string> = { Accept: "application/json" };
+  if (jsonBody !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
   if (method !== "GET") {
     // Re-read on every mutation; sent only when the cookie exists so the
     // backend itself decides between 401 (no session) and 403 (bad CSRF).
@@ -245,6 +258,7 @@ async function send(
       credentials: "same-origin",
       cache: "no-store",
       signal: combinedSignal,
+      ...(jsonBody === undefined ? {} : { body: jsonBody }),
     });
   } catch (error) {
     return failure(error);
@@ -254,7 +268,7 @@ async function send(
     unauthorizedHandler?.();
   }
 
-  if (!readSuccessBody || !isSuccess(response.status)) {
+  if (!isSuccess(response.status) || !readBodyFor(response.status)) {
     discardBody(response);
     return { status: response.status, body: "" };
   }
@@ -272,7 +286,7 @@ function isSuccess(status: number): boolean {
 
 /** GET a JSON document. An empty, non-JSON, oversized, or non-2xx response is an ApiError. */
 export async function apiGetJson(path: string, options: RequestOptions = {}): Promise<unknown> {
-  const { status, body } = await send("GET", path, options, true);
+  const { status, body } = await send("GET", path, options, isSuccess);
   if (!isSuccess(status)) {
     throw new ApiError(status, publicDetail(status));
   }
@@ -294,9 +308,42 @@ export async function apiSendNoContent(
   path: string,
   options: RequestOptions = {},
 ): Promise<void> {
-  const { status } = await send(method, path, options, false);
+  const { status } = await send(method, path, options, () => false);
   if (status === 204) {
     return;
   }
   throw new ApiError(status, isSuccess(status) ? UNEXPECTED_RESPONSE_DETAIL : publicDetail(status));
+}
+
+/**
+ * State-changing request with a JSON request body and a JSON response body.
+ *
+ * `payload` is serialized exactly once, here. Only `expectedStatus` counts as
+ * success, and only a response with that status has its body read (bounded and
+ * strict UTF-8, like every success body); any other 2xx is an unexpected
+ * response whose body is never consumed, and a non-2xx body is never read at
+ * all. An empty, non-JSON, or oversized success body is an unexpected
+ * response. Whether the parsed value has the right shape is the caller's call.
+ * Nothing is retried, so a mutation is never sent twice on its own.
+ */
+export async function apiSendJson(
+  method: MutatingMethod,
+  path: string,
+  payload: unknown,
+  expectedStatus: number,
+  options: RequestOptions = {},
+): Promise<unknown> {
+  const jsonBody = JSON.stringify(payload) as string | undefined;
+  if (jsonBody === undefined) {
+    throw new TypeError("apiSendJson needs a JSON-serializable payload");
+  }
+  const { status, body } = await send(method, path, options, (received) => received === expectedStatus, jsonBody);
+  if (!isSuccess(status)) {
+    throw new ApiError(status, publicDetail(status));
+  }
+  const parsed = status !== expectedStatus || body === null || body === "" ? undefined : parseJson(body);
+  if (parsed === undefined) {
+    throw new ApiError(status, UNEXPECTED_RESPONSE_DETAIL);
+  }
+  return parsed;
 }
