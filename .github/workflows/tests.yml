@@ -69,3 +69,38 @@ jobs:
 
       - name: Run tests (offline-enforced; PostgreSQL required, never silently skipped)
         run: python -m pytest
+
+  # Stage 7B-1: the React/TypeScript frontend (frontend/). Independent of
+  # the Python job above — no PostgreSQL, no provider access, no network
+  # beyond the npm registry for `npm ci`. Tests never call a real backend
+  # or provider (fetch is stubbed).
+  frontend:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies (exact, from the committed lockfile)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build

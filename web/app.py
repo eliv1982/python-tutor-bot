@@ -90,6 +90,12 @@ valid authenticated state-changing request; whoever adds CORS here must
 preserve that invariant explicitly, not merely default `allow_credentials`
 to true alongside a wide `allow_origins`.
 
+Stage 7B-1: web.frontend serves the compiled React build (frontend/dist)
+from this same process and origin — `/` and `/assets/...` only, no SPA
+catch-all — so production stays same-origin and still needs no CORS.
+create_app() never touches frontend/dist itself (it is looked up per
+request), so a missing build never breaks construction or the test suite.
+
 Stage 7A-2: web.body_limit.RequestBodyLimitMiddleware caps the ACTUAL
 request body of the small mutating JSON routes (POST /api/chat, PATCH
 /api/settings — and only those) at web_config.MAX_JSON_BODY_BYTES, before
@@ -110,6 +116,7 @@ from fastapi.responses import JSONResponse
 import web_config
 from config import MAX_DOCUMENT_SIZE_BYTES
 from web.body_limit import RequestBodyLimitMiddleware
+from web.frontend import router as frontend_router
 from web.github_oauth import router as github_oauth_router
 from web.routes import INVALID_REQUEST_DETAIL, router
 
@@ -222,4 +229,8 @@ def create_app(*, owns_db_lifecycle: bool = True) -> FastAPI:
     )
     app.include_router(router)
     app.include_router(github_oauth_router)
+    # Registered LAST and only ever two exact GET routes ("/" and
+    # "/assets/{path}") — never a catch-all, so it cannot shadow any API
+    # route. See web/frontend.py.
+    app.include_router(frontend_router)
     return app

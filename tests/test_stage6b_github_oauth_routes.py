@@ -116,7 +116,9 @@ def test_full_successful_login_flow(monkeypatch):
     )
 
     assert callback_response.status_code == 302
-    assert callback_response.headers["location"] == "/api/me"
+    # Stage 7B-1: the fixed post-login destination is now the React
+    # application root (was "/api/me" while no frontend existed).
+    assert callback_response.headers["location"] == "/"
     assert len(token_calls) == 1
     assert len(user_calls) == 1
 

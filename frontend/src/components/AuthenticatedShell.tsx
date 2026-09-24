@@ -1,0 +1,53 @@
+import type { CurrentUser } from "../api/types";
+import type { LogoutState } from "../auth/AuthContext";
+
+function formatMemberSince(createdAt: string): string | null {
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "long" }).format(date);
+}
+
+interface AuthenticatedShellProps {
+  user: CurrentUser;
+  logoutState: LogoutState;
+  onLogout: () => void;
+}
+
+/** The signed-in shell. The canonical user id is intentionally never shown. */
+export function AuthenticatedShell({ user, logoutState, onLogout }: AuthenticatedShellProps) {
+  const memberSince = formatMemberSince(user.created_at);
+
+  return (
+    <div className="shell">
+      <header className="shell-header">
+        <span className="brand">Python Tutor</span>
+        <button type="button" className="button button-secondary" onClick={onLogout} disabled={logoutState.pending}>
+          {logoutState.pending ? "Signing out…" : "Sign out"}
+        </button>
+      </header>
+      <main className="shell-main">
+        <h1>You’re signed in</h1>
+        {logoutState.error !== null && (
+          <div className="notice notice-error" role="alert">
+            <p>We couldn’t confirm that you were signed out, so you’re still signed in here. Please try again.</p>
+            <p className="muted">{logoutState.error.detail}</p>
+          </div>
+        )}
+        <dl className="facts">
+          {memberSince !== null && (
+            <div>
+              <dt>Member since</dt>
+              <dd>{memberSince}</dd>
+            </div>
+          )}
+          <div>
+            <dt>Telegram</dt>
+            <dd>{user.telegram_linked ? "Linked" : "Not linked"}</dd>
+          </div>
+        </dl>
+      </main>
+    </div>
+  );
+}

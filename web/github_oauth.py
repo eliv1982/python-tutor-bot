@@ -150,8 +150,11 @@ _OAUTH_STATE_COOKIE_BASENAME = "github_oauth_state"
 
 # Fixed, same-origin, constant post-login destination (Section 14: "Do NOT
 # implement arbitrary user-controlled post-login redirects. No open
-# redirect."). Never derived from any request input.
-_POST_LOGIN_REDIRECT_PATH = "/api/me"
+# redirect."). Never derived from any request input. Stage 7B-1: the React
+# application root (web/frontend.py serves it; the frontend then restores
+# the signed-in state from GET /api/me) — was "/api/me" while no frontend
+# existed.
+_POST_LOGIN_REDIRECT_PATH = "/"
 
 # Applied to EVERY callback response, success or failure alike (Stage 6B
 # independent-audit corrective pass #1, MAJOR 1 item 4 / this module's own

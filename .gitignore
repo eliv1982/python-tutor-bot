@@ -56,6 +56,15 @@ data/*.png
 *.wav
 *.mp3
 
+# Frontend (Stage 7B-1): dependencies and generated build output — never
+# committed. frontend/package-lock.json IS tracked (reproducible `npm ci`).
+node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.vite/
+frontend/*.tsbuildinfo
+npm-debug.log*
+
 # Logs
 *.log
 

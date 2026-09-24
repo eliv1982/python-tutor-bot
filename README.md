@@ -22,7 +22,8 @@
 Про совместный запуск Telegram-бота и web-адаптера в одном процессе
 (`service_main.py`) — обязательный вариант, как только появятся
 Qdrant-зависимые web-маршруты документов/поиска — см. раздел «Единый
-процесс: Telegram + web (Stage 7A-3)» ниже.
+процесс: Telegram + web (Stage 7A-3)» ниже. Про web-интерфейс (React,
+Node 24 LTS) — раздел «Web-фронтенд (Stage 7B-1)» ниже.
 
 ---
 
@@ -364,6 +365,92 @@ Telegram-поллинг (тот же `AsyncTeleBot` из `bot.py`, тот же `
   при обновлении любой из них нужно заново сверить `service_main.py` с
   новой установленной реализацией.
 
+### Web-фронтенд (Stage 7B-1)
+
+Каталог `frontend/` — минимальное React + TypeScript (Vite) приложение
+поверх уже существующего backend-контракта: экран входа через GitHub,
+восстановление сессии из `GET /api/me`, простая «оболочка» вошедшего
+пользователя и выход (`POST /api/logout`). Чата, настроек, документов и
+остального в этой стадии нет. Фронтенд не дублирует логику идентичности,
+сессии или CSRF — каноническая личность приходит только из серверной сессии
+(HttpOnly cookie, которую JavaScript не читает и не хранит); внутренний UUID
+пользователя в интерфейсе не показывается.
+
+**Требования:** Node.js 24 LTS и npm (проверено на Node 24 / npm 11).
+
+```
+cd frontend
+npm ci              # ставит ровно то, что зафиксировано в package-lock.json
+npm run lint
+npm run typecheck
+npm test
+npm run build       # -> frontend/dist (в репозиторий не коммитится)
+```
+
+#### Локальная разработка (два процесса)
+
+1. В `.env` для локальной разработки (только так cookie без `Secure`
+   допускаются — см. `web_config.py`):
+   ```
+   WEB_ENV=development
+   WEB_COOKIE_SECURE=false
+   GITHUB_REDIRECT_URI=http://127.0.0.1:5173/api/auth/github/callback
+   ```
+   В настройках **dev**-OAuth-приложения GitHub «Authorization callback URL»
+   должен быть точно таким же. Callback URL — это origin Vite, а не backend:
+   браузер работает только с ним, а `/api/...` проксируется дальше.
+2. Backend: `python web_main.py` (или `python service_main.py`) — слушает
+   `127.0.0.1:8000`.
+3. Frontend: `cd frontend && npm run dev`, затем откройте
+   **`http://127.0.0.1:5173`** (именно `127.0.0.1`, не `localhost`: cookie и
+   зарегистрированный callback URL привязаны к хосту).
+
+- Vite проксирует `/api` и `/healthz` на `http://127.0.0.1:8000`
+  (`frontend/vite.config.ts`). Для браузера всё остаётся одним origin, поэтому
+  CORS не нужен и **не добавляется**. Если backend слушает другой порт
+  (`WEB_PORT`), поправьте `BACKEND_ORIGIN` в `frontend/vite.config.ts`.
+- Порт Vite зафиксирован (`5173`, `strictPort`) — иначе callback URL перестал
+  бы совпадать с зарегистрированным.
+- Вход: кнопка «Sign in with GitHub» — обычная ссылка (полная навигация
+  браузера) на `/api/auth/github/login`, не AJAX: `state`, PKCE и cookie
+  привязки по-прежнему целиком на стороне backend. После успешного входа
+  callback редиректит на фиксированный путь `/` (без `next`/`return_to`).
+- Cookie: в разработке — `session` и `csrf_token` без `Secure`; в production —
+  `__Host-session` и `__Host-csrf_token` с `Secure`, `Path=/`, без `Domain`.
+  Фронтенд читает только CSRF-cookie (сначала `__Host-csrf_token`, затем
+  `csrf_token`) и перед **каждым** изменяющим запросом заново отправляет её
+  значение в заголовке `X-CSRF-Token`; нигде не сохраняет и не логирует.
+- Фронтенд ничего не хранит в `localStorage`/`sessionStorage`/IndexedDB и не
+  пишет cookie. Не включайте логирование запросов dev-прокси: callback
+  содержит `code`/`state` (требования выше остаются в силе).
+
+#### Production: тот же процесс, тот же origin
+
+Отдельного web-сервера или контейнера для фронтенда нет: собранное
+приложение раздаёт тот же FastAPI-процесс (`python service_main.py` /
+`web_main.py`, `web/frontend.py`).
+
+```
+cd frontend && npm ci && npm run build   # до запуска процесса
+```
+
+- `GET /` → `frontend/dist/index.html` (`Cache-Control: no-store`).
+- `GET /assets/...` → только обычные файлы строго внутри
+  `frontend/dist/assets` (проверка по полностью разрешённому пути: `..`,
+  симлинки и абсолютные пути не выводят за каталог), с
+  `Cache-Control: public, max-age=31536000, immutable` — безопасно, потому что
+  имена файлов Vite содержат хеш содержимого.
+- Никакого SPA catch-all: любой другой путь, включая опечатку в `/api/...`,
+  остаётся обычным 404; `/api/*` и `/healthz` никогда не перехватываются.
+  Исходники фронтенда, репозиторий, `data/` и загрузки не раздаются.
+- Если `frontend/dist` не собран, `/` и `/assets/...` отвечают 404 (в лог
+  пишется предупреждение) — импорт, создание приложения и тесты backend от
+  сборки не зависят.
+- Production остаётся same-origin: CORS не настраивается. Cookie — только
+  `Secure`/`__Host-` (`WEB_ENV=production` и `WEB_COOKIE_SECURE=true` —
+  значения по умолчанию); TLS терминируется на reverse proxy, который по
+  требованиям выше не должен логировать `code`/`state` callback-а.
+
 ## Режимы
 
 | Команда        | Описание |
@@ -449,9 +536,10 @@ Telegram-поллинг (тот же `AsyncTeleBot` из `bot.py`, тот же `
 - `config.py` — настройки, пути, режимы (без Telegram-credential — см. `telegram_config.py`)
 - `telegram_config.py` — валидация `TELEGRAM_BOT_TOKEN`, импортируется только Telegram-адаптером (`bot.py`)
 - `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры; резолвят внутренний UUID сразу после проверки доступа)
-- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) + `POST /api/chat`/`GET`/`PATCH /api/settings` и body_limit (64 KiB-лимит тела этих запросов, Stage 7A-2) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
+- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) + `POST /api/chat`/`GET`/`PATCH /api/settings` и body_limit (64 KiB-лимит тела этих запросов, Stage 7A-2) + frontend (раздача собранного React-приложения `frontend/dist`: только `/` и `/assets/...`, Stage 7B-1) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
 - `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв, включая GitHub-race-safe выпуск — Stage 6A/6C), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B), text_chat (stateless текстовое ядро, Stage 7A-1), preferences (чтение/запись durable-режима для web без `user_sessions`, Stage 7A-2), telegram_link (генерация/хеширование bearer-секрета связывания, старт/redemption/отвязка — Stage 6C; сырой секрет никогда не покидает этот модуль и `web/routes.py`/`handlers/start.py`)
 - `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID, проверка наличия Telegram-привязки), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, включая race-safe GitHub-выпуск сессии — Stage 6A/6C), github_identity (race-safe резолв/создание пользователя по GitHub id, Stage 6B), oauth_transactions (короткоживущая одноразовая OAuth-транзакция + database-authoritative admission control/rate limit, Stage 6B), telegram_link (создание/redemption/отвязка попытки связывания под скорректированным порядком блокировок — Stage 6C)
+- `frontend/` — React + TypeScript (Vite) web-приложение: экран входа, восстановление сессии из `/api/me`, выход (Stage 7B-1); `npm ci`/`npm run build` — см. «Web-фронтенд (Stage 7B-1)» выше; `frontend/dist` не коммитится
 - `github_oauth_config.py` — настройки только для GitHub-логина (`GITHUB_CLIENT_ID`/`SECRET`/`REDIRECT_URI` и др., Stage 6B), не требуется для Telegram-бота
 - `telegram_link_config.py` — настройки только для связывания Telegram/GitHub (`TELEGRAM_BOT_USERNAME` и др., Stage 6C); никогда не импортирует `TELEGRAM_BOT_TOKEN`; отсутствие/некорректность значения не ломает запуск web-адаптера
 - `alembic/`, `alembic.ini` — миграции схемы PostgreSQL (`alembic upgrade head`)
