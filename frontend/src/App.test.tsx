@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -52,15 +52,27 @@ async function settle<T>(gate: { promise: Promise<T>; resolve: (value: T) => voi
   });
 }
 
-/** Routes /api/me and /api/logout; every other request is a test bug and answers 599. */
+/**
+ * An authenticated request unrelated to any feature, for tests of the central
+ * 401 handling: the signed-in shell already reads `/api/settings` on its own.
+ */
+const LATER_REQUEST_PATH = "/api/later-request";
+
+/**
+ * Routes /api/me, /api/logout and /api/settings (the signed-in shell reads it
+ * on mount; the default is the text mode); every other request is a test bug
+ * and answers 599.
+ */
 function backend(overrides: {
   me?: (call: RecordedCall) => Response | Promise<Response>;
   logout?: (call: RecordedCall) => Response | Promise<Response>;
+  settings?: (call: RecordedCall) => Response | Promise<Response>;
   other?: (call: RecordedCall) => Response | Promise<Response>;
 }) {
   return mockFetch((call) => {
     if (call.url === "/api/me" && overrides.me) return overrides.me(call);
     if (call.url === "/api/logout" && overrides.logout) return overrides.logout(call);
+    if (call.url === "/api/settings") return (overrides.settings ?? (() => jsonResponse(200, { mode: "text" })))(call);
     if (overrides.other) return overrides.other(call);
     return jsonResponse(599, { detail: `unexpected request ${call.url}` });
   });
@@ -238,7 +250,8 @@ describe("session bootstrap", () => {
 
     await settle(gate, jsonResponse(200, SAMPLE_USER));
     await screen.findByRole("heading", { name: "You’re signed in" });
-    expect(calls).toHaveLength(2);
+    // Session checks only: the signed-in shell reads /api/settings on its own.
+    expect(calls.filter((call) => call.url === "/api/me")).toHaveLength(2);
   });
 
   it("can fail again after a retry and stays in the error state without looping", async () => {
@@ -301,7 +314,7 @@ describe("central 401 handling", () => {
     await signedInApp({ other: () => jsonResponse(401, { detail: "Not authenticated" }) });
 
     await act(async () => {
-      await apiGetJson("/api/settings").catch(() => undefined);
+      await apiGetJson(LATER_REQUEST_PATH).catch(() => undefined);
     });
 
     expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
@@ -313,7 +326,7 @@ describe("central 401 handling", () => {
     await signedInApp({ other: networkDown });
 
     await act(async () => {
-      await apiGetJson("/api/settings").catch(() => undefined);
+      await apiGetJson(LATER_REQUEST_PATH).catch(() => undefined);
     });
 
     expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
@@ -324,7 +337,7 @@ describe("central 401 handling", () => {
     await signedInApp({ other: () => jsonResponse(status, { detail: "nope" }) });
 
     await act(async () => {
-      await apiGetJson("/api/settings").catch(() => undefined);
+      await apiGetJson(LATER_REQUEST_PATH).catch(() => undefined);
     });
 
     expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
@@ -339,7 +352,7 @@ describe("central 401 handling", () => {
     await screen.findByRole("heading", { name: "You’re signed in" });
     view.unmount();
 
-    await expect(apiGetJson("/api/settings")).rejects.toMatchObject({ status: 401 });
+    await expect(apiGetJson(LATER_REQUEST_PATH)).rejects.toMatchObject({ status: 401 });
   });
 });
 
@@ -453,7 +466,7 @@ describe("account linking integration", () => {
       },
       other: (call) => {
         if (call.url === "/api/link/telegram/start") return jsonResponse(200, ACCOUNT_LINK_RESPONSE);
-        if (call.url === "/api/settings") return jsonResponse(401, { detail: "session ended" });
+        if (call.url === LATER_REQUEST_PATH) return jsonResponse(401, { detail: "session ended" });
         return jsonResponse(599, {});
       },
     });
@@ -462,7 +475,7 @@ describe("account linking integration", () => {
     await user.click(await screen.findByRole("button", { name: "Check link status" }));
 
     await act(async () => {
-      await apiGetJson("/api/settings").catch(() => undefined);
+      await apiGetJson(LATER_REQUEST_PATH).catch(() => undefined);
     });
     expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
 
@@ -494,6 +507,183 @@ describe("account linking integration", () => {
     expect(screen.getByRole("button", { name: "Disconnect GitHub web access" }).hasAttribute("disabled")).toBe(true);
     await settle(gate, noContentResponse());
     expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+  });
+});
+
+describe("settings integration", () => {
+  const settingsRegion = () => screen.getByRole("region", { name: "Settings" });
+  const settingsSelect = () =>
+    within(settingsRegion()).getByRole<HTMLSelectElement>("combobox", { name: "Preferred mode" });
+  const settingsSave = () =>
+    within(settingsRegion()).getByRole<HTMLButtonElement>("button", { name: /^(Save|Saving…)$/ });
+  const settingsLoaded = () => waitFor(() => expect(settingsSelect().disabled).toBe(false));
+  const chatAndLinking = (call: RecordedCall) => {
+    if (call.url === "/api/chat") return jsonResponse(200, { text: "Use a list comprehension." });
+    if (call.url === "/api/link/telegram/start") return jsonResponse(200, ACCOUNT_LINK_RESPONSE);
+    return jsonResponse(599, {});
+  };
+
+  it("is shown only while authenticated, with the server's effective mode", async () => {
+    backend({ me: () => jsonResponse(401, { detail: "Not authenticated" }) });
+    const anonymous = renderApp();
+    await screen.findByRole("link", { name: "Sign in with GitHub" });
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    anonymous.unmount();
+
+    backend({ me: networkDown });
+    const failed = renderApp();
+    await screen.findByRole("button", { name: "Try again" });
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    failed.unmount();
+
+    const user = userEvent.setup();
+    const { calls } = await signedInApp({
+      settings: () => jsonResponse(200, { mode: "rag" }),
+      logout: () => noContentResponse(),
+    });
+    await settingsLoaded();
+    expect(settingsSelect().value).toBe("rag");
+    expect(calls.filter((call) => call.url === "/api/settings").map((call) => call.init.method)).toEqual(["GET"]);
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("sits between the account connections and the chat as an independent sibling", async () => {
+    await signedInApp();
+
+    const account = screen.getByRole("heading", { name: "Account connections" });
+    const settings = screen.getByRole("heading", { name: "Settings" });
+    const chat = screen.getByRole("heading", { name: "Ask the tutor" });
+    expect(account.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(settings.compareDocumentPosition(chat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(settingsRegion()).queryByRole("log")).toBeNull();
+    expect(within(settingsRegion()).queryByRole("button", { name: /link telegram|disconnect/i })).toBeNull();
+  });
+
+  it("ends the authenticated shell through the central handler when the Settings request is a 401", async () => {
+    backend({ me: () => jsonResponse(200, SAMPLE_USER), settings: () => jsonResponse(401, { detail: "session ended" }) });
+
+    renderApp();
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "You’re signed in" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.body.textContent).not.toContain("session ended");
+  });
+
+  it("ends the authenticated shell when a save is rejected as unauthorized, without a local error", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      settings: (call) =>
+        call.init.method === "PATCH" ? jsonResponse(401, { detail: "session ended" }) : jsonResponse(200, { mode: "text" }),
+    });
+    await settingsLoaded();
+
+    await user.selectOptions(settingsSelect(), "voice");
+    await user.click(settingsSave());
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("does not let a late Settings answer bring the shell back after sign-out, and cancels the read", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    const { calls } = await signedInApp({ settings: () => gate.promise, logout: () => noContentResponse() });
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+
+    expect(calls.find((call) => call.url === "/api/settings")?.init.signal?.aborted).toBe(true);
+    await settle(gate, jsonResponse(200, { mode: "rag" }));
+    expect(screen.getByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "You’re signed in" })).toBeNull();
+  });
+
+  it("disables the Settings controls while sign-out is pending", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    await signedInApp({ logout: () => gate.promise });
+    await settingsLoaded();
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(settingsSelect().disabled).toBe(true);
+    expect(settingsSave().disabled).toBe(true);
+    await settle(gate, noContentResponse());
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+  });
+
+  it("leaves Settings usable while an account operation is pending", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    await signedInApp({ other: (call) => (call.url === "/api/link/telegram/start" ? gate.promise : jsonResponse(599, {})) });
+    await settingsLoaded();
+
+    await user.click(screen.getByRole("button", { name: "Link Telegram" }));
+
+    expect(screen.getByRole("button", { name: "Disconnect GitHub web access" }).hasAttribute("disabled")).toBe(true);
+    expect(settingsSelect().disabled).toBe(false);
+    expect(settingsSave().disabled).toBe(false);
+    await settle(gate, jsonResponse(200, ACCOUNT_LINK_RESPONSE));
+  });
+
+  it("keeps chat and account linking working, and a saved mode never reaches the chat request", async () => {
+    document.cookie = "csrf_token=dev-csrf; Path=/";
+    const user = userEvent.setup();
+    const { calls } = await signedInApp({
+      settings: (call) =>
+        call.init.method === "PATCH" ? jsonResponse(200, { mode: "vision" }) : jsonResponse(200, { mode: "text" }),
+      other: chatAndLinking,
+    });
+    await settingsLoaded();
+
+    await user.selectOptions(settingsSelect(), "vision");
+    await user.click(settingsSave());
+    await screen.findByText("Preference saved.");
+    await user.click(screen.getByRole("textbox", { name: "Your message" }));
+    await user.paste("How do I square numbers?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await within(screen.getByRole("log", { name: "Conversation" })).findByText("Use a list comprehension.");
+    await user.click(screen.getByRole("button", { name: "Link Telegram" }));
+
+    expect(await screen.findByRole("link", { name: "Open Telegram" })).toBeTruthy();
+    const chat = calls.filter((call) => call.url === "/api/chat");
+    expect(chat).toHaveLength(1);
+    expect(JSON.parse(chat[0]?.init.body as string)).toEqual({ message: "How do I square numbers?", history: [] });
+    expect(chat[0]?.init.body).not.toMatch(/mode|vision/);
+    expect(calls.filter((call) => call.init.method === "PATCH").map((call) => call.init.body)).toEqual(['{"mode":"vision"}']);
+    expect(settingsSelect().value).toBe("vision");
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+  });
+
+  it("keeps the rest of the shell usable, and hides the backend detail, when Settings cannot load", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      settings: () => jsonResponse(503, { detail: SENSITIVE_DETAILS[0] }),
+      other: chatAndLinking,
+    });
+
+    const alert = await within(settingsRegion()).findByRole("alert");
+    expect(alert.textContent).toContain(SERVER_ERROR_DETAIL);
+    expect(document.documentElement.outerHTML).not.toContain(SENSITIVE_DETAILS[0]);
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Sign out" }).disabled).toBe(false);
+
+    await user.click(screen.getByRole("textbox", { name: "Your message" }));
+    await user.paste("hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await within(screen.getByRole("log", { name: "Conversation" })).findByText("Use a list comprehension.");
+    await user.click(screen.getByRole("button", { name: "Link Telegram" }));
+    expect(await screen.findByRole("link", { name: "Open Telegram" })).toBeTruthy();
   });
 });
 

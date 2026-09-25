@@ -31,6 +31,27 @@ export interface UnlinkGithubResponse {
   status: "ok";
 }
 
+/**
+ * The canonical tutor modes of `/api/settings`. Only these exact strings are
+ * ever accepted from, or sent to, the server. This is the web settings
+ * contract in full: it is mode only (no voice, no user id, no other field).
+ */
+export const TUTOR_MODES = ["text", "voice", "vision", "rag"] as const;
+
+export type TutorMode = (typeof TUTOR_MODES)[number];
+
+const TUTOR_MODE_SET: ReadonlySet<string> = new Set(TUTOR_MODES);
+
+/** Exact, case-sensitive membership: no trimming, folding, or aliases. */
+export function isTutorMode(value: unknown): value is TutorMode {
+  return typeof value === "string" && TUTOR_MODE_SET.has(value);
+}
+
+/** `GET`/`PATCH /api/settings` success body: the effective (GET) or persisted (PATCH) mode. */
+export interface SettingsResponse {
+  mode: TutorMode;
+}
+
 /** One prior turn of a `POST /api/chat` request. `system` is never a client-suppliable role. */
 export interface ChatHistoryMessage {
   role: "user" | "assistant";

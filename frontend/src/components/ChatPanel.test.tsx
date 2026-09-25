@@ -91,6 +91,7 @@ async function renderSignedInApp(chat: Handler) {
   const harness = mockFetch((call) => {
     if (call.url === "/api/me") return jsonResponse(200, SAMPLE_USER);
     if (call.url === "/api/logout") return noContentResponse();
+    if (call.url === "/api/settings") return jsonResponse(200, { mode: "text" });
     if (call.url === "/api/chat") return chat(call, harness.calls.filter((c) => c.url === "/api/chat").length - 1);
     return jsonResponse(599, { detail: `unexpected request ${call.url}` });
   });
@@ -931,6 +932,7 @@ describe("in the signed-in application", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(harness.calls.map((call) => `${call.init.method} ${call.url}`)).toEqual([
       "GET /api/me",
+      "GET /api/settings",
       "POST /api/chat",
       "POST /api/chat",
     ]);
