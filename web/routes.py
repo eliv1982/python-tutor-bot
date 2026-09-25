@@ -194,7 +194,11 @@ async def link_telegram_start(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="No active GitHub account to link"
         )
-    return LinkTelegramStartResponse(deep_link=result.deep_link, expires_at=result.expires_at)
+    return LinkTelegramStartResponse(
+        deep_link=result.deep_link,
+        bot_path=telegram_link_config.telegram_bot_path(),
+        expires_at=result.expires_at,
+    )
 
 
 @router.post(

@@ -27,6 +27,7 @@ import {
   UNEXPECTED_RESPONSE_DETAIL,
   apiGetJson,
   apiSendJson,
+  apiSendJsonNoBody,
   apiSendNoContent,
   isUnauthorized,
   setUnauthorizedHandler,
@@ -1199,5 +1200,67 @@ describe("apiSendJson (JSON request body)", () => {
     await failureOf(apiSendJson("POST", "/api/chat", PAYLOAD, 200));
 
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("apiSendJsonNoBody (bodyless mutation with JSON response)", () => {
+  it("POSTs without a body or content type while preserving the shared transport", async () => {
+    document.cookie = "csrf_token=dev-token; Path=/";
+    const { calls } = mockFetch(() => jsonResponse(200, { status: "ok" }));
+
+    await expect(apiSendJsonNoBody("POST", "/api/unlink/github", 200)).resolves.toEqual({ status: "ok" });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("/api/unlink/github");
+    expect(calls[0]?.init.method).toBe("POST");
+    expect(calls[0]?.init.body).toBeUndefined();
+    expect(calls[0]?.headers.has("content-type")).toBe(false);
+    expect(calls[0]?.headers.get("accept")).toBe("application/json");
+    expect(calls[0]?.headers.get("x-csrf-token")).toBe("dev-token");
+    expect(calls[0]?.init.credentials).toBe("same-origin");
+    expect(calls[0]?.init.cache).toBe("no-store");
+  });
+
+  it("re-reads CSRF and sends exactly one request per call", async () => {
+    const { calls, fetchMock } = mockFetch(() => jsonResponse(200, { status: "ok" }));
+    document.cookie = "csrf_token=first; Path=/";
+    await apiSendJsonNoBody("POST", "/api/unlink/github", 200);
+    document.cookie = "csrf_token=second; Path=/";
+    await apiSendJsonNoBody("POST", "/api/unlink/github", 200);
+
+    expect(calls.map((call) => call.headers.get("x-csrf-token"))).toEqual(["first", "second"]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([204, 201])("rejects unexpected success status %i without accepting its body", async (status) => {
+    mockFetch(() => (status === 204 ? noContentResponse() : jsonResponse(status, { status: "ok" })));
+    const error = await failureOf(apiSendJsonNoBody("POST", "/api/unlink/github", 200));
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+  });
+
+  it("runs central 401 handling and never exposes the backend body", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch(() => jsonResponse(401, { detail: SENSITIVE_DETAILS[0] }));
+
+    const error = await failureOf(apiSendJsonNoBody("POST", "/api/unlink/github", 200));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(error.detail).toBe(UNAUTHORIZED_ERROR_DETAIL);
+    expect(error.message).not.toContain(SENSITIVE_DETAILS[0]);
+  });
+
+  it("forwards caller cancellation", async () => {
+    const gate = deferred<Response>();
+    const { calls } = mockFetch((call) => {
+      call.init.signal?.addEventListener("abort", () => gate.reject(new DOMException("aborted", "AbortError")));
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const pending = apiSendJsonNoBody("POST", "/api/unlink/github", 200, { signal: controller.signal });
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(calls[0]?.init.signal?.aborted).toBe(true);
   });
 });

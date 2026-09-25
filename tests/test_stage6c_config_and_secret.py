@@ -115,11 +115,14 @@ def test_telegram_deep_link_raises_when_username_unavailable(monkeypatch):
     monkeypatch.setattr(telegram_link_config, "TELEGRAM_BOT_USERNAME", None)
     with pytest.raises(RuntimeError):
         telegram_link_config.telegram_deep_link("secret")
+    with pytest.raises(RuntimeError):
+        telegram_link_config.telegram_bot_path()
 
 
 def test_telegram_deep_link_shape(monkeypatch):
     monkeypatch.setattr(telegram_link_config, "TELEGRAM_BOT_USERNAME", "my_tutor_bot")
     link = telegram_link_config.telegram_deep_link("abc123")
+    assert telegram_link_config.telegram_bot_path() == "/my_tutor_bot"
     assert link == "https://t.me/my_tutor_bot?start=link_abc123"
 
 

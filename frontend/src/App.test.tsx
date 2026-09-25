@@ -27,6 +27,14 @@ import {
   type RecordedCall,
 } from "./test/http";
 
+const ACCOUNT_BOT_PATH = "/my_tutor_bot";
+const ACCOUNT_SECRET = "A".repeat(43);
+const ACCOUNT_LINK_RESPONSE = {
+  deep_link: `https://t.me${ACCOUNT_BOT_PATH}?start=link_${ACCOUNT_SECRET}`,
+  bot_path: ACCOUNT_BOT_PATH,
+  expires_at: "2026-09-25T12:00:00Z",
+};
+
 function renderApp(extra?: React.ReactNode) {
   return render(
     <AuthProvider>
@@ -332,6 +340,160 @@ describe("central 401 handling", () => {
     view.unmount();
 
     await expect(apiGetJson("/api/settings")).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe("account linking integration", () => {
+  it("stays authenticated and keeps the issued link after a manual false status", async () => {
+    const user = userEvent.setup();
+    let meCount = 0;
+    backend({
+      me: () => {
+        meCount += 1;
+        return jsonResponse(200, SAMPLE_USER);
+      },
+      other: (call) =>
+        call.url === "/api/link/telegram/start" ? jsonResponse(200, ACCOUNT_LINK_RESPONSE) : jsonResponse(599, {}),
+    });
+    renderApp();
+
+    await user.click(await screen.findByRole("button", { name: "Link Telegram" }));
+    await user.click(await screen.findByRole("button", { name: "Check link status" }));
+
+    expect(await screen.findByText(/not linked yet/i)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open Telegram" }).getAttribute("href")).toBe(
+      ACCOUNT_LINK_RESPONSE.deep_link,
+    );
+    expect(meCount).toBe(2);
+  });
+
+  it("updates the authenticated shell and clears the issued link after a manual true status", async () => {
+    const user = userEvent.setup();
+    let meCount = 0;
+    backend({
+      me: () => {
+        meCount += 1;
+        return jsonResponse(200, { ...SAMPLE_USER, telegram_linked: meCount > 1 });
+      },
+      other: (call) =>
+        call.url === "/api/link/telegram/start" ? jsonResponse(200, ACCOUNT_LINK_RESPONSE) : jsonResponse(599, {}),
+    });
+    renderApp();
+
+    await user.click(await screen.findByRole("button", { name: "Link Telegram" }));
+    await user.click(await screen.findByRole("button", { name: "Check link status" }));
+
+    expect(await screen.findByText("Linked")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Open Telegram" })).toBeNull();
+    expect(document.documentElement.outerHTML).not.toContain(ACCOUNT_SECRET);
+  });
+
+  it("treats a manual-status 401 after merge as signed out and drops the secret-bearing UI", async () => {
+    const user = userEvent.setup();
+    let meCount = 0;
+    backend({
+      me: () => {
+        meCount += 1;
+        return meCount === 1 ? jsonResponse(200, SAMPLE_USER) : jsonResponse(401, { detail: "merged" });
+      },
+      other: (call) =>
+        call.url === "/api/link/telegram/start" ? jsonResponse(200, ACCOUNT_LINK_RESPONSE) : jsonResponse(599, {}),
+    });
+    renderApp();
+
+    await user.click(await screen.findByRole("button", { name: "Link Telegram" }));
+    await user.click(await screen.findByRole("button", { name: "Check link status" }));
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(document.documentElement.outerHTML).not.toContain(ACCOUNT_SECRET);
+    expect(screen.queryByRole("log")).toBeNull();
+  });
+
+  it("ends the signed-in application after confirmed GitHub disconnection", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      other: (call) =>
+        call.url === "/api/unlink/github" ? jsonResponse(200, { status: "ok" }) : jsonResponse(599, {}),
+    });
+
+    await user.click(screen.getByRole("button", { name: "Disconnect GitHub web access" }));
+    await user.click(screen.getByRole("button", { name: "Confirm disconnect" }));
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Account connections" })).toBeNull();
+    expect(screen.queryByRole("log")).toBeNull();
+  });
+
+  it("keeps the authenticated application and hides backend detail when GitHub disconnection is refused", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      other: (call) =>
+        call.url === "/api/unlink/github"
+          ? jsonResponse(409, { detail: SENSITIVE_DETAILS[0] })
+          : jsonResponse(599, {}),
+    });
+
+    await user.click(screen.getByRole("button", { name: "Disconnect GitHub web access" }));
+    await user.click(screen.getByRole("button", { name: "Confirm disconnect" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("session are unchanged");
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+    expect(document.documentElement.outerHTML).not.toContain(SENSITIVE_DETAILS[0]);
+  });
+
+  it("does not let a late successful status response resurrect an anonymous session", async () => {
+    const user = userEvent.setup();
+    const statusGate = deferred<Response>();
+    let meCount = 0;
+    backend({
+      me: () => {
+        meCount += 1;
+        return meCount === 1 ? jsonResponse(200, SAMPLE_USER) : statusGate.promise;
+      },
+      other: (call) => {
+        if (call.url === "/api/link/telegram/start") return jsonResponse(200, ACCOUNT_LINK_RESPONSE);
+        if (call.url === "/api/settings") return jsonResponse(401, { detail: "session ended" });
+        return jsonResponse(599, {});
+      },
+    });
+    renderApp();
+    await user.click(await screen.findByRole("button", { name: "Link Telegram" }));
+    await user.click(await screen.findByRole("button", { name: "Check link status" }));
+
+    await act(async () => {
+      await apiGetJson("/api/settings").catch(() => undefined);
+    });
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+
+    await settle(statusGate, jsonResponse(200, { ...SAMPLE_USER, telegram_linked: true }));
+    expect(screen.getByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByText("Linked")).toBeNull();
+  });
+
+  it("disables sign out while an account mutation is pending", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    await signedInApp({ other: (call) => (call.url === "/api/link/telegram/start" ? gate.promise : jsonResponse(599, {})) });
+
+    await user.click(screen.getByRole("button", { name: "Link Telegram" }));
+
+    expect(screen.getByRole("button", { name: "Sign out" }).hasAttribute("disabled")).toBe(true);
+    await settle(gate, jsonResponse(200, ACCOUNT_LINK_RESPONSE));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Sign out" }).hasAttribute("disabled")).toBe(false));
+  });
+
+  it("disables account operations while sign out is pending", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    await signedInApp({ logout: () => gate.promise });
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(screen.getByRole("button", { name: "Link Telegram" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Disconnect GitHub web access" }).hasAttribute("disabled")).toBe(true);
+    await settle(gate, noContentResponse());
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
   });
 });
 

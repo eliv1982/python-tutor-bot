@@ -1,6 +1,6 @@
 import { createContext, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { ApiError, isUnauthorized, setUnauthorizedHandler, toApiError } from "../api/client";
+import { ApiError, isUnauthorized, setUnauthorizedHandler, toApiError, type RequestOptions } from "../api/client";
 import { fetchCurrentUser, requestLogout } from "../api/session";
 import type { CurrentUser } from "../api/types";
 
@@ -27,6 +27,10 @@ export interface AuthContextValue {
   logoutState: LogoutState;
   /** Re-runs the session check after a verification error. One request per call. */
   retryVerification: () => void;
+  /** Fresh authenticated GET /api/me that updates the current user without replacing the shell with a loader. */
+  refreshCurrentUser: (options?: RequestOptions) => Promise<CurrentUser>;
+  /** Drops all authenticated UI after a server-confirmed session-ending account operation. */
+  finishAuthenticatedSession: () => void;
   /** POST /api/logout. Becomes anonymous only after the server confirms the revocation. */
   logout: () => void;
 }
@@ -99,6 +103,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     startVerification();
   }, [startVerification]);
 
+  const refreshCurrentUser = useCallback(async (options: RequestOptions = {}) => {
+    const user = await fetchCurrentUser(options);
+    // A late successful read must never revive a session that another
+    // request has already moved to anonymous/error/unknown.
+    setState((current) => (current.status === "authenticated" ? { status: "authenticated", user } : current));
+    return user;
+  }, []);
+
   const logout = useCallback(() => {
     if (logoutInFlight.current) {
       return;
@@ -124,8 +136,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [enterAnonymous]);
 
   const value = useMemo<AuthContextValue>(
-    () => ({ state, logoutState, retryVerification, logout }),
-    [state, logoutState, retryVerification, logout],
+    () => ({
+      state,
+      logoutState,
+      retryVerification,
+      refreshCurrentUser,
+      finishAuthenticatedSession: enterAnonymous,
+      logout,
+    }),
+    [state, logoutState, retryVerification, refreshCurrentUser, enterAnonymous, logout],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

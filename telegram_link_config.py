@@ -120,6 +120,15 @@ else:
         )
 
 
+def telegram_bot_path() -> str:
+    """The exact, normalized Telegram bot path exposed alongside a deep
+    link so a browser can validate the destination without maintaining a
+    second bot-username configuration source."""
+    if TELEGRAM_BOT_USERNAME is None:
+        raise RuntimeError("TELEGRAM_BOT_USERNAME is not configured — cannot build a Telegram bot path")
+    return f"/{TELEGRAM_BOT_USERNAME}"
+
+
 def telegram_deep_link(secret: str) -> str:
     """Builds the `https://t.me/<bot_username>?start=link_<secret>` deep
     link — the ONE place this URL shape is constructed, so
@@ -127,6 +136,4 @@ def telegram_deep_link(secret: str) -> str:
     TELEGRAM_BOT_USERNAME is unavailable — callers must check
     `TELEGRAM_BOT_USERNAME is not None` (or catch this) before calling, and
     the web route translates that into a generic 503, never a raw 500."""
-    if TELEGRAM_BOT_USERNAME is None:
-        raise RuntimeError("TELEGRAM_BOT_USERNAME is not configured — cannot build a Telegram deep link")
-    return f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=link_{secret}"
+    return f"https://t.me{telegram_bot_path()}?start=link_{secret}"

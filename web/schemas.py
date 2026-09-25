@@ -36,6 +36,10 @@ class LinkTelegramStartResponse(BaseModel):
     `Cache-Control: no-store` on this route)."""
 
     deep_link: str
+    # Exact backend-configured bot path. The frontend validates the
+    # secret-bearing deep_link against this value instead of carrying an
+    # independent bot username that could drift from backend configuration.
+    bot_path: str
     expires_at: datetime
 
 

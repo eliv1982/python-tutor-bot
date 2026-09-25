@@ -92,7 +92,10 @@ async def test_valid_session_and_csrf_succeeds():
 
     assert response.status_code == 200
     body = response.json()
+    assert set(body) == {"deep_link", "bot_path", "expires_at"}
+    assert body["bot_path"] == "/my_tutor_bot"
     assert body["deep_link"].startswith("https://t.me/my_tutor_bot?start=link_")
+    assert body["deep_link"].split("?", 1)[0].removeprefix("https://t.me") == body["bot_path"]
     assert "expires_at" in body
 
 

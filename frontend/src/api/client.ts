@@ -315,6 +315,32 @@ export async function apiSendNoContent(
   throw new ApiError(status, isSuccess(status) ? UNEXPECTED_RESPONSE_DETAIL : publicDetail(status));
 }
 
+function expectedJsonResponse({ status, body }: RawResponse, expectedStatus: number): unknown {
+  if (!isSuccess(status)) {
+    throw new ApiError(status, publicDetail(status));
+  }
+  const parsed = status !== expectedStatus || body === null || body === "" ? undefined : parseJson(body);
+  if (parsed === undefined) {
+    throw new ApiError(status, UNEXPECTED_RESPONSE_DETAIL);
+  }
+  return parsed;
+}
+
+/**
+ * State-changing request with no request body and a JSON response body.
+ * Used by bodyless authenticated commands whose confirmation is JSON rather
+ * than 204. It deliberately sends neither `body` nor `Content-Type`.
+ */
+export async function apiSendJsonNoBody(
+  method: MutatingMethod,
+  path: string,
+  expectedStatus: number,
+  options: RequestOptions = {},
+): Promise<unknown> {
+  const response = await send(method, path, options, (received) => received === expectedStatus);
+  return expectedJsonResponse(response, expectedStatus);
+}
+
 /**
  * State-changing request with a JSON request body and a JSON response body.
  *
@@ -337,13 +363,6 @@ export async function apiSendJson(
   if (jsonBody === undefined) {
     throw new TypeError("apiSendJson needs a JSON-serializable payload");
   }
-  const { status, body } = await send(method, path, options, (received) => received === expectedStatus, jsonBody);
-  if (!isSuccess(status)) {
-    throw new ApiError(status, publicDetail(status));
-  }
-  const parsed = status !== expectedStatus || body === null || body === "" ? undefined : parseJson(body);
-  if (parsed === undefined) {
-    throw new ApiError(status, UNEXPECTED_RESPONSE_DETAIL);
-  }
-  return parsed;
+  const response = await send(method, path, options, (received) => received === expectedStatus, jsonBody);
+  return expectedJsonResponse(response, expectedStatus);
 }

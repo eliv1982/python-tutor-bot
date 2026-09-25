@@ -19,6 +19,18 @@ export function isCurrentUser(value: unknown): value is CurrentUser {
   );
 }
 
+/** POST /api/link/telegram/start success body. */
+export interface TelegramLinkStartResponse {
+  deep_link: string;
+  bot_path: string;
+  expires_at: string;
+}
+
+/** POST /api/unlink/github success body. */
+export interface UnlinkGithubResponse {
+  status: "ok";
+}
+
 /** One prior turn of a `POST /api/chat` request. `system` is never a client-suppliable role. */
 export interface ChatHistoryMessage {
   role: "user" | "assistant";

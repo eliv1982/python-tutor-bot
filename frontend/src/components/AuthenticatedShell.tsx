@@ -1,5 +1,8 @@
+import { useState } from "react";
+
 import type { CurrentUser } from "../api/types";
 import type { LogoutState } from "../auth/AuthContext";
+import { AccountLinkingPanel } from "./AccountLinkingPanel";
 import { ChatPanel } from "./ChatPanel";
 
 function formatMemberSince(createdAt: string): string | null {
@@ -19,12 +22,18 @@ interface AuthenticatedShellProps {
 /** The signed-in shell. The canonical user id is intentionally never shown. */
 export function AuthenticatedShell({ user, logoutState, onLogout }: AuthenticatedShellProps) {
   const memberSince = formatMemberSince(user.created_at);
+  const [accountOperationPending, setAccountOperationPending] = useState(false);
 
   return (
     <div className="shell">
       <header className="shell-header">
         <span className="brand">Python Tutor</span>
-        <button type="button" className="button button-secondary" onClick={onLogout} disabled={logoutState.pending}>
+        <button
+          type="button"
+          className="button button-secondary"
+          onClick={onLogout}
+          disabled={logoutState.pending || accountOperationPending}
+        >
           {logoutState.pending ? "Signing out…" : "Sign out"}
         </button>
       </header>
@@ -43,11 +52,12 @@ export function AuthenticatedShell({ user, logoutState, onLogout }: Authenticate
               <dd>{memberSince}</dd>
             </div>
           )}
-          <div>
-            <dt>Telegram</dt>
-            <dd>{user.telegram_linked ? "Linked" : "Not linked"}</dd>
-          </div>
         </dl>
+        <AccountLinkingPanel
+          user={user}
+          disabled={logoutState.pending}
+          onOperationPendingChange={setAccountOperationPending}
+        />
         <ChatPanel />
       </main>
     </div>
