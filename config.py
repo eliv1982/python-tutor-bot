@@ -111,7 +111,17 @@ class BotMode:
     # of sync with this class's own attributes.
     ALL = (TEXT, VOICE, VISION, RAG)
 
+# BOT_MODE is the EFFECTIVE default mode (Stage 7B-3P): what a user with no
+# stored mode (no user_preferences row, or a row whose mode is NULL) gets, on
+# Telegram and the web settings API alike (see app/preferences.py). It is never
+# written to the database to "initialize" a user. Validated against the
+# canonical BotMode.ALL allowlist here, at the configuration boundary, so an
+# unsupported value fails deterministically at import/startup — same fail-fast
+# posture as LLM_PROVIDER above — instead of surfacing later as a runtime
+# effective mode no handler recognizes.
 DEFAULT_MODE = os.getenv("BOT_MODE", BotMode.TEXT)
+if DEFAULT_MODE not in BotMode.ALL:
+    raise ValueError(f"BOT_MODE must be one of {BotMode.ALL!r}, got {DEFAULT_MODE!r}")
 
 # Voice Configuration
 class VoiceType:
@@ -121,8 +131,17 @@ class VoiceType:
     FABLE = "fable"      # Male (British)
     ONYX = "onyx"        # Male (Deep)
     SHIMMER = "shimmer"  # Female (Warm)
+    # The single canonical allowlist of every supported voice (same role as
+    # BotMode.ALL): the Telegram /voice command, services/tts.py and the
+    # DEFAULT_VOICE check below all validate against this ONE tuple.
+    ALL = (ALLOY, ECHO, NOVA, FABLE, ONYX, SHIMMER)
 
+# DEFAULT_VOICE is the EFFECTIVE default voice (Stage 7B-3P): what a user with
+# no stored voice gets. Like BOT_MODE it is never persisted by /start, and an
+# unsupported value fails at import/startup rather than reaching TTS.
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", VoiceType.ALLOY)
+if DEFAULT_VOICE not in VoiceType.ALL:
+    raise ValueError(f"DEFAULT_VOICE must be one of {VoiceType.ALL!r}, got {DEFAULT_VOICE!r}")
 
 # OpenAI Models
 GPT_MODEL = "gpt-4o"

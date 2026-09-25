@@ -74,6 +74,17 @@ os.environ["GITHUB_REDIRECT_URI"] = "https://testserver.example/api/auth/github/
 # path explicitly, per-test, via monkeypatch — see that file.
 os.environ["LLM_PROVIDER"] = "openai"
 
+# Stage 7B-3P: BOT_MODE / DEFAULT_VOICE are effective defaults that
+# config.py validates at import and every preference read falls back to. Pin
+# them so a developer's local .env (or ambient environment) can neither change
+# what "no stored preference" means for the whole suite nor — now that an
+# unsupported value fails config loading outright — break every import.
+# Tests that need another configured default set it explicitly (monkeypatch
+# of config.DEFAULT_MODE/DEFAULT_VOICE, or a fresh interpreter's environment
+# for the real config-loading cases).
+os.environ["BOT_MODE"] = "text"
+os.environ["DEFAULT_VOICE"] = "alloy"
+
 # --- Stage 1F-B remediation: localhost-proxy bypass (Codex finding) -------
 #
 # pytest.ini enforces `--disable-socket --allow-hosts=127.0.0.1,::1`. The

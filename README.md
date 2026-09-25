@@ -241,16 +241,54 @@ cron/воркера и даже при нескольких процессах w
   GitHub-привязка (`github_accounts`) переносится на Telegram UUID;
   все web-сессии и сама строка попытки связывания GitHub-стороны
   удаляются; пустой (identity-only) `users`-ряд GitHub-стороны удаляется.
-  Владение документами/настройками/данными в Qdrant НИКОГДА не
-  переписывается — они физически принадлежат Telegram UUID с самого
-  начала, поэтому никакого переноса не требуется.
+  Владение документами/данными в Qdrant НИКОГДА не переписывается — они
+  физически принадлежат Telegram UUID с самого начала, поэтому никакого
+  переноса не требуется. **Единственное исключение — настройки
+  (`user_preferences`, Stage 7B-3P):** `PATCH /api/settings` создаёт такую
+  строку у любого web-пользователя, и одна лишь сохранённая настройка не
+  должна навсегда блокировать связывание.
+  - **Значения по умолчанию — эффективные, а не сохранённые.** `BOT_MODE`
+    (режим) и `DEFAULT_VOICE` (голос) применяются при чтении, когда у
+    пользователя нет сохранённого значения: нет строки, либо `mode`/`voice`
+    равен NULL (нераспознанный сохранённый `mode` тоже читается как
+    `BOT_MODE`, но при чтении не переписывается). Единый резолвер —
+    `app/preferences.py` — используют и Telegram
+    (`UserSession.get_mode/get_voice`), и `GET /api/settings` (он по-прежнему
+    ничего не пишет), поэтому они всегда согласованы. `/start` НЕ создаёт и
+    НЕ обновляет `user_preferences` (раньше он записывал `BOT_MODE` — этого
+    больше нет): строка появляется, только когда пользователь что-то выбрал
+    (`/mode`, `/voice`, `PATCH /api/settings`) либо когда она перенесена при
+    слиянии. `BOT_MODE`/`DEFAULT_VOICE` проверяются при загрузке
+    конфигурации (`config.py`): неподдерживаемое значение — ошибка запуска, а
+    не некорректное состояние в базе.
+  - **Классификация строки при слиянии.** Ø — строки нет; D — строка,
+    эквивалентная умолчанию (её удаление не меняет наблюдаемое поведение);
+    M — существенная. Строка существенна, если
+    `voice IS NOT NULL ИЛИ mode NOT IN (NULL, текущий BOT_MODE)`;
+    `updated_at` никогда не учитывается. Значит `(NULL, NULL)` и
+    `(BOT_MODE, NULL)` — D; неосновной каноничный `mode`, любой непустой
+    `voice` (даже равный `DEFAULT_VOICE`) и нераспознанный `mode` — M.
+    Принятый компромисс: явный выбор текущего режима по умолчанию и
+    историческая автоматическая запись старого `/start` неразличимы, оба —
+    D; если `BOT_MODE` позже изменится, старая строка (`mode=text`) станет M
+    и молча не удаляется.
+  - **Матрица** (источник — GitHub/web, цель — Telegram): Ø/Ø, Ø/D, D/Ø,
+    D/D → слияние, строк настроек не остаётся; Ø/M, D/M → слияние, строка
+    цели без изменений (D источника отбрасывается); M/Ø → слияние, вся
+    строка источника (`mode`, `voice`, `updated_at`) переносится на цель;
+    M/D → строка D цели удаляется, затем вся строка источника переносится;
+    M/M → общее отклонение, обе строки без изменений (победитель не
+    выбирается, поля не смешиваются, попытка расходуется как при любом
+    детерминированном отказе). Документы по-прежнему жёсткий блокер и
+    проверяются РАНЬШЕ настроек.
 - **Отклонение** (общая формулировка в Telegram, без деталей — исключает
   перебор состояния): диплинк недействителен/истёк/уже использован;
   Telegram-аккаунт уже связан с ДРУГИМ GitHub-аккаунтом; GitHub-сторона
   уже связана с ДРУГИМ Telegram-аккаунтом; GitHub-привязка исчезла
   (отвязана параллельно); GitHub-сторона не «чистый» identity-аккаунт
-  (несёт собственные документы/настройки — слияние было бы неоднозначным
-  и данные должны остаться доступными, а не молча потеряться).
+  (несёт собственные документы — слияние было бы неоднозначным и данные
+  должны остаться доступными, а не молча потеряться); у ОБЕИХ сторон
+  существенные настройки (M/M — ни одна не выбирается молча).
 - **`POST /api/unlink/github`** (валидная сессия + CSRF) отвязывает
   GitHub от текущего канонического пользователя:
   - если у пользователя есть Telegram-привязка — GitHub-привязка
@@ -270,10 +308,23 @@ cron/воркера и даже при нескольких процессах w
   advisory-блокировки) → `github_accounts` (при нескольких строках — с
   явным `ORDER BY`) → `users` → policy/admission-синглтон, когда требуется
   (`web_session_policy` при выпуске сессии; `github_oauth_admission` при
-  успешной отвязке) → мутация строки `telegram_link_attempts` — ВСЕГДА
-  ПОСЛЕДНЕЙ и всегда одним атомарным оператором (`INSERT ... ON CONFLICT`/
-  `DELETE ... RETURNING`), никогда отдельным предварительным `SELECT ...
-  FOR UPDATE`; ни одна операция не блокирует `github_accounts`/`users`, а
+  успешной отвязке) → мутация строки `telegram_link_attempts` — ПОСЛЕДНИЙ
+  шаг иерархии блокировок (после неё не берётся ни одна блокировка из
+  предыдущих позиций) и всегда одним атомарным оператором (`INSERT ... ON
+  CONFLICT`/`DELETE ... RETURNING`), никогда отдельным предварительным
+  `SELECT ... FOR UPDATE`. Это последний шаг иерархии, а не последний
+  оператор транзакции: redemption берёт advisory-блокировку,
+  `github_accounts` и `users`, забирает (claim) попытку и уже ПОСЛЕ этого, в
+  той же транзакции и под уже удерживаемыми блокировками, выполняет
+  классификацию отказа, проверку документов, классификацию/нормализацию/перенос настроек
+  (Stage 7B-3P) и мутации слияния. Строки `user_preferences` всегда идут
+  ПОСЛЕ `users`: redemption переносит настройки под удерживаемыми
+  блокировками `users`, а `db/preferences.py` (`set_mode_sync`,
+  `set_voice_sync`) перед записью берёт
+  `FOR KEY SHARE` на строку владельца (иначе запись настроек Telegram-стороны
+  параллельно с redemption давала настоящий deadlock — воспроизведён и закрыт
+  тестом `tests/test_stage7b3p_preference_link_compat.py`). Ни одна операция не
+  блокирует `github_accounts`/`users`, а
   затем ждёт уже существующей строки `telegram_link_attempts` — см.
   `db/telegram_link.py`'s docstring и `tests/test_stage6c_lock_ordering.py`
   (реальный PostgreSQL, реальные потоки и детерминированное наблюдение
@@ -537,7 +588,7 @@ cd frontend && npm ci && npm run build   # до запуска процесса
 - `telegram_config.py` — валидация `TELEGRAM_BOT_TOKEN`, импортируется только Telegram-адаптером (`bot.py`)
 - `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры; резолвят внутренний UUID сразу после проверки доступа)
 - `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) + `POST /api/chat`/`GET`/`PATCH /api/settings` и body_limit (64 KiB-лимит тела этих запросов, Stage 7A-2) + frontend (раздача собранного React-приложения `frontend/dist`: только `/` и `/assets/...`, Stage 7B-1) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
-- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв, включая GitHub-race-safe выпуск — Stage 6A/6C), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B), text_chat (stateless текстовое ядро, Stage 7A-1), preferences (чтение/запись durable-режима для web без `user_sessions`, Stage 7A-2), telegram_link (генерация/хеширование bearer-секрета связывания, старт/redemption/отвязка — Stage 6C; сырой секрет никогда не покидает этот модуль и `web/routes.py`/`handlers/start.py`)
+- `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв, включая GitHub-race-safe выпуск — Stage 6A/6C), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B), text_chat (stateless текстовое ядро, Stage 7A-1), preferences (единый резолвер эффективных mode/voice для Telegram и web — значения по умолчанию из `BOT_MODE`/`DEFAULT_VOICE`, Stage 7B-3P — и запись durable-режима для web без `user_sessions`, Stage 7A-2), telegram_link (генерация/хеширование bearer-секрета связывания, старт/redemption/отвязка — Stage 6C; сырой секрет никогда не покидает этот модуль и `web/routes.py`/`handlers/start.py`)
 - `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID, проверка наличия Telegram-привязки), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, включая race-safe GitHub-выпуск сессии — Stage 6A/6C), github_identity (race-safe резолв/создание пользователя по GitHub id, Stage 6B), oauth_transactions (короткоживущая одноразовая OAuth-транзакция + database-authoritative admission control/rate limit, Stage 6B), telegram_link (создание/redemption/отвязка попытки связывания под скорректированным порядком блокировок — Stage 6C)
 - `frontend/` — React + TypeScript (Vite) web-приложение: экран входа, восстановление сессии из `/api/me`, выход (Stage 7B-1); `npm ci`/`npm run build` — см. «Web-фронтенд (Stage 7B-1)» выше; `frontend/dist` не коммитится
 - `github_oauth_config.py` — настройки только для GitHub-логина (`GITHUB_CLIENT_ID`/`SECRET`/`REDIRECT_URI` и др., Stage 6B), не требуется для Telegram-бота
@@ -566,7 +617,7 @@ Telegram-аккаунтов, настроек (mode/voice) и каталога �
 |---|---|
 | `users` | Канонический внутренний пользователь (`id UUID PK`) |
 | `telegram_accounts` | Привязка Telegram id → `users.id` (unique в обе стороны) |
-| `user_preferences` | `mode`/`voice` пользователя (durable) |
+| `user_preferences` | Сохранённая кастомизация `mode`/`voice` пользователя (durable); значения по умолчанию (`BOT_MODE`, `DEFAULT_VOICE`) в ней не хранятся — применяются при чтении |
 | `documents` | Каталог владения загруженными документами (`status`: pending/active) |
 | `web_sessions` | Серверные web-сессии (Stage 6A, `alembic/versions/0002_web_sessions.py`): `session_token_hash` (SHA-256 браузерного bearer-токена, PK) → `users.id`, `expires_at`, `revoked_at` |
 | `github_accounts` | Привязка числового GitHub id → `users.id` (Stage 6B, `alembic/versions/0003_github_oauth.py`), структурно как `telegram_accounts` |

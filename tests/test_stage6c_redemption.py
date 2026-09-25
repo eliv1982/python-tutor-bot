@@ -19,7 +19,7 @@ from telebot import types
 import app.telegram_link as telegram_link
 import db.github_identity as db_github_identity
 import db.identity as db_identity
-import db.preferences as db_preferences
+import db.documents as db_documents
 import db.telegram_link as db_telegram_link
 import handlers.start as start_handler
 import utils.access_control as access_control
@@ -35,6 +35,13 @@ from sqlalchemy.orm import Session
 def _default_fake_preferences():
     """Shadows conftest.py's same-named autouse fixture — this module
     needs REAL users/telegram_accounts/github_accounts rows throughout."""
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _default_fake_documents_catalog():
+    """Shadows conftest.py's in-memory documents fake — the ambiguous-merge
+    gate below must see a REAL `documents` row."""
     yield
 
 
@@ -174,8 +181,19 @@ def test_rejected_target_already_linked_elsewhere(postgres_db):
 
 
 def test_rejected_ambiguous_merge_when_source_has_domain_data(postgres_db):
+    """Documents are the domain data that still makes a merge ambiguous.
+    (Stage 7B-3P: a source's `user_preferences` row no longer does by
+    itself — see tests/test_stage7b3p_preference_link_compat.py for the
+    Ø/D/M preference matrix; only material-on-both-sides rejects.)"""
     source = _github_only_user()
-    db_preferences.set_mode_sync(source, "text")  # gives source a user_preferences row
+    document_id = uuid.uuid4()
+    db_documents.create_pending_sync(  # gives source an owned document row
+        document_id=document_id,
+        owner_user_id=source,
+        stored_name=f"{document_id.hex}.txt",
+        display_name="ambiguous-merge.txt",
+        content_sha256="0" * 64,
+    )
     telegram_id = _fresh_telegram_id()
     db_identity.resolve_or_create_user_by_telegram_id_sync(telegram_id)
 

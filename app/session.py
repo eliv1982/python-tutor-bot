@@ -48,6 +48,7 @@ import threading
 import uuid
 from typing import Optional
 
+import app.preferences as app_preferences
 import db.preferences as db_preferences
 from utils.helpers import await_worker, submit_worker
 
@@ -138,22 +139,27 @@ class UserSession:
                 del self.sessions[user_id]
 
     async def get_mode(self, user_id: uuid.UUID) -> str:
-        """Get current mode for a user (durable — PostgreSQL). Offloaded via
+        """Get the user's EFFECTIVE mode (durable — PostgreSQL): the stored
+        canonical mode, else the configured default (BOT_MODE) — for no row,
+        a NULL mode and a legacy/noncanonical mode alike. Never writes; the
+        resolution is app.preferences.resolve_effective_mode(), the same one
+        GET /api/settings uses. Offloaded via
         utils.helpers.submit_worker()/await_worker() — see db/engine.py's
         module docstring (Stage 7A-3 unified-runtime corrective pass) for
         why this is no longer a plain asyncio.to_thread()."""
         mode, _voice = await await_worker(submit_worker(db_preferences.get_preferences_sync, user_id))
-        return mode if mode is not None else "text"
+        return app_preferences.resolve_effective_mode(mode)
 
     async def set_mode(self, user_id: uuid.UUID, mode: str):
-        """Set mode for a user (durable — PostgreSQL)."""
+        """Set mode for a user (durable — PostgreSQL). An explicit user
+        selection — nothing else ever persists a mode (not even /start)."""
         await await_worker(submit_worker(db_preferences.set_mode_sync, user_id, mode))
 
     async def get_voice(self, user_id: uuid.UUID) -> str:
-        """Get current voice setting for a user (durable — PostgreSQL)."""
-        from config import DEFAULT_VOICE
+        """Get the user's EFFECTIVE voice (durable — PostgreSQL): the stored
+        canonical voice, else the configured DEFAULT_VOICE. Never writes."""
         _mode, voice = await await_worker(submit_worker(db_preferences.get_preferences_sync, user_id))
-        return voice if voice is not None else DEFAULT_VOICE
+        return app_preferences.resolve_effective_voice(voice)
 
     async def set_voice(self, user_id: uuid.UUID, voice: str):
         """Set voice for a user (durable — PostgreSQL)."""

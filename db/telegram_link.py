@@ -35,16 +35,32 @@ module):
        transaction.
     3. The relevant `users` row(s), locked/revalidated, ordered by `id`
        when more than one is locked in the same transaction.
+       3b. `user_preferences` rows (Stage 7B-3P; redemption's preference
+       transfer only) — never locked directly; touched only AFTER position
+       3, so they are always reached under the users-row locks already
+       held. The other direction is enforced in db.preferences: its
+       writers (set_mode_sync, set_voice_sync) take `FOR KEY SHARE` on the
+       owning `users` row BEFORE writing, so `users` -> `user_preferences`
+       is the one order in both directions (the FK-check-after-insert order
+       it replaces deadlocked against redemption — see that module's
+       docstring). Every preference read/normalization/transfer redemption
+       performs (classification, deleting a default-equivalent row, copying
+       a material one) therefore happens under users-row locks no writer can
+       be holding or acquiring: the rows it classified are the rows it
+       mutates.
     4. `web_session_policy` — session-issuance only (db.auth_sessions.
        create_for_github_sync(); never touched by anything in THIS
        module) / `github_oauth_admission` — unlink's generation bump only
        (see unlink_github_sync() below); never touched by attempt
        creation or redemption.
-    5. The `telegram_link_attempts` row itself — ALWAYS LAST, and always
-       via the single mutating statement that claims/creates/removes it
-       (an atomic `DELETE ... RETURNING`, an `INSERT ... ON CONFLICT DO
-       UPDATE`, or a plain `DELETE`) — NEVER a separate prior `SELECT ...
-       FOR UPDATE` lock step. This is the actual fix for the deadlock this
+    5. The `telegram_link_attempts` row itself — the LAST STEP OF THE LOCK
+       HIERARCHY (nothing from positions 1-4 is ever acquired after it),
+       and always via the single mutating statement that claims/creates/
+       removes it (an atomic `DELETE ... RETURNING`, an `INSERT ... ON
+       CONFLICT DO UPDATE`, or a plain `DELETE`) — NEVER a separate prior
+       `SELECT ... FOR UPDATE` lock step. Last in the hierarchy is not the
+       last statement of the transaction: see "Work after the attempt
+       claim" below. This is the actual fix for the deadlock this
        module used to contain (see the historical note below): every
        function used to lock/probe the attempt row FIRST, before
        provider/user — for a row that already existed, this genuinely
@@ -53,19 +69,30 @@ module):
        EFFECTIVE order silently became provider/user-first instead. Two
        concurrent callers landing on opposite sides of that existing-vs-
        missing branch could form a genuine two-resource wait cycle.
-       Making the attempt table strictly the LAST resource touched, via
+       Making the attempt table the LAST hierarchy position, reached via
        ONE mutating statement, in EVERY function, removes that
        inconsistency by construction: there is no longer a branch where
        the attempt table is ever locked/touched before `github_accounts`/
        `users`.
     6. Commit.
 
+Work after the attempt claim (Stage 7B-3P). Only redemption has any: it
+claims the attempt (position 5) and THEN, in the same transaction and under
+the position 1/2/3 locks it already holds, runs the REJECTED_* classification
+reads, the source-document check, the preference classification/normalization/
+transfer (3b) and, for MERGED, the merge mutations (re-point `github_accounts`; delete the
+source's `web_sessions`, any remaining source attempt row and its `users`
+row). None of that acquires anything from positions 1-4 — every `users`/
+`github_accounts` row involved is already locked by this transaction — and
+the `user_preferences` part follows the `users` -> `user_preferences` order
+of 3b. The claim is the last hierarchy step, not the last statement.
+
 No function here ever locks/touches a `github_accounts`/`users` row and
 THEN waits on a `telegram_link_attempts` row that already exists, because
 no function here ever waits on `telegram_link_attempts` at all — its one
-mutating statement always runs last and is inherently non-blocking with
-respect to itself (an atomic conditional `DELETE`/`INSERT ... ON
-CONFLICT`/`DELETE` either matches-and-mutates or matches nothing; a
+mutating statement is always the last hierarchy step and is inherently
+non-blocking with respect to itself (an atomic conditional `DELETE`/`INSERT
+... ON CONFLICT`/`DELETE` either matches-and-mutates or matches nothing; a
 genuinely concurrent claim of the identical row simply serializes at that
 one statement, which can never form a cycle with a resource acquired
 BEFORE it). This is what makes attempt-creation, redemption, and unlink
@@ -90,7 +117,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, List, Optional
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, literal, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -107,6 +134,7 @@ from db.models import (
     UserPreference,
     WebSession,
 )
+from db.preferences import PreferenceState, preference_state
 
 
 class CreateAttemptOutcome(Enum):
@@ -273,10 +301,69 @@ def cleanup_expired_attempts_sync(*, batch_size: int = 200) -> int:
         return len(expired_ids)
 
 
+def _configured_default_mode() -> str:
+    """The current configured effective default mode (config.DEFAULT_MODE —
+    the very value app.preferences.default_mode() reports, so redemption
+    classifies "default-equivalent" against the same policy Telegram and the
+    web settings API resolve reads with), read at call time. `config` is
+    imported HERE, lazily, not at module level: this module (and
+    app/telegram_link.py) must stay importable without pulling in `rag`
+    (config re-exports rag.constants) — see
+    tests/test_stage6c_qdrant_preservation.py."""
+    import config
+
+    return config.DEFAULT_MODE
+
+
+def _merge_preferences(
+    session: Session, *, source_user_id: uuid.UUID, target_user_id: uuid.UUID, default_mode: str
+) -> bool:
+    """Applies redeem_attempt_sync()'s Ø/D/M preference matrix inside the
+    caller's transaction. Returns False — having written NOTHING — for the
+    one rejected case (M/M); True once the two sides are resolved so that at
+    most one preference row (the surviving material one, if any) remains and
+    it belongs to the target. The caller then deletes the source `users`
+    row, which the foreign key only allows once the source owns no
+    preference row — every branch below leaves it with none."""
+    source_state = preference_state(session, source_user_id, default_mode)
+    target_state = preference_state(session, target_user_id, default_mode)
+
+    if source_state is PreferenceState.MATERIAL and target_state is PreferenceState.MATERIAL:
+        return False  # M/M: preserve both rows, choose neither
+
+    if target_state is PreferenceState.DEFAULT_EQUIVALENT:
+        # Ø/D, D/D and M/D: the target's default-equivalent row carries no
+        # customization — remove it (for M/D this also frees the slot the
+        # source row is copied into below).
+        session.execute(delete(UserPreference).where(UserPreference.user_id == target_user_id))
+
+    if source_state is PreferenceState.DEFAULT_EQUIVALENT:
+        # D/Ø, D/D and D/M: discard the source's default-equivalent row.
+        session.execute(delete(UserPreference).where(UserPreference.user_id == source_user_id))
+    elif source_state is PreferenceState.MATERIAL:
+        # M/Ø and M/D: the target now owns no row — move the COMPLETE source
+        # row (mode, voice and updated_at exactly as stored) onto it.
+        session.execute(
+            pg_insert(UserPreference).from_select(
+                ["user_id", "mode", "voice", "updated_at"],
+                select(
+                    literal(target_user_id, UserPreference.user_id.type),
+                    UserPreference.mode,
+                    UserPreference.voice,
+                    UserPreference.updated_at,
+                ).where(UserPreference.user_id == source_user_id),
+            )
+        )
+        session.execute(delete(UserPreference).where(UserPreference.user_id == source_user_id))
+    # Source Ø (Ø/Ø, Ø/D, Ø/M): nothing to discard or move.
+    return True
+
+
 def redeem_attempt_sync(
     *,
     link_secret_hash: bytes,
     telegram_user_id: int,
+    default_mode: Optional[str] = None,
     _test_hook_after_advisory_lock: Optional[Callable[[], None]] = None,
     _test_hook_after_provider_lock: Optional[Callable[[], None]] = None,
     _test_hook_after_user_lock: Optional[Callable[[], None]] = None,
@@ -333,14 +420,66 @@ def redeem_attempt_sync(
          one outcome — see RedemptionOutcome's own docstring for what each
          one means.
 
-    MERGED mutations (Section I): move the source's `github_accounts` row
-    onto the target UUID; delete every source `web_sessions` row; delete
-    every remaining source `telegram_link_attempts` row (normally none —
-    already consumed by step 6's claim; a defensive no-op DELETE); delete
-    the now-empty source `users` row. Never touches Qdrant, document
-    ownership, or preference ownership (Section I/N) — nothing in this
-    function imports rag/* or touches `documents`/`user_preferences` except
-    to CHECK (never write) them in the REJECTED_AMBIGUOUS_MERGE gate below.
+    MERGED mutations (Section I): resolve the two sides' `user_preferences`
+    rows (see the matrix below); move the source's `github_accounts` row onto
+    the target UUID; delete every source `web_sessions` row; delete every
+    remaining source `telegram_link_attempts` row (normally none — already
+    consumed by step 6's claim; a defensive no-op DELETE); delete the now-
+    empty source `users` row. Never touches Qdrant or document ownership
+    (Section I/N) — nothing in this function imports rag/* or writes
+    `documents`, which is only CHECKED (never written) in the
+    REJECTED_AMBIGUOUS_MERGE gate below.
+
+    Preference merge matrix (Stage 7B-3P, final policy). `user_preferences`
+    is the ONE domain table treated as user-level configuration that can
+    move across identities (PATCH /api/settings creates a row for every web
+    user who saves a harmless setting, and rejecting on that alone
+    permanently stranded the link attempt). BOT_MODE/DEFAULT_VOICE are
+    EFFECTIVE defaults (app/preferences.py), so a row that merely equals them
+    carries no customization. Each side is classified once, under the locks
+    of steps 1/5, by db.preferences.preference_state() (see that module for
+    the exact definition — MATERIAL iff `voice IS NOT NULL OR mode NOT IN
+    (NULL, current DEFAULT_MODE)`; `updated_at` never participates):
+
+        Ø = no row      D = default-equivalent row      M = material row
+
+        source | target | result
+        -------+--------+---------------------------------------------------
+          Ø    |   Ø    | MERGED; no preference row exists afterwards
+          Ø    |   D    | MERGED; the target's D row is removed
+          Ø    |   M    | MERGED; the target's M row is untouched
+          D    |   Ø    | MERGED; the source's D row is discarded
+          D    |   D    | MERGED; both D rows are discarded
+          D    |   M    | MERGED; the source's D row is discarded, the
+               |        | target's M row is untouched
+          M    |   Ø    | MERGED; the complete source row (mode, voice,
+               |        | updated_at) is copied onto the target, then removed
+          M    |   D    | MERGED; the target's D row is removed, then the
+               |        | complete source row is copied onto the target
+          M    |   M    | REJECTED_AMBIGUOUS_MERGE; neither row is written
+               |        | (never silently pick a side, never merge fields)
+
+    A removed D row changes no observable behavior (its user reads the same
+    effective mode/voice from the configured defaults). Values are never
+    compared to pick a winner and columns are never merged individually.
+    `default_mode` is the effective default mode "default-equivalent" is
+    measured against; None (what the application layer uses) means the
+    current config.DEFAULT_MODE, read at call time. Tests may pass it
+    explicitly.
+
+    The M/M rejection happens BEFORE any preference statement mutates
+    anything, so the commit that consumes the claim (as for every
+    deterministic outcome) can never carry a partial change. The copy is
+    `INSERT ... SELECT` (then a DELETE of the source row) rather than an
+    UPDATE of the primary key, so `updated_at` — which UserPreference
+    refreshes on ORM/Core UPDATE — arrives exactly as it was. Because both
+    users rows are locked and every preference writer takes `FOR KEY SHARE`
+    on its users row first, no target row can appear between classification
+    and copy; an unexpected uniqueness violation there is treated as any other
+    unexpected failure (the whole transaction, claim included, rolls back).
+    Documents keep their existing protection: a source that owns any
+    document is still REJECTED_AMBIGUOUS_MERGE, before any preference is
+    touched.
 
     Every deterministic outcome (MERGED, ALREADY_LINKED, every REJECTED_*)
     commits — the attempt claim from step 6 is consumed either way (Section
@@ -451,10 +590,19 @@ def redeem_attempt_sync(
         source_has_documents = session.execute(
             select(Document.id).where(Document.owner_user_id == source_user_id).limit(1)
         ).first()
-        source_has_preferences = session.execute(
-            select(UserPreference.user_id).where(UserPreference.user_id == source_user_id).limit(1)
-        ).first()
-        if source_has_documents is not None or source_has_preferences is not None:
+        if source_has_documents is not None:
+            session.commit()
+            return RedemptionResult(outcome=RedemptionOutcome.REJECTED_AMBIGUOUS_MERGE)
+
+        # user_preferences is the ONE domain table whose rows a merge may
+        # normalize or move (Stage 7B-3P) — see this function's docstring
+        # for the nine-case matrix. Its only rejection (M/M) writes nothing.
+        if not _merge_preferences(
+            session,
+            source_user_id=source_user_id,
+            target_user_id=target_user_id,
+            default_mode=_configured_default_mode() if default_mode is None else default_mode,
+        ):
             session.commit()
             return RedemptionResult(outcome=RedemptionOutcome.REJECTED_AMBIGUOUS_MERGE)
 

@@ -27,16 +27,7 @@ async def generate_voice_response(
     """
     try:
         # Validate voice type
-        valid_voices = [
-            VoiceType.ALLOY,
-            VoiceType.ECHO,
-            VoiceType.NOVA,
-            VoiceType.FABLE,
-            VoiceType.ONYX,
-            VoiceType.SHIMMER
-        ]
-        
-        if voice not in valid_voices:
+        if voice not in VoiceType.ALL:
             logger.warning("TTS: invalid voice=%s, using default", voice)
             voice = DEFAULT_VOICE
         logger.debug("TTS generate_voice_response | voice=%s, text_len=%s", voice, len(text))
@@ -102,17 +93,8 @@ def get_available_voices() -> str:
     Returns:
         Formatted string with voice information
     """
-    voices = [
-        VoiceType.ALLOY,
-        VoiceType.ECHO,
-        VoiceType.NOVA,
-        VoiceType.FABLE,
-        VoiceType.ONYX,
-        VoiceType.SHIMMER
-    ]
-    
     result = "📢 Доступные голоса:\n\n"
-    for voice in voices:
+    for voice in VoiceType.ALL:
         info = get_voice_info(voice)
         result += f"• {info['name']} ({voice})\n"
         result += f"  Тип: {info['type']}\n"

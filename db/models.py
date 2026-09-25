@@ -564,8 +564,11 @@ class TelegramLinkAttempt(Base):
     MAJOR 2 — see db/telegram_link.py's own module docstring for the full
     protocol): advisory lock, where one applies -> `github_accounts` rows ->
     `users` rows -> (success path only) `web_session_policy`/
-    `github_oauth_admission` -> this table's row, ALWAYS LAST, mutated via
-    one atomic statement (never a separate prior lock/probe step). RESTRICT
+    `github_oauth_admission` -> this table's row, the LAST hierarchy step,
+    mutated via one atomic statement (never a separate prior lock/probe
+    step; redemption's preference-normalization/transfer and merge
+    mutations run after that claim, under locks it already holds — see
+    db/telegram_link.py's "Work after the attempt claim"). RESTRICT
     is a defense-in-depth backstop making "never leave a `users` row FK-
     orphaned by this table" a hard database invariant, not merely an
     application-level convention — it says nothing about lock ORDER, which

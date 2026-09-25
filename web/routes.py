@@ -268,7 +268,9 @@ async def chat(
 
 @router.get("/api/settings", response_model=SettingsResponse)
 async def get_settings(user_id: uuid.UUID = Depends(get_current_user_id)) -> SettingsResponse:
-    """Stage 7A-2. Read-only — never creates a preference row."""
+    """Stage 7A-2. Read-only — never creates a preference row. Reports the
+    EFFECTIVE mode (Stage 7B-3P): the stored canonical mode, else the
+    configured BOT_MODE default — the same resolution Telegram uses."""
     mode = await preferences.get_effective_mode(user_id)
     return SettingsResponse(mode=mode)
 

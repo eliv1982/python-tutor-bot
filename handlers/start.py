@@ -11,7 +11,7 @@ from app.session import user_sessions
 from app.identity import resolve_user_uuid
 from app.telegram_link import LINK_PAYLOAD_PREFIX, RedemptionOutcome, extract_link_secret, redeem_link
 from utils.access_control import require_authorized
-from config import BotMode, DEFAULT_MODE
+from config import BotMode
 
 # Stage 6C, Section I: every REJECTED_* outcome renders to this exact same
 # text — deliberately generic, never revealing WHICH conflict occurred (a
@@ -49,13 +49,20 @@ async def cmd_start(message: types.Message):
     user_name = message.from_user.first_name
     logger.info("Command /start | telegram_user_id=%s", telegram_user_id)
 
-    # Initialize user session — existing first canonical Telegram
-    # resolution (Stage 6C, Section I: "existing first canonical Telegram
-    # resolution" — preserved unchanged, and always run BEFORE any linking
-    # logic below: db.telegram_link.redeem_attempt_sync() requires a
-    # telegram_accounts row to already exist for this sender).
-    user_uuid = await resolve_user_uuid(telegram_user_id)
-    await user_sessions.set_mode(user_uuid, DEFAULT_MODE)
+    # Existing first canonical Telegram resolution (Stage 6C, Section I:
+    # "existing first canonical Telegram resolution" — preserved unchanged,
+    # and always run BEFORE any linking logic below:
+    # db.telegram_link.redeem_attempt_sync() requires a telegram_accounts
+    # row to already exist for this sender).
+    #
+    # Stage 7B-3P: /start persists NO preference. BOT_MODE (DEFAULT_MODE) and
+    # DEFAULT_VOICE are effective defaults that app/preferences.py applies at
+    # read time for any user without a stored value — /start used to write
+    # DEFAULT_MODE here, which reset a returning user's saved mode and gave a
+    # brand-new sender a user_preferences row before `/start link_<secret>`
+    # redemption ran. A user_preferences row now exists only once a user
+    # (or a link merge carrying one over) actually chose something.
+    await resolve_user_uuid(telegram_user_id)
 
     # Stage 6C: a `/start link_<secret>` payload is redeemed here, narrowly
     # extending the existing handler — every other `/start` shape (no

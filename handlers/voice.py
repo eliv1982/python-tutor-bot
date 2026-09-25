@@ -43,16 +43,7 @@ async def cmd_voice(message: types.Message):
 
     # Set new voice
     new_voice = args[1].lower()
-    valid_voices = [
-        VoiceType.ALLOY,
-        VoiceType.ECHO,
-        VoiceType.NOVA,
-        VoiceType.FABLE,
-        VoiceType.ONYX,
-        VoiceType.SHIMMER
-    ]
-
-    if new_voice not in valid_voices:
+    if new_voice not in VoiceType.ALL:
         await bot.send_message(
             message.chat.id,
             f"❌ Неизвестный голос: {new_voice}\n\nИспользуйте /voice для списка доступных голосов."
