@@ -26,6 +26,7 @@ import {
   UNAUTHORIZED_ERROR_DETAIL,
   UNEXPECTED_RESPONSE_DETAIL,
   apiGetJson,
+  apiSendFormData,
   apiSendJson,
   apiSendJsonNoBody,
   apiSendNoContent,
@@ -1262,5 +1263,320 @@ describe("apiSendJsonNoBody (bodyless mutation with JSON response)", () => {
 
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(calls[0]?.init.signal?.aborted).toBe(true);
+  });
+});
+
+describe("apiSendFormData (multipart request body)", () => {
+  function upload(name = "notes.txt") {
+    const file = new File(["hello"], name, { type: "text/plain" });
+    const form = new FormData();
+    form.append("file", file);
+    return { file, form };
+  }
+
+  it("hands the FormData to fetch unchanged, with no Content-Type of its own", async () => {
+    document.cookie = "csrf_token=dev-token; Path=/";
+    const { calls } = mockFetch(() => jsonResponse(201, { id: 1 }));
+    const { form } = upload();
+
+    await apiSendFormData("POST", "/api/documents", form, 201);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("/api/documents");
+    expect(calls[0]?.init.method).toBe("POST");
+    // The very object, not a copy and not a serialization of it.
+    expect(calls[0]?.init.body).toBe(form);
+    expect(calls[0]?.init.body).toBeInstanceOf(FormData);
+    expect(calls[0]?.init.credentials).toBe("same-origin");
+    expect(calls[0]?.init.cache).toBe("no-store");
+    expect(calls[0]?.headers.get("accept")).toBe("application/json");
+    expect(calls[0]?.headers.get("x-csrf-token")).toBe("dev-token");
+  });
+
+  it("leaves the multipart content type, and its boundary, to the browser: no header named Content-Type is ever set", async () => {
+    document.cookie = "csrf_token=dev-token; Path=/";
+    const { calls } = mockFetch(() => jsonResponse(201, {}));
+
+    await apiSendFormData("POST", "/api/documents", upload().form, 201);
+
+    expect(calls[0]?.headers.has("content-type")).toBe(false);
+    const rawHeaders = calls[0]?.init.headers as Record<string, string>;
+    expect(Object.keys(rawHeaders).some((name) => name.toLowerCase() === "content-type")).toBe(false);
+    expect([...(calls[0]?.headers.keys() ?? [])].sort()).toEqual(["accept", "x-csrf-token"]);
+  });
+
+  it("keeps the JSON content type for a JSON body and gives a FormData none, through the same client", async () => {
+    const { calls } = mockFetch(() => jsonResponse(200, {}));
+
+    await apiSendJson("POST", "/api/chat", { message: "hi" }, 200);
+    await apiSendFormData("POST", "/api/documents", upload().form, 200);
+
+    expect(calls[0]?.headers.get("content-type")).toBe("application/json");
+    expect(calls[1]?.headers.has("content-type")).toBe(false);
+  });
+
+  it("re-reads the CSRF cookie for every call and sends exactly one request per call", async () => {
+    const { calls, fetchMock } = mockFetch(() => jsonResponse(201, {}));
+
+    document.cookie = "csrf_token=first; Path=/";
+    await apiSendFormData("POST", "/api/documents", upload().form, 201);
+    document.cookie = "csrf_token=second; Path=/";
+    await apiSendFormData("POST", "/api/documents", upload().form, 201);
+
+    expect(calls.map((call) => call.headers.get("x-csrf-token"))).toEqual(["first", "second"]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends no CSRF header when the cookie is absent, leaving the verdict to the server", async () => {
+    const { calls } = mockFetch(() => jsonResponse(403, { detail: "CSRF validation failed" }));
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(calls[0]?.headers.has("x-csrf-token")).toBe(false);
+    expect(error.status).toBe(403);
+  });
+
+  it.each(["https://evil.example/api/documents", "//evil.example/api/documents", "api/documents", "/\\evil.example", "/api/documents\n"])(
+    "refuses non same-origin or unsafe path %j without calling fetch",
+    async (path) => {
+      const { fetchMock } = mockFetch(() => jsonResponse(201, {}));
+
+      await expect(apiSendFormData("POST", path, upload().form, 201)).rejects.toThrow("same-origin");
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["a string", "file=notes"],
+    ["a plain object", { file: "notes" }],
+    ["a Blob", new Blob(["x"])],
+    ["null", null],
+  ])("refuses %s as the body without calling fetch", async (_label, body) => {
+    const { fetchMock } = mockFetch(() => jsonResponse(201, {}));
+
+    await expect(apiSendFormData("POST", "/api/documents", body as unknown as FormData, 201)).rejects.toThrow(TypeError);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns the parsed JSON of a response with exactly the expected status", async () => {
+    mockFetch(() => jsonResponse(201, { id: "x", display_name: "é.pdf" }));
+    await expect(apiSendFormData("POST", "/api/documents", upload().form, 201)).resolves.toEqual({
+      id: "x",
+      display_name: "é.pdf",
+    });
+  });
+
+  it.each([
+    ["a 200 when 201 was expected", 200],
+    ["a 202", 202],
+  ])("does not accept %s as success and never reads its body", async (_label, status) => {
+    const { response, stats } = streamedResponse(status, ['{"id":"x"}']);
+    mockFetch(() => response);
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(error.status).toBe(status);
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+    expect(stats.pulls).toBe(0);
+  });
+
+  it("does not accept a 204 with no body where a JSON confirmation was expected", async () => {
+    mockFetch(() => noContentResponse());
+    expect((await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201))).detail).toBe(
+      UNEXPECTED_RESPONSE_DETAIL,
+    );
+  });
+
+  it.each([400, 401, 403, 404, 413, 422, 429, 500, 502, 503, 504])(
+    "maps HTTP %i to its fixed message and never reads the failed response's body",
+    async (status) => {
+      const { response, stats } = streamedResponse(status, [JSON.stringify({ detail: SENSITIVE_DETAILS[0] })], {
+        "content-type": "application/json",
+      });
+      mockFetch(() => response);
+
+      const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+      const fixed = new Map<number, string>([
+        [401, UNAUTHORIZED_ERROR_DETAIL],
+        [403, FORBIDDEN_ERROR_DETAIL],
+        [429, RATE_LIMITED_ERROR_DETAIL],
+      ]).get(status);
+      expect(error.status).toBe(status);
+      expect(error.detail).toBe(fixed ?? (status >= 500 ? SERVER_ERROR_DETAIL : GENERIC_ERROR_DETAIL));
+      expect(error.detail).not.toContain(SENSITIVE_DETAILS[0]);
+      expect(stats.pulls).toBe(0);
+      await vi.waitFor(() => expect(stats.cancelled).toBe(true));
+    },
+  );
+
+  it.each([
+    ["malformed JSON", () => textResponse(201, "{not json", "application/json")],
+    ["an empty body", () => new Response("", { status: 201 })],
+    ["a body-less response", () => new Response(null, { status: 201 })],
+    ["an HTML page", () => textResponse(201, "<!doctype html><html></html>", "text/html")],
+    ["bytes that are not UTF-8", () => new Response(rawBytes('{"id":"', [0xff], '"}'), { status: 201 })],
+  ])("treats %s on the expected status as an unexpected response", async (_label, build) => {
+    mockFetch(build);
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(error.status).toBe(201);
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+  });
+
+  it("keeps the 64 KiB response bound: an oversized success body is refused after limit + 1 bytes and cancelled", async () => {
+    const { response, stats } = streamedResponse(201, chunked(jsonOfBytes(1024 * KIB), KIB));
+    mockFetch(() => response);
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+    expect(stats.bytesPulled).toBe(MAX_RESPONSE_BYTES + 1);
+    expectEveryReadBounded(stats);
+    await expectCancelledAndIdle(stats);
+  });
+
+  it("decodes a valid multi-byte success body across chunk boundaries, through a BYOB reader only", async () => {
+    const body = { display_name: "héllo wörld — 你好 🎉.pdf" };
+    const { response, stats } = streamedResponse(201, chunked(JSON.stringify(body), 3));
+    const getReader = vi.spyOn(response.body as ReadableStream<Uint8Array>, "getReader");
+    mockFetch(() => response);
+
+    await expect(apiSendFormData("POST", "/api/documents", upload().form, 201)).resolves.toEqual(body);
+
+    for (const call of getReader.mock.calls) {
+      expect(call).toEqual([{ mode: "byob" }]);
+    }
+    expect(stats.defaultReads).toBe(0);
+    expectEveryReadBounded(stats);
+  });
+
+  it("refuses a success body that is not strict UTF-8 instead of decoding it with replacement characters", async () => {
+    const { response, stats } = streamedResponse(201, [rawBytes('{"display_name":"', [0xc3, 0x28], '"}')]);
+    mockFetch(() => response);
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+    expect(error.message).not.toContain(REPLACEMENT_CHARACTER);
+    expect(stats.cancelled).toBe(false);
+  });
+
+  it("forwards caller cancellation to fetch and rethrows the abort, not an ApiError, without running the 401 handler", async () => {
+    const gate = deferred<Response>();
+    const { calls } = mockFetch((call) => {
+      call.init.signal?.addEventListener("abort", () => gate.reject(new DOMException("aborted", "AbortError")));
+      return gate.promise;
+    });
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    const controller = new AbortController();
+
+    const pending = apiSendFormData("POST", "/api/documents", upload().form, 201, { signal: controller.signal });
+    expect(calls[0]?.init.signal?.aborted).toBe(false);
+    controller.abort();
+
+    const error: unknown = await pending.catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ name: "AbortError" });
+    expect(calls[0]?.init.signal?.aborted).toBe(true);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("cancels a stalled success body when the caller aborts", async () => {
+    const { response, stats } = stalledResponse();
+    mockFetch(() => response);
+    const controller = new AbortController();
+
+    const pending = apiSendFormData("POST", "/api/documents", upload().form, 200, { signal: controller.signal });
+    await vi.waitFor(() => expect(stats.pulls).toBe(2));
+    controller.abort();
+
+    const error: unknown = await pending.catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(ApiError);
+    await expectCancelledAndIdle(stats);
+  });
+
+  it("uses the generic timeout unless the caller sets one, and honours a caller-set timeout", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    mockFetch(() => jsonResponse(201, {}));
+
+    await apiSendFormData("POST", "/api/documents", upload().form, 201);
+    await apiSendFormData("POST", "/api/documents", upload().form, 201, { timeoutMs: 120_000 });
+
+    expect(timeout.mock.calls.map(([ms]) => ms)).toEqual([DEFAULT_TIMEOUT_MS, 120_000]);
+  });
+
+  it("times out a hung request as a status-0 timeout error, and calls fetch exactly once", async () => {
+    const { fetchMock } = mockFetch(
+      (call) =>
+        new Promise<Response>((_resolve, reject) => {
+          call.init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+    );
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201, { timeoutMs: 20 }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(error.status).toBe(0);
+    expect(error.detail).toBe(TIMEOUT_ERROR_DETAIL);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("normalizes a network failure and calls fetch exactly once (no retry)", async () => {
+    const { fetchMock } = mockFetch(() => {
+      throw new TypeError("Failed to fetch https://internal.example/secret");
+    });
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(error.status).toBe(0);
+    expect(error.detail).toBe(NETWORK_ERROR_DETAIL);
+    expect(error.message).not.toContain("internal.example");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls fetch exactly once for a failing HTTP response (no retry)", async () => {
+    const { fetchMock } = mockFetch(() => jsonResponse(503, { detail: "down" }));
+
+    await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the central 401 handler once and still rejects with the ApiError", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch(() => jsonResponse(401, { detail: "Not authenticated" }));
+
+    const error = await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(isUnauthorized(error)).toBe(true);
+  });
+
+  it.each([403, 413, 422, 500, 503])("does not run the 401 handler for HTTP %i", async (status) => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    mockFetch(() => jsonResponse(status, { detail: "nope" }));
+
+    await failureOf(apiSendFormData("POST", "/api/documents", upload().form, 201));
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("supports the other mutating methods the same way", async () => {
+    document.cookie = "csrf_token=dev-token; Path=/";
+    const { calls } = mockFetch(() => jsonResponse(200, {}));
+
+    await apiSendFormData("PUT", "/api/thing", upload().form, 200);
+
+    expect(calls[0]?.init.method).toBe("PUT");
+    expect(calls[0]?.headers.get("x-csrf-token")).toBe("dev-token");
+    expect(calls[0]?.headers.has("content-type")).toBe(false);
   });
 });

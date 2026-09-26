@@ -4,6 +4,7 @@ import type { CurrentUser } from "../api/types";
 import type { LogoutState } from "../auth/AuthContext";
 import { AccountLinkingPanel } from "./AccountLinkingPanel";
 import { ChatPanel } from "./ChatPanel";
+import { DocumentsPanel } from "./DocumentsPanel";
 import { SettingsPanel } from "./SettingsPanel";
 
 function formatMemberSince(createdAt: string): string | null {
@@ -60,6 +61,7 @@ export function AuthenticatedShell({ user, logoutState, onLogout }: Authenticate
           onOperationPendingChange={setAccountOperationPending}
         />
         <SettingsPanel disabled={logoutState.pending} />
+        <DocumentsPanel telegramLinked={user.telegram_linked} disabled={logoutState.pending} />
         <ChatPanel />
       </main>
     </div>

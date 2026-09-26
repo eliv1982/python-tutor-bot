@@ -87,3 +87,21 @@ export function isChatResponse(value: unknown): value is ChatResponse {
   const text = (value as Record<string, unknown>)["text"];
   return typeof text === "string" && text.trim() !== "";
 }
+
+/**
+ * One document of `GET /api/documents` (and the `POST /api/documents` 201
+ * body). These three fields are everything the server exposes: no owner, scope,
+ * status, size, hash, stored name, or content. `display_name` is presentation
+ * text only and is never an identifier, a path, or part of a URL.
+ */
+export interface DocumentSummary {
+  /** Canonical lowercase UUID. The only thing a document is ever addressed by. */
+  id: string;
+  display_name: string;
+  created_at: string;
+}
+
+/** `GET /api/documents` success body. */
+export interface DocumentListResponse {
+  items: DocumentSummary[];
+}

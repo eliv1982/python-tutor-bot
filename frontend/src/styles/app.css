@@ -302,6 +302,161 @@ p {
   margin-bottom: 0;
 }
 
+/* Documents. Filenames are untrusted text: kept literal, and even one unbroken
+   run of characters wraps instead of overflowing. */
+.documents-panel {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.documents-panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+  line-height: 1.3;
+}
+
+.documents-panel h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.documents-note {
+  margin-bottom: 1rem;
+}
+
+.documents-warning {
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.documents-upload {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 1rem;
+}
+
+.documents-label {
+  font-weight: 600;
+}
+
+.documents-file-input {
+  max-width: 100%;
+  font: inherit;
+}
+
+.documents-file-input:focus-visible {
+  outline: 3px solid #86a8f0;
+  outline-offset: 2px;
+}
+
+.documents-hint,
+.documents-selected,
+.documents-problem {
+  margin: 0;
+}
+
+.documents-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.documents-problem {
+  padding-left: 0.5rem;
+  border-left: 3px solid var(--danger-border);
+  color: var(--danger-text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.documents-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.documents-status {
+  margin: 0.75rem 0;
+}
+
+.documents-panel > .notice {
+  margin: 0.75rem 0;
+}
+
+.documents-panel .notice .button {
+  margin-top: 0.5rem;
+}
+
+.documents-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0 0.5rem;
+}
+
+.documents-empty {
+  margin: 0.5rem 0;
+}
+
+.documents-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--border);
+}
+
+.documents-list[aria-busy="true"],
+.documents-item[aria-busy="true"] {
+  opacity: 0.7;
+}
+
+.documents-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.documents-item-main {
+  display: flex;
+  flex: 1 1 12rem;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.documents-time {
+  font-size: 0.85rem;
+}
+
+.documents-confirmation {
+  flex-basis: 100%;
+}
+
+.documents-confirmation > p {
+  margin: 0 0 0.5rem;
+}
+
+.documents-confirmation > .documents-status,
+.documents-confirmation > .documents-problem {
+  margin: 0.5rem 0 0;
+}
+
+.documents-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
 /* Text chat. */
 .visually-hidden {
   position: absolute;
@@ -477,7 +632,8 @@ p {
   }
 
   .account-actions,
-  .settings-actions {
+  .settings-actions,
+  .documents-actions {
     flex-direction: column;
   }
 
@@ -487,6 +643,8 @@ p {
 
   .account-actions .button,
   .settings-actions .button,
+  .documents-actions .button,
+  .documents-item > .button,
   .account-connection > .button {
     width: 100%;
     text-align: center;

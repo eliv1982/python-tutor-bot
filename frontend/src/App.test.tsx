@@ -54,25 +54,34 @@ async function settle<T>(gate: { promise: Promise<T>; resolve: (value: T) => voi
 
 /**
  * An authenticated request unrelated to any feature, for tests of the central
- * 401 handling: the signed-in shell already reads `/api/settings` on its own.
+ * 401 handling: the signed-in shell already reads `/api/settings` and
+ * `/api/documents` on its own.
  */
 const LATER_REQUEST_PATH = "/api/later-request";
 
+const DOCUMENTS_FIRST_PAGE = "/api/documents?limit=21&offset=0";
+
 /**
- * Routes /api/me, /api/logout and /api/settings (the signed-in shell reads it
- * on mount; the default is the text mode); every other request is a test bug
- * and answers 599.
+ * Routes /api/me, /api/logout, /api/settings and /api/documents (the signed-in
+ * shell reads the last two on mount; the defaults are the text mode and an
+ * empty first page of documents); every other request is a test bug and
+ * answers 599.
  */
 function backend(overrides: {
   me?: (call: RecordedCall) => Response | Promise<Response>;
   logout?: (call: RecordedCall) => Response | Promise<Response>;
   settings?: (call: RecordedCall) => Response | Promise<Response>;
+  documents?: (call: RecordedCall) => Response | Promise<Response>;
   other?: (call: RecordedCall) => Response | Promise<Response>;
 }) {
   return mockFetch((call) => {
     if (call.url === "/api/me" && overrides.me) return overrides.me(call);
     if (call.url === "/api/logout" && overrides.logout) return overrides.logout(call);
     if (call.url === "/api/settings") return (overrides.settings ?? (() => jsonResponse(200, { mode: "text" })))(call);
+    if (call.url.startsWith("/api/documents")) {
+      if (overrides.documents) return overrides.documents(call);
+      if (call.init.method === "GET" && call.url === DOCUMENTS_FIRST_PAGE) return jsonResponse(200, { items: [] });
+    }
     if (overrides.other) return overrides.other(call);
     return jsonResponse(599, { detail: `unexpected request ${call.url}` });
   });
@@ -684,6 +693,328 @@ describe("settings integration", () => {
     await within(screen.getByRole("log", { name: "Conversation" })).findByText("Use a list comprehension.");
     await user.click(screen.getByRole("button", { name: "Link Telegram" }));
     expect(await screen.findByRole("link", { name: "Open Telegram" })).toBeTruthy();
+  });
+});
+
+describe("documents integration", () => {
+  const documentsRegion = () => screen.getByRole("region", { name: "Documents" });
+  const fileInput = () => within(documentsRegion()).getByLabelText<HTMLInputElement>("Choose a document file");
+  const uploadButton = () =>
+    within(documentsRegion()).getByRole<HTMLButtonElement>("button", { name: /^(Upload|Uploading…)$/ });
+  const refreshButton = () => within(documentsRegion()).getByRole<HTMLButtonElement>("button", { name: "Refresh" });
+  const documentsLoaded = () =>
+    waitFor(() => expect(within(documentsRegion()).queryByText("Loading documents…")).toBeNull());
+  const created = { id: "00000000-0000-4000-8000-000000000001", display_name: "notes.txt", created_at: "2026-09-25T12:00:00.5" };
+  const noteFile = () => new File(["hello"], "notes.txt", { type: "text/plain" });
+  const documentCalls = (calls: RecordedCall[]) => calls.filter((call) => call.url.startsWith("/api/documents"));
+  const WARNING =
+    "Link Telegram before uploading if you plan to use RAG there. Documents are not moved when separate accounts are merged and can prevent linking.";
+  const chatOnly = (call: RecordedCall) =>
+    call.url === "/api/chat" ? jsonResponse(200, { text: "Use a list comprehension." }) : jsonResponse(599, {});
+
+  it("is shown only while authenticated, and reads the first page of the caller's documents", async () => {
+    backend({ me: () => jsonResponse(401, { detail: "Not authenticated" }) });
+    const anonymous = renderApp();
+    await screen.findByRole("link", { name: "Sign in with GitHub" });
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByLabelText("Choose a document file")).toBeNull();
+    anonymous.unmount();
+
+    backend({ me: networkDown });
+    const failed = renderApp();
+    await screen.findByRole("button", { name: "Try again" });
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    failed.unmount();
+
+    const user = userEvent.setup();
+    const { calls } = await signedInApp({ logout: () => noContentResponse() });
+    await documentsLoaded();
+    expect(screen.getByText("No documents yet.")).toBeTruthy();
+    expect(documentCalls(calls).map((call) => `${call.init.method} ${call.url}`)).toEqual([
+      `GET ${DOCUMENTS_FIRST_PAGE}`,
+    ]);
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByLabelText("Choose a document file")).toBeNull();
+  });
+
+  it("sits between Settings and the chat, and coexists with Account connections as an independent sibling", async () => {
+    await signedInApp();
+
+    const account = screen.getByRole("heading", { name: "Account connections" });
+    const settings = screen.getByRole("heading", { name: "Settings" });
+    const documents = screen.getByRole("heading", { name: "Documents" });
+    const chat = screen.getByRole("heading", { name: "Ask the tutor" });
+    expect(account.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(settings.compareDocumentPosition(documents) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(documents.compareDocumentPosition(chat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(documentsRegion().parentElement).toBe(screen.getByRole("region", { name: "Settings" }).parentElement);
+    expect(documentsRegion().contains(screen.getByRole("region", { name: "Settings" }))).toBe(false);
+    expect(within(documentsRegion()).queryByRole("log")).toBeNull();
+    expect(within(documentsRegion()).queryByRole("combobox")).toBeNull();
+    expect(within(documentsRegion()).queryByRole("button", { name: /link telegram|disconnect/i })).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Your message" })).toBeTruthy();
+  });
+
+  it("warns, neutrally, while Telegram is not linked, and stops when linking is confirmed", async () => {
+    const user = userEvent.setup();
+    let meCount = 0;
+    backend({
+      me: () => {
+        meCount += 1;
+        return jsonResponse(200, { ...SAMPLE_USER, telegram_linked: meCount > 1 });
+      },
+      other: (call) =>
+        call.url === "/api/link/telegram/start" ? jsonResponse(200, ACCOUNT_LINK_RESPONSE) : jsonResponse(599, {}),
+    });
+    renderApp();
+    await screen.findByRole("heading", { name: "You’re signed in" });
+    await documentsLoaded();
+
+    expect(within(documentsRegion()).getByText(WARNING)).toBeTruthy();
+    expect(within(documentsRegion()).queryByRole("alert")).toBeNull();
+    // Informational only: uploading is not blocked.
+    expect(fileInput().disabled).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Link Telegram" }));
+    await user.click(await screen.findByRole("button", { name: "Check link status" }));
+
+    expect(await screen.findByText("Linked")).toBeTruthy();
+    expect(screen.queryByText(WARNING)).toBeNull();
+    expect(screen.getByRole("region", { name: "Documents" })).toBeTruthy();
+  });
+
+  it("shows no warning when Telegram is already linked", async () => {
+    await signedInApp({ me: () => jsonResponse(200, { ...SAMPLE_USER, telegram_linked: true }) });
+    await documentsLoaded();
+
+    expect(screen.queryByText(WARNING)).toBeNull();
+  });
+
+  it("ends the authenticated shell through the central handler when the documents read is a 401", async () => {
+    backend({ me: () => jsonResponse(200, SAMPLE_USER), documents: () => jsonResponse(401, { detail: "session ended" }) });
+
+    renderApp();
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "You’re signed in" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.body.textContent).not.toContain("session ended");
+  });
+
+  it("ends the authenticated shell when an upload is rejected as unauthorized, without a local error or a claim of success", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      documents: (call) =>
+        call.init.method === "POST" ? jsonResponse(401, { detail: "session ended" }) : jsonResponse(200, { items: [] }),
+    });
+    await documentsLoaded();
+
+    await user.upload(fileInput(), noteFile());
+    await user.click(uploadButton());
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/^Uploaded/)).toBeNull();
+  });
+
+  it("ends the authenticated shell when a delete is rejected as unauthorized", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      documents: (call) =>
+        call.init.method === "DELETE" ? jsonResponse(401, { detail: "session ended" }) : jsonResponse(200, { items: [created] }),
+    });
+    await within(documentsRegion()).findByText("notes.txt");
+
+    await user.click(within(documentsRegion()).getByRole("button", { name: "Delete" }));
+    await user.click(within(documentsRegion()).getByRole("button", { name: "Confirm Delete" }));
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("does not let a late documents answer bring the shell back after sign-out, and cancels the read", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    const { calls } = await signedInApp({ documents: () => gate.promise, logout: () => noContentResponse() });
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+
+    expect(documentCalls(calls)[0]?.init.signal?.aborted).toBe(true);
+    await settle(gate, jsonResponse(200, { items: [created] }));
+    expect(screen.getByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "You’re signed in" })).toBeNull();
+  });
+
+  it("does not let a late upload answer bring anything back after the session ends, and cancels the upload", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    const { calls } = await signedInApp({
+      documents: (call) => (call.init.method === "POST" ? gate.promise : jsonResponse(200, { items: [] })),
+      logout: () => noContentResponse(),
+    });
+    await documentsLoaded();
+    await user.upload(fileInput(), noteFile());
+    await user.click(uploadButton());
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+
+    expect(documentCalls(calls).find((call) => call.init.method === "POST")?.init.signal?.aborted).toBe(true);
+    await settle(gate, jsonResponse(201, created));
+    expect(screen.getByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+    expect(screen.queryByText(/notes\.txt/)).toBeNull();
+    expect(documentCalls(calls).filter((call) => call.init.method === "GET")).toHaveLength(1);
+  });
+
+  it("ends Documents together with the authenticated application after confirmed GitHub disconnection", async () => {
+    const user = userEvent.setup();
+    await signedInApp({
+      other: (call) => (call.url === "/api/unlink/github" ? jsonResponse(200, { status: "ok" }) : jsonResponse(599, {})),
+    });
+    await documentsLoaded();
+
+    await user.click(screen.getByRole("button", { name: "Disconnect GitHub web access" }));
+    await user.click(screen.getByRole("button", { name: "Confirm disconnect" }));
+
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Documents" })).toBeNull();
+  });
+
+  it("disables the Documents controls while sign-out is pending", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    await signedInApp({ documents: () => jsonResponse(200, { items: [created] }), logout: () => gate.promise });
+    await within(documentsRegion()).findByText("notes.txt");
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(fileInput().disabled).toBe(true);
+    expect(uploadButton().disabled).toBe(true);
+    expect(refreshButton().disabled).toBe(true);
+    expect(within(documentsRegion()).getByRole<HTMLButtonElement>("button", { name: "Delete" }).disabled).toBe(true);
+    await settle(gate, noContentResponse());
+    expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
+  });
+
+  it("leaves Documents usable while an account operation is pending", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    await signedInApp({
+      other: (call) => (call.url === "/api/link/telegram/start" ? gate.promise : jsonResponse(599, {})),
+    });
+    await documentsLoaded();
+
+    await user.click(screen.getByRole("button", { name: "Link Telegram" }));
+
+    expect(screen.getByRole("button", { name: "Disconnect GitHub web access" }).hasAttribute("disabled")).toBe(true);
+    expect(fileInput().disabled).toBe(false);
+    expect(refreshButton().disabled).toBe(false);
+    await settle(gate, jsonResponse(200, ACCOUNT_LINK_RESPONSE));
+  });
+
+  it("keeps web chat text-only: uploading a document adds nothing to the chat request, and chat keeps its contract", async () => {
+    document.cookie = "csrf_token=dev-csrf; Path=/";
+    const user = userEvent.setup();
+    let uploaded = false;
+    const { calls } = await signedInApp({
+      documents: (call) => {
+        if (call.init.method === "POST") {
+          uploaded = true;
+          return jsonResponse(201, created);
+        }
+        return jsonResponse(200, { items: uploaded ? [created] : [] });
+      },
+      other: chatOnly,
+    });
+    await documentsLoaded();
+
+    await user.upload(fileInput(), noteFile());
+    await user.click(uploadButton());
+    await screen.findByText("Uploaded “notes.txt”.");
+    await user.click(screen.getByRole("textbox", { name: "Your message" }));
+    await user.paste("How do I square numbers?");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await within(screen.getByRole("log", { name: "Conversation" })).findByText("Use a list comprehension.");
+
+    const chat = calls.filter((call) => call.url === "/api/chat");
+    expect(chat).toHaveLength(1);
+    expect(JSON.parse(chat[0]?.init.body as string)).toEqual({ message: "How do I square numbers?", history: [] });
+    expect(Object.keys(JSON.parse(chat[0]?.init.body as string) as object).sort()).toEqual(["history", "message"]);
+    expect(chat[0]?.init.body).not.toMatch(/document|notes|rag|mode|file|scope/i);
+    expect(chat[0]?.headers.get("content-type")).toBe("application/json");
+    expect(chat[0]?.headers.get("x-csrf-token")).toBe("dev-csrf");
+    // The upload itself never touched the chat or settings endpoints.
+    const upload = calls.find((call) => call.init.method === "POST" && call.url === "/api/documents");
+    expect(upload?.headers.has("content-type")).toBe(false);
+    expect(upload?.init.body).toBeInstanceOf(FormData);
+    expect(calls.filter((call) => call.url === "/api/settings" && call.init.method !== "GET")).toHaveLength(0);
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+  });
+
+  it("keeps the rest of the shell usable, and hides the backend detail, when the documents list cannot load", async () => {
+    const user = userEvent.setup();
+    await signedInApp({ documents: () => jsonResponse(503, { detail: SENSITIVE_DETAILS[0] }), other: chatOnly });
+
+    const alert = await within(documentsRegion()).findByRole("alert");
+    expect(alert.textContent).toContain(SERVER_ERROR_DETAIL);
+    expect(document.documentElement.outerHTML).not.toContain(SENSITIVE_DETAILS[0]);
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Sign out" }).disabled).toBe(false);
+
+    await user.click(screen.getByRole("textbox", { name: "Your message" }));
+    await user.paste("hello");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await within(screen.getByRole("log", { name: "Conversation" })).findByText("Use a list comprehension.");
+  });
+
+  it("never puts the user id or a document name into a request path, and never writes to browser storage", async () => {
+    document.cookie = "csrf_token=dev-csrf; Path=/";
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    const user = userEvent.setup();
+    let items: unknown[] = [];
+    const { calls } = await signedInApp({
+      documents: (call) => {
+        if (call.init.method === "POST") {
+          items = [created];
+          return jsonResponse(201, created);
+        }
+        if (call.init.method === "DELETE") {
+          items = [];
+          return noContentResponse();
+        }
+        return jsonResponse(200, { items });
+      },
+    });
+    await documentsLoaded();
+
+    await user.upload(fileInput(), noteFile());
+    await user.click(uploadButton());
+    await within(documentsRegion()).findByText("Uploaded “notes.txt”.");
+    await documentsLoaded();
+    await user.click(within(documentsRegion()).getByRole("button", { name: "Delete" }));
+    await user.click(within(documentsRegion()).getByRole("button", { name: "Confirm Delete" }));
+    await within(documentsRegion()).findByText("Deleted “notes.txt”.");
+
+    for (const call of documentCalls(calls)) {
+      expect(call.url).not.toContain(SAMPLE_USER.id);
+      expect(call.url).not.toContain("notes");
+      expect(call.url).not.toContain("dev-csrf");
+    }
+    expect(documentCalls(calls).find((call) => call.init.method === "DELETE")?.url).toBe(`/api/documents/${created.id}`);
+    expect(setItem).not.toHaveBeenCalled();
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
   });
 });
 

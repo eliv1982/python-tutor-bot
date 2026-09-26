@@ -19,6 +19,9 @@
  *   `Content-Type: application/json` through the same `send` as everything
  *   else, and its response is read only when it carries the one status the
  *   caller expects.
+ * - A multipart request body (`apiSendFormData`) goes through that same `send`
+ *   too. It never sets `Content-Type`: only the browser can write the multipart
+ *   header, because the boundary it contains is generated together with the body.
  */
 import { CSRF_HEADER_NAME, readCsrfToken } from "./csrf";
 
@@ -216,19 +219,21 @@ interface RawResponse {
 /**
  * `readBodyFor` names the statuses whose body is read; it is only ever
  * consulted for 2xx responses, so an error body is unreachable by design.
- * `jsonBody` is an already-serialized JSON document (mutations only).
+ * `body` (mutations only) is either an already-serialized JSON document, which
+ * gets the JSON content type, or a `FormData`, which gets none: the browser
+ * derives the multipart content type, boundary included, from the body itself.
  */
 async function send(
   method: "GET" | MutatingMethod,
   path: string,
   { signal, timeoutMs = DEFAULT_TIMEOUT_MS }: RequestOptions,
   readBodyFor: (status: number) => boolean,
-  jsonBody?: string,
+  body?: string | FormData,
 ): Promise<RawResponse> {
   assertSameOriginPath(path);
 
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (jsonBody !== undefined) {
+  if (typeof body === "string") {
     headers["Content-Type"] = "application/json";
   }
   if (method !== "GET") {
@@ -258,7 +263,7 @@ async function send(
       credentials: "same-origin",
       cache: "no-store",
       signal: combinedSignal,
-      ...(jsonBody === undefined ? {} : { body: jsonBody }),
+      ...(body === undefined ? {} : { body }),
     });
   } catch (error) {
     return failure(error);
@@ -364,5 +369,32 @@ export async function apiSendJson(
     throw new TypeError("apiSendJson needs a JSON-serializable payload");
   }
   const response = await send(method, path, options, (received) => received === expectedStatus, jsonBody);
+  return expectedJsonResponse(response, expectedStatus);
+}
+
+/**
+ * State-changing request with a multipart request body and a JSON response
+ * body: a file upload.
+ *
+ * `formData` is handed to `fetch` unchanged and no `Content-Type` is set, so
+ * the browser writes `multipart/form-data; boundary=...` itself. Everything
+ * else is `apiSendJson`'s contract: a fresh CSRF read, same-origin credentials,
+ * only `expectedStatus` counts as success, only that response's body is read
+ * (bounded, strict UTF-8), a failure body is never read, and nothing is retried.
+ * A caller that needs longer than the default timeout passes `timeoutMs`; a
+ * timeout is an ApiError with status 0 and leaves the outcome of the request
+ * unknown.
+ */
+export async function apiSendFormData(
+  method: MutatingMethod,
+  path: string,
+  formData: FormData,
+  expectedStatus: number,
+  options: RequestOptions = {},
+): Promise<unknown> {
+  if (!(formData instanceof FormData)) {
+    throw new TypeError("apiSendFormData needs a FormData body");
+  }
+  const response = await send(method, path, options, (received) => received === expectedStatus, formData);
   return expectedJsonResponse(response, expectedStatus);
 }
