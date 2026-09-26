@@ -50,6 +50,7 @@ export function AccountLinkingPanel({
   const operationInFlight = useRef(false);
   const controller = useRef<AbortController | null>(null);
   const mounted = useRef(false);
+  const disconnectTrigger = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -164,6 +165,13 @@ export function AccountLinkingPanel({
     })();
   }, [begin, finish, finishAuthenticatedSession]);
 
+  // Cancel removes the very button that has focus, so focus goes back to the
+  // control that opened the confirmation instead of dropping to the page.
+  const cancelDisconnect = () => {
+    setConfirmingUnlink(false);
+    disconnectTrigger.current?.focus();
+  };
+
   const pending = operation !== null;
   const controlsDisabled = disabled || pending;
 
@@ -216,6 +224,7 @@ export function AccountLinkingPanel({
           <p className="account-status">Connected</p>
         </div>
         <button
+          ref={disconnectTrigger}
           type="button"
           className="button button-danger"
           onClick={() => setConfirmingUnlink(true)}
@@ -236,7 +245,7 @@ export function AccountLinkingPanel({
               <button
                 type="button"
                 className="button button-secondary"
-                onClick={() => setConfirmingUnlink(false)}
+                onClick={cancelDisconnect}
                 disabled={controlsDisabled}
               >
                 Cancel

@@ -170,6 +170,84 @@ describe("success handling", () => {
   });
 });
 
+describe("a GET requires exactly HTTP 200", () => {
+  it("accepts a 200 with a valid JSON body", async () => {
+    mockFetch(() => jsonResponse(200, { items: [], next: null }));
+    await expect(apiGetJson("/api/x")).resolves.toEqual({ items: [], next: null });
+  });
+
+  it.each([201, 202, 203, 206, 207, 208, 226])(
+    "rejects HTTP %i carrying otherwise valid JSON as an unexpected response",
+    async (status) => {
+      mockFetch(() => jsonResponse(status, { ok: true }));
+
+      const error = await failureOf(apiGetJson("/api/x"));
+
+      expect(error.status).toBe(status);
+      expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+      expect(error.message).toBe(UNEXPECTED_RESPONSE_DETAIL);
+    },
+  );
+
+  it.each([
+    ["204 No Content", () => noContentResponse()],
+    ["205 Reset Content", () => new Response(null, { status: 205 })],
+  ])("rejects a body-less %s as an unexpected response", async (_label, respond) => {
+    mockFetch(respond);
+
+    const error = await failureOf(apiGetJson("/api/x"));
+
+    expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+  });
+
+  it.each([201, 202, 206])(
+    "never reads or shows the body of an unexpected HTTP %i, and releases it",
+    async (status) => {
+      const secret = SENSITIVE_DETAILS[0];
+      const { response, stats } = streamedResponse(status, [JSON.stringify({ detail: secret })], {
+        "content-type": "application/json",
+      });
+      mockFetch(() => response);
+
+      const error = await failureOf(apiGetJson("/api/x"));
+
+      expect(error.detail).toBe(UNEXPECTED_RESPONSE_DETAIL);
+      for (const surface of [error.message, error.detail, String(error), JSON.stringify(error), error.stack ?? ""]) {
+        expect(surface).not.toContain(secret);
+      }
+      expect(stats.pulls).toBe(0);
+      await vi.waitFor(() => expect(stats.cancelled).toBe(true));
+    },
+  );
+
+  it("still sends the same-origin, no-store, cookie-only GET, once, and never treats the rejection as a 401", async () => {
+    document.cookie = "csrf_token=dev-token; Path=/";
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    const { calls, fetchMock } = mockFetch(() => jsonResponse(201, { ok: true }));
+
+    await failureOf(apiGetJson("/api/x"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(calls[0]?.url).toBe("/api/x");
+    expect(calls[0]?.init.method).toBe("GET");
+    expect(calls[0]?.init.credentials).toBe("same-origin");
+    expect(calls[0]?.init.cache).toBe("no-store");
+    expect(calls[0]?.headers.has("x-csrf-token")).toBe(false);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("keeps a real non-2xx status mapped to its own fixed message rather than the unexpected-response one", async () => {
+    mockFetch(() => jsonResponse(503, { detail: "down" }));
+
+    const error = await failureOf(apiGetJson("/api/x"));
+
+    expect(error.status).toBe(503);
+    expect(error.detail).toBe(SERVER_ERROR_DETAIL);
+  });
+});
+
 describe("public error messages (no backend text is ever surfaced)", () => {
   it.each([
     [401, UNAUTHORIZED_ERROR_DETAIL],

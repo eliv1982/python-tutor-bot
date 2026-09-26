@@ -865,6 +865,73 @@ describe("cancellation", () => {
   });
 });
 
+describe("disabled while sign-out is pending", () => {
+  const form = () => textarea().closest("form") as HTMLFormElement;
+
+  it("cannot be edited or sent by button, Enter, or a direct form submit, and keeps the draft", async () => {
+    const user = userEvent.setup();
+    const { chatCalls } = chatBackend(() => reply("unused"));
+    const view = render(<ChatPanel />);
+    await write(user, "keep me");
+
+    view.rerender(<ChatPanel disabled />);
+
+    expect(textarea().disabled).toBe(true);
+    expect(sendButton().disabled).toBe(true);
+    await user.click(sendButton());
+    await user.type(textarea(), "more{Enter}");
+    // Dispatched straight at the handlers, past the DOM's own refusal to act on a disabled control.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.submit(form());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(chatCalls()).toHaveLength(0);
+    expect(textarea().value).toBe("keep me");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("is editable and sendable again with the same draft when re-enabled", async () => {
+    const user = userEvent.setup();
+    const { chatCalls } = chatBackend(() => reply("welcome back"));
+    const view = render(<ChatPanel />);
+    await write(user, "keep me");
+    view.rerender(<ChatPanel disabled />);
+    view.rerender(<ChatPanel disabled={false} />);
+
+    expect(textarea().disabled).toBe(false);
+    expect(textarea().value).toBe("keep me");
+    expect(sendButton().disabled).toBe(false);
+
+    await user.click(textarea());
+    await user.keyboard(" too{Enter}");
+
+    await within(transcript()).findByText("welcome back");
+    expect(chatCalls()).toHaveLength(1);
+    expect(body(chatCalls()[0])).toEqual({ message: "keep me too", history: [] });
+  });
+
+  it("does not abort a reply that is already awaited, and still shows it", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    const { chatCalls } = chatBackend(() => gate.promise);
+    const view = render(<ChatPanel />);
+    await send(user, "in flight");
+
+    view.rerender(<ChatPanel disabled />);
+
+    expect(chatCalls()[0]?.init.signal?.aborted).toBe(false);
+    expect(textarea().disabled).toBe(true);
+
+    await settle(gate, reply("late but welcome"));
+
+    expect(within(transcript()).getByText("late but welcome")).toBeTruthy();
+    expect(within(transcript()).getByText("in flight")).toBeTruthy();
+    expect(chatCalls()).toHaveLength(1);
+    expect(chatCalls()[0]?.init.signal?.aborted).toBe(false);
+  });
+});
+
 describe("no persistence", () => {
   it("writes nothing to browser storage or cookies, and a remounted panel starts empty", async () => {
     document.cookie = "csrf_token=dev-csrf; Path=/";

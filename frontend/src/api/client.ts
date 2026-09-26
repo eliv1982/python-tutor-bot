@@ -289,17 +289,15 @@ function isSuccess(status: number): boolean {
   return status >= 200 && status < 300;
 }
 
-/** GET a JSON document. An empty, non-JSON, oversized, or non-2xx response is an ApiError. */
+/**
+ * GET a JSON document. Every GET this client makes is contracted to answer
+ * exactly `200 OK`, so only a 200 has its body read; any other 2xx (201, 202,
+ * 204, ...) is an unexpected response whose body is never consumed. An empty,
+ * non-JSON, oversized, or non-2xx response is an ApiError as well.
+ */
 export async function apiGetJson(path: string, options: RequestOptions = {}): Promise<unknown> {
-  const { status, body } = await send("GET", path, options, isSuccess);
-  if (!isSuccess(status)) {
-    throw new ApiError(status, publicDetail(status));
-  }
-  const parsed = body === null || body === "" ? undefined : parseJson(body);
-  if (parsed === undefined) {
-    throw new ApiError(status, UNEXPECTED_RESPONSE_DETAIL);
-  }
-  return parsed;
+  const response = await send("GET", path, options, (received) => received === 200);
+  return expectedJsonResponse(response, 200);
 }
 
 /**

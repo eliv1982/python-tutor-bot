@@ -62,7 +62,7 @@ export function AuthenticatedShell({ user, logoutState, onLogout }: Authenticate
         />
         <SettingsPanel disabled={logoutState.pending} />
         <DocumentsPanel telegramLinked={user.telegram_linked} disabled={logoutState.pending} />
-        <ChatPanel />
+        <ChatPanel disabled={logoutState.pending} />
       </main>
     </div>
   );

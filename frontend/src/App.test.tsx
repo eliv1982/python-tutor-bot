@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -1107,6 +1107,50 @@ describe("logout", () => {
 
     expect(await screen.findByRole("link", { name: "Sign in with GitHub" })).toBeTruthy();
     expect(calls.filter((call) => call.url === "/api/logout")).toHaveLength(2);
+  });
+
+  it("makes Chat inert while sign-out is pending, then usable again with the same draft when sign-out fails", async () => {
+    const user = userEvent.setup();
+    const gate = deferred<Response>();
+    const { calls } = await signedInApp({
+      logout: () => gate.promise,
+      other: (call) =>
+        call.url === "/api/chat"
+          ? jsonResponse(200, { text: "Loops repeat things." })
+          : jsonResponse(599, { detail: `unexpected request ${call.url}` }),
+    });
+    const chatCalls = () => calls.filter((call) => call.url === "/api/chat");
+    const composer = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Your message" });
+    await user.click(composer);
+    await user.paste("How do loops work?");
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    // Pending: the composer and Send are inert, and nothing can start a request.
+    expect(composer.disabled).toBe(true);
+    const sendButton = screen.getByRole<HTMLButtonElement>("button", { name: "Send" });
+    expect(sendButton.disabled).toBe(true);
+    await user.click(sendButton);
+    await user.type(composer, "{Enter}");
+    fireEvent.keyDown(composer, { key: "Enter" });
+    fireEvent.submit(composer.closest("form") as HTMLFormElement);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(chatCalls()).toHaveLength(0);
+    expect(composer.value).toBe("How do loops work?");
+
+    // The sign-out fails: still signed in, and Chat is back exactly as it was left.
+    await settle(gate, jsonResponse(500, { detail: "Something broke" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("still signed in");
+    expect(screen.getByRole("heading", { name: "You’re signed in" })).toBeTruthy();
+    expect(composer.disabled).toBe(false);
+    expect(composer.value).toBe("How do loops work?");
+    expect(chatCalls()).toHaveLength(0);
+
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Loops repeat things.")).toBeTruthy();
+    expect(chatCalls()).toHaveLength(1);
+    expect(JSON.parse(chatCalls()[0]?.init.body as string)).toEqual({ message: "How do loops work?", history: [] });
   });
 
   it("goes anonymous when the server answers 401 (session already invalid) and leaves no stale error", async () => {

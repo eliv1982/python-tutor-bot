@@ -284,6 +284,24 @@ describe("GitHub disconnection", () => {
     expect(screen.queryByRole("group", { name: "Confirm GitHub disconnection" })).toBeNull();
   });
 
+  it("returns focus to the disconnect trigger when the confirmation is cancelled", async () => {
+    const user = userEvent.setup();
+    const { calls } = await renderPanel(() => jsonResponse(599, {}));
+    const trigger = screen.getByRole("button", { name: "Disconnect GitHub web access" });
+
+    trigger.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("group", { name: "Confirm GitHub disconnection" })).toBeTruthy();
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(calls.filter((call) => call.url === "/api/unlink/github")).toHaveLength(0);
+    expect(screen.queryByRole("group", { name: "Confirm GitHub disconnection" })).toBeNull();
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Disconnect GitHub web access" }));
+  });
+
   it("keeps the session and shows safe client copy on 409", async () => {
     const user = userEvent.setup();
     await renderPanel(() => jsonResponse(409, { detail: SENSITIVE_DETAILS[0] }));

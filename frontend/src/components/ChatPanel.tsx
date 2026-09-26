@@ -14,6 +14,10 @@ interface TranscriptEntry extends ChatExchange {
   id: number;
 }
 
+interface ChatPanelProps {
+  disabled?: boolean;
+}
+
 /**
  * Text chat. Everything here is React state in this component and nowhere else:
  * there is no history endpoint and nothing is stored in the browser, so the
@@ -26,8 +30,13 @@ interface TranscriptEntry extends ChatExchange {
  *   in `draft` for another try.
  * - Every piece of text is rendered as a plain React text node. Errors show
  *   only the client-owned `ApiError.detail`, never anything the server said.
+ * - `disabled` (a sign-out is pending) makes the composer inert but keeps the
+ *   draft: a failed sign-out leaves the session valid, and the user then finds
+ *   the chat exactly as they left it. A reply that is already awaited is
+ *   deliberately not aborted; a confirmed session end unmounts the panel, and
+ *   the cleanup below handles that.
  */
-export function ChatPanel() {
+export function ChatPanel({ disabled = false }: ChatPanelProps) {
   const [exchanges, setExchanges] = useState<TranscriptEntry[]>([]);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<string | null>(null);
@@ -63,10 +72,10 @@ export function ChatPanel() {
   const draftLength = useMemo(() => codePointLength(draft), [draft]);
   const overLimit = draftLength > CHAT_MAX_MESSAGE_CODE_POINTS;
   const isPending = pending !== null;
-  const canSend = !isPending && !overLimit && draft.trim() !== "";
+  const canSend = !disabled && !isPending && !overLimit && draft.trim() !== "";
 
   const submit = () => {
-    if (inFlight.current) {
+    if (disabled || inFlight.current) {
       return;
     }
     const built = buildChatRequest(draft, exchanges);
@@ -204,6 +213,7 @@ export function ChatPanel() {
             rows={3}
             value={draft}
             readOnly={isPending}
+            disabled={disabled}
             aria-invalid={overLimit}
             aria-describedby={hintId}
             autoComplete="off"

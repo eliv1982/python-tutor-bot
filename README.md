@@ -20,21 +20,27 @@
 4. Запуск (только Telegram-бот, без web-адаптера): `python main.py`
 
 Про совместный запуск Telegram-бота и web-адаптера в одном процессе
-(`service_main.py`) — обязательный вариант, как только появятся
-Qdrant-зависимые web-маршруты документов/поиска — см. раздел «Единый
-процесс: Telegram + web (Stage 7A-3)» ниже. Про web-интерфейс (React,
-Node 24 LTS) — раздел «Web-фронтенд (Stage 7B-1)» ниже.
+(`service_main.py`) — обязательный вариант, когда работают оба адаптера:
+web-маршруты документов/поиска используют тот же локальный Qdrant — см.
+раздел «Единый процесс: Telegram + web (Stage 7A-3)» ниже. Про web-интерфейс
+(React, Node 24 LTS) — раздел «Web-интерфейс (React, Stage 7B)» ниже.
 
 ---
 
 ## Доступ к боту и идентификация пользователей
 
-Доступ к боту временно ограничен списком числовых Telegram user id в
+Доступ к Telegram-боту ограничен списком числовых Telegram user id в
 `TELEGRAM_ALLOWED_USER_IDS` (`.env`). Если переменная не задана, пустая
 или не содержит ни одного корректного id — бот отклоняет всех пользователей
-(fail closed), а не становится публичным. Это остаётся временным механизмом
-предварительной защиты до будущей системы OAuth-логина, а не окончательной
-моделью авторизации приложения.
+(fail closed), а не становится публичным.
+
+Этот список относится именно к каналу Telegram (`utils/access_control.py`,
+применяется в обработчиках бота). Он не ограничивает web-вход через GitHub:
+web-интерфейс использует собственную аутентификацию — GitHub OAuth и
+серверную сессию (см. «GitHub OAuth-логин (Stage 6B)»). Оба механизма
+сосуществуют намеренно, как независимые каналы доступа: вход через GitHub
+не даёт доступа к Telegram-боту, а наличие Telegram id в списке не
+заменяет вход в web-интерфейс.
 
 Начиная с этой стадии, Telegram-идентификатор — это **только внешняя
 идентичность адаптера**. Сразу после прохождения проверки доступа
@@ -64,14 +70,14 @@ SHA-256-дайджест (см. `db/auth_sessions.py`, `app/auth_session.py`).
   ```
   Требует `SESSION_SECRET_KEY` в `.env` (подпись CSRF-токенов) —
   без него адаптер не запустится (fail closed), см. `.env.example`.
-  Как только появятся Qdrant-зависимые web-маршруты документов/поиска
-  (Stage 7A-3), запускать этот процесс ОДНОВРЕМЕННО с `main.py` против
-  одного и того же локального каталога Qdrant станет небезопасно и не
-  поддерживается — см. «Единый процесс: Telegram + web (Stage 7A-3)» ниже.
+  Поскольку web-маршруты документов/поиска (Stage 7A-3) используют Qdrant,
+  запускать этот процесс ОДНОВРЕМЕННО с `main.py` против одного и того же
+  локального каталога Qdrant небезопасно и не поддерживается — см. «Единый
+  процесс: Telegram + web (Stage 7A-3)» ниже.
 - Эндпоинты: `GET /healthz` (без авторизации), `GET /api/me` (текущий
-  пользователь — только `id`/`created_at`, без Telegram id и внутренних
-  деталей), `POST /api/logout` (требует валидную сессию и CSRF-заголовок
-  `X-CSRF-Token`).
+  пользователь — `id`, `created_at` и булево `telegram_linked`; сам
+  Telegram id и внутренние детали не отдаются), `POST /api/logout`
+  (требует валидную сессию и CSRF-заголовок `X-CSRF-Token`).
 - CSRF: stateless double-submit cookie, значение криптографически привязано
   к самому токену сессии (`web/csrf.py`) — не единственная защита от CSRF,
   но SameSite=Lax остаётся дополнительным слоем, не основным механизмом.
@@ -347,23 +353,55 @@ cron/воркера и даже при нескольких процессах w
 
 - `POST /api/chat` — тело `{"message": "...", "history": [{"role":
   "user"|"assistant", "content": "..."}]}`, ответ `{"text": "..."}`
-  (`Cache-Control: no-store`). Web-чат в этой стадии **только текстовый**:
-  режим фиксируется на сервере (`text`), клиент не может его передать;
-  RAG/поиск по документам для web отложены до Stage 7A-3. История диалога
-  **не сохраняется** на сервере — клиент сам присылает свою ограниченную
-  историю (лимиты те же, что в прикладном ядре: сообщение ≤ 4000 символов,
-  история ≤ 20 сообщений и ≤ 20 000 символов суммарно). Ответы об ошибках —
-  фиксированные: 422 (некорректный запрос), 429 (генерация уже идёт —
-  не более одной на пользователя и четырёх на процесс), 504 (таймаут),
-  502 (сбой генерации).
-- `GET /api/settings` → `{"mode": "..."}` — эффективный режим (без
-  сохранённого значения — `text`); чтение ничего не записывает.
+  (`Cache-Control: no-store`). Web-чат **только текстовый**: режим
+  фиксируется на сервере (`text`), клиент не может его передать, а
+  сохранённый режим пользователя (`/mode`, `PATCH /api/settings`) на web-чат
+  не влияет. Web-чат **не использует RAG и загруженные документы** — ответ
+  строится без поиска по базе знаний. История диалога **не сохраняется** на
+  сервере — клиент сам присылает свою ограниченную историю (лимиты те же,
+  что в прикладном ядре: сообщение ≤ 4000 символов, история ≤ 20 сообщений
+  и ≤ 20 000 символов суммарно). Ответы об ошибках — фиксированные: 422
+  (некорректный запрос), 429 (генерация уже идёт — не более одной на
+  пользователя и четырёх на процесс), 504 (таймаут), 502 (сбой генерации).
+- `GET /api/settings` → `{"mode": "..."}` — эффективный режим: сохранённый,
+  а без сохранённого значения — настроенный `BOT_MODE` (по умолчанию
+  `text`); чтение ничего не записывает.
 - `PATCH /api/settings` — тело `{"mode": "text"|"voice"|"vision"|"rag"}`;
-  сохраняет тот же durable-режим, что и Telegram `/mode`.
+  сохраняет тот же durable-режим, что и Telegram `/mode`. Он меняет
+  поведение Telegram-бота, но не web-чата. Голос через web не настраивается
+  (только `/voice` в Telegram).
 - Тела `POST /api/chat` и `PATCH /api/settings` ограничены 64 KiB
   фактически полученных байт (HTTP 413) — ограничение применяется только к
   этим двум маршрутам. Любой невалидный запрос получает обезличенный ответ
   422 `{"detail": "Invalid request"}` без эха введённых данных.
+
+### Web-документы (Stage 7A-3 API, Stage 7B-4 интерфейс)
+
+Документы принадлежат пользователю: идентификатор берётся только из
+сессии, клиентского идентификатора нет. Документ виден и удаляется только
+владельцем — чужой и несуществующий id дают один и тот же 404. Правила сессии и CSRF — те же, что выше (изменяющие запросы — с
+`X-CSRF-Token`).
+
+- `GET /api/documents?limit=&offset=` — каталог активных документов
+  пользователя (`limit` 1–100, по умолчанию 20; без total/курсора). Элемент
+  — только `id`, `display_name`, `created_at`. `GET /api/documents/{id}` —
+  один документ.
+- `POST /api/documents` — `multipart/form-data`, поле `file`; успех — `201` и
+  та же сводка. Поддерживаются `.pdf`, `.txt`, `.md`, `.docx`, не более
+  10 MiB (`MAX_DOCUMENT_SIZE_BYTES`), имя файла — не длиннее 255 символов.
+  Это та же транзакция загрузки/индексации, что и в Telegram
+  (`app/documents.py`); успех сообщается, только когда документ стал
+  активным.
+- `DELETE /api/documents/{id}` — `204`; документ удаляется вместе с его
+  данными в индексе.
+- `POST /api/retrieval/search` — «сырой» поиск по документам без генерации
+  текста; React-интерфейс его не использует.
+- Загруженные документы приватны и участвуют в RAG-ответах **Telegram-бота**,
+  когда у пользователя активен режим `rag`. Web-чат их не использует.
+- При слиянии двух разных аккаунтов документы не переносятся: собственные
+  документы GitHub-стороны блокируют связывание (см. «Связывание Telegram- и
+  GitHub-аккаунтов (Stage 6C)»). Если RAG нужен в Telegram, свяжите аккаунты
+  ДО загрузки документов через web.
 
 ### Единый процесс: Telegram + web (Stage 7A-3)
 
@@ -416,16 +454,52 @@ Telegram-поллинг (тот же `AsyncTeleBot` из `bot.py`, тот же `
   при обновлении любой из них нужно заново сверить `service_main.py` с
   новой установленной реализацией.
 
-### Web-фронтенд (Stage 7B-1)
+### Web-интерфейс (React, Stage 7B)
 
-Каталог `frontend/` — минимальное React + TypeScript (Vite) приложение
-поверх уже существующего backend-контракта: экран входа через GitHub,
-восстановление сессии из `GET /api/me`, простая «оболочка» вошедшего
-пользователя и выход (`POST /api/logout`). Чата, настроек, документов и
-остального в этой стадии нет. Фронтенд не дублирует логику идентичности,
+Каталог `frontend/` — React + TypeScript (Vite) приложение поверх
+backend-контракта, описанного выше. Оно не дублирует логику идентичности,
 сессии или CSRF — каноническая личность приходит только из серверной сессии
 (HttpOnly cookie, которую JavaScript не читает и не хранит); внутренний UUID
-пользователя в интерфейсе не показывается.
+пользователя в интерфейсе не показывается. Единственный источник состояния
+входа во фронтенде — `AuthContext`; HTTP 401 на любой авторизованный запрос
+возвращает интерфейс на экран входа.
+
+Вошедший пользователь видит «оболочку» с панелями в таком порядке: Account
+connections → Settings → Documents → Chat.
+
+- **Вход и сессия.** Вход — только через GitHub (OAuth 2.0 Authorization
+  Code + PKCE, см. «GitHub OAuth-логин (Stage 6B)»): `state`, PKCE и сессия
+  целиком на стороне backend, браузер получает лишь HttpOnly-cookie.
+  Состояние восстанавливается из `GET /api/me` (`id`, `created_at`,
+  `telegram_linked`), выход — `POST /api/logout`. Пока выход выполняется,
+  панели недоступны для действий; если он не удался, сессия остаётся
+  действующей, а введённый в чат текст сохраняется. Telegram-allowlist
+  (`TELEGRAM_ALLOWED_USER_IDS`) к web-входу не применяется.
+- **Связывание с Telegram (Account connections).** Вошедший пользователь
+  создаёт диплинк на Telegram (`POST /api/link/telegram/start`); связывание
+  завершается в Telegram (Start в боте), а не на сайте. Сайт статус сам не
+  опрашивает — пользователь нажимает «Check link status» вручную. При
+  слиянии двух разных аккаунтов существующие web-сессии GitHub-стороны
+  отзываются, и нужен повторный вход через GitHub (см. «Связывание Telegram-
+  и GitHub-аккаунтов (Stage 6C)»). «Disconnect GitHub web access» отвязывает
+  GitHub (с подтверждением; завершает эту web-сессию) и **не** является
+  отвязкой Telegram — её в интерфейсе нет.
+- **Settings.** Одно поле — предпочитаемый режим `text` / `voice` /
+  `vision` / `rag`. Это тот же сохранённый режим, что и Telegram `/mode`:
+  он меняет поведение Telegram-бота. Пока значение не сохранено, действует
+  настроенный `BOT_MODE` (не обязательно `text`). Web-чат от этого режима
+  не зависит и остаётся текстовым; выбора голоса в web нет.
+- **Documents.** Список, загрузка и удаление собственных документов (PDF,
+  TXT, MD, DOCX, до 10 MiB) — см. «Web-документы». Документы приватны,
+  используются Telegram-ботом при активном режиме `rag` и не используются
+  web-чатом; при слиянии аккаунтов они не переносятся и могут блокировать
+  связывание — поэтому связывайте Telegram до загрузки, если RAG нужен там.
+- **Chat.** Текстовый чат: локальная расшифровка живёт только в состоянии
+  страницы (обновление, выход или истёкшая сессия очищают её; ничего не
+  пишется в `localStorage`/`sessionStorage`/IndexedDB/cookie), клиент сам
+  присылает ограниченную недавнюю историю (лимиты — в «Web-чат и
+  настройки»). Чат не использует RAG/документы и не зависит от сохранённого
+  режима Telegram.
 
 **Требования:** Node.js 24 LTS и npm (проверено на Node 24 / npm 11).
 
@@ -437,6 +511,10 @@ npm run typecheck
 npm test
 npm run build       # -> frontend/dist (в репозиторий не коммитится)
 ```
+
+`frontend/dist` — сгенерированный каталог (в `.gitignore`): его нужно
+собрать на машине, где запускается backend. Полный набор проверок backend и
+frontend — в разделе «Проверки» ниже.
 
 #### Локальная разработка (два процесса)
 
@@ -499,8 +577,28 @@ cd frontend && npm ci && npm run build   # до запуска процесса
   сборки не зависят.
 - Production остаётся same-origin: CORS не настраивается. Cookie — только
   `Secure`/`__Host-` (`WEB_ENV=production` и `WEB_COOKIE_SECURE=true` —
-  значения по умолчанию); TLS терминируется на reverse proxy, который по
-  требованиям выше не должен логировать `code`/`state` callback-а.
+  значения по умолчанию).
+
+**Развёртывание и безопасность.** Репозиторий НЕ содержит Dockerfile,
+Compose или конфигурации reverse proxy — их предоставляет сторона
+развёртывания. Ниже требования к ней; код приложения физически проверяет
+не все из них (то, что не проверяется, нужно проверить по реальной
+конфигурации proxy):
+
+- HTTPS терминируется на внешнем reverse proxy; `GITHUB_REDIRECT_URI` — это
+  `https://`-адрес того же публичного хоста, а не адрес backend-порта.
+- Same-origin: `/`, `/assets/...`, `/api/...` и `/healthz` одного публичного
+  хоста идут на один и тот же процесс приложения (`service_main.py` или
+  `web_main.py`). Фронтенд и API не разносятся по разным origin: CORS не
+  настроен, а CSRF-защита опирается на Same-Origin Policy.
+- Secure-cookie: `WEB_ENV=production`, `WEB_COOKIE_SECURE=true` (значения по
+  умолчанию) — cookie `__Host-session` и `__Host-csrf_token`.
+- Query-строка `/api/auth/github/callback` (`code`/`state`) не должна
+  попадать в логи proxy: отключите access-лог для этого маршрута либо
+  логируйте только путь / редактируйте эти параметры — см. «Приватность
+  callback».
+- Rate limit `/api/auth/github/login` на proxy — defense-in-depth поверх
+  database-уровневого ограничения (не замена ему).
 
 ## Режимы
 
@@ -587,10 +685,10 @@ cd frontend && npm ci && npm run build   # до запуска процесса
 - `config.py` — настройки, пути, режимы (без Telegram-credential — см. `telegram_config.py`)
 - `telegram_config.py` — валидация `TELEGRAM_BOT_TOKEN`, импортируется только Telegram-адаптером (`bot.py`)
 - `handlers/` — start, text, voice, image, document_upload (тонкие Telegram-адаптеры; резолвят внутренний UUID сразу после проверки доступа)
-- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) + `POST /api/chat`/`GET`/`PATCH /api/settings` и body_limit (64 KiB-лимит тела этих запросов, Stage 7A-2) + frontend (раздача собранного React-приложения `frontend/dist`: только `/` и `/assets/...`, Stage 7B-1) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
+- `web/` — тонкий FastAPI-адаптер: app (фабрика приложения), routes (включая `POST /api/link/telegram/start`/`POST /api/unlink/github`, Stage 6C), dependencies (централизованная проверка текущего пользователя/CSRF), cookies, csrf, schemas (Stage 6A) + github_oauth (GitHub OAuth login/callback, Stage 6B) + `POST /api/chat`/`GET`/`PATCH /api/settings` и body_limit (64 KiB-лимит тела этих запросов, Stage 7A-2) + `/api/documents*`/`POST /api/retrieval/search` (Stage 7A-3) + frontend (раздача собранного React-приложения `frontend/dist`: только `/` и `/assets/...`, Stage 7B-1) — без бизнес-логики, весь резолвинг пользователя идёт через `app/auth_session.py`/`app/github_identity.py`/`app/telegram_link.py`
 - `app/` — Telegram/Web-независимый прикладной слой: tutor (оркестрация диалога), session (состояние диалога — история/pending-image эфемерны в памяти, mode/voice — durable в PostgreSQL), documents (транзакция загрузки/индексации документа), identity (резолв Telegram id → внутренний UUID), auth_session (жизненный цикл серверной web-сессии: создание/резолв/отзыв, включая GitHub-race-safe выпуск — Stage 6A/6C), github_identity (резолв GitHub id → внутренний UUID, Stage 6B), oauth_transaction (state/PKCE-транзакция GitHub-логина, Stage 6B), text_chat (stateless текстовое ядро, Stage 7A-1), preferences (единый резолвер эффективных mode/voice для Telegram и web — значения по умолчанию из `BOT_MODE`/`DEFAULT_VOICE`, Stage 7B-3P — и запись durable-режима для web без `user_sessions`, Stage 7A-2), telegram_link (генерация/хеширование bearer-секрета связывания, старт/redemption/отвязка — Stage 6C; сырой секрет никогда не покидает этот модуль и `web/routes.py`/`handlers/start.py`)
 - `db/` — слой PostgreSQL: settings (DATABASE_URL, без credential-зависимостей), base/models (SQLAlchemy ORM), engine (ленивый sync-движок), identity (race-safe резолв/создание пользователя, чтение профиля по UUID, проверка наличия Telegram-привязки), preferences (mode/voice upsert), documents (каталог владения документами), auth_sessions (хранение web-сессий — только SHA-256 дайджест токена, включая race-safe GitHub-выпуск сессии — Stage 6A/6C), github_identity (race-safe резолв/создание пользователя по GitHub id, Stage 6B), oauth_transactions (короткоживущая одноразовая OAuth-транзакция + database-authoritative admission control/rate limit, Stage 6B), telegram_link (создание/redemption/отвязка попытки связывания под скорректированным порядком блокировок — Stage 6C)
-- `frontend/` — React + TypeScript (Vite) web-приложение: экран входа, восстановление сессии из `/api/me`, выход (Stage 7B-1); `npm ci`/`npm run build` — см. «Web-фронтенд (Stage 7B-1)» выше; `frontend/dist` не коммитится
+- `frontend/` — React + TypeScript (Vite) web-приложение (Stage 7B): вход через GitHub, связывание аккаунтов, настройки, документы и текстовый чат; `npm ci`/`npm run build` — см. «Web-интерфейс (React, Stage 7B)» выше; `frontend/dist` — сгенерированный каталог, не коммитится
 - `github_oauth_config.py` — настройки только для GitHub-логина (`GITHUB_CLIENT_ID`/`SECRET`/`REDIRECT_URI` и др., Stage 6B), не требуется для Telegram-бота
 - `telegram_link_config.py` — настройки только для связывания Telegram/GitHub (`TELEGRAM_BOT_USERNAME` и др., Stage 6C); никогда не импортирует `TELEGRAM_BOT_TOKEN`; отсутствие/некорректность значения не ломает запуск web-адаптера
 - `alembic/`, `alembic.ini` — миграции схемы PostgreSQL (`alembic upgrade head`)
@@ -637,6 +735,33 @@ alembic upgrade head
 синхронный, и асинхронный доступ. Импорт `config.py`/`db/*.py`/`app/*.py`
 не требует `TELEGRAM_BOT_TOKEN` — только Telegram-адаптер (`bot.py`) и
 всё, что от него зависит, требует валидный токен при старте.
+
+## Проверки
+
+Backend — из корня репозитория, в окружении с `requirements.txt` и
+`requirements-dev.txt` (CI использует Python 3.12):
+
+```
+python -m pip check
+python -m pytest
+```
+
+Тесты требуют PostgreSQL: задайте `TEST_POSTGRES_DSN` (так делает CI) либо
+держите локально Docker с уже загруженным образом `postgres:16-alpine`.
+С `PYTEST_REQUIRE_POSTGRES=1` (как в CI) недоступный PostgreSQL — ошибка, а
+не тихий пропуск тестов. Сеть `pytest` блокирует (разрешён только loopback).
+
+Frontend — из `frontend/`, Node 24 LTS:
+
+```
+npm ci
+npm run lint
+npm run typecheck
+npm test
+npm run build
+```
+
+Именно эти команды выполняет `.github/workflows/tests.yml`.
 
 ## Зависимости
 
